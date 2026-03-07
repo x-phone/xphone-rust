@@ -29,7 +29,7 @@ getrandom = "0.2"
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
 crossbeam-channel = "0.5"
-fakepbx = { path = "../fakepbx-rust" }
+fakepbx = "0.1.0"
 
 [[example]]
 name = "sipcli"

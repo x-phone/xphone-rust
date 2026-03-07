@@ -258,7 +258,6 @@ impl AppState {
             }
         }
     }
-
 }
 
 type SharedState = Arc<Mutex<AppState>>;
@@ -613,8 +612,8 @@ fn setup_mic_stream(active: Arc<AtomicBool>, pcm_tx: crossbeam_channel::Sender<V
             for chunk in data.chunks(channels * downsample_ratio) {
                 // Average the first sample of each channel in this chunk.
                 let mut sum = 0.0f32;
-                for ch in 0..channels.min(chunk.len()) {
-                    sum += chunk[ch];
+                for sample_val in chunk.iter().take(channels) {
+                    sum += sample_val;
                 }
                 let sample = sum / channels as f32;
                 let pcm = (sample * 32767.0).clamp(-32768.0, 32767.0) as i16;
@@ -1064,7 +1063,7 @@ fn draw(f: &mut ratatui::Frame, state: &SharedState) {
         .split(outer[1]);
 
     // Left side: Calls panel (top) + Events panel (bottom)
-    let calls_height = (st.calls.len() as u16 + 2).max(3).min(8); // 2 for borders, min 3, max 8
+    let calls_height = (st.calls.len() as u16 + 2).clamp(3, 8); // 2 for borders, min 3, max 8
     let left_chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(calls_height), Constraint::Min(4)])

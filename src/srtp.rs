@@ -997,9 +997,9 @@ mod tests {
         assert_ne!(
             cipher,
             salt[..14]
-                .to_vec()
-                .into_iter()
-                .chain(std::iter::repeat(0).take(2))
+                .iter()
+                .copied()
+                .chain(std::iter::repeat_n(0, 2))
                 .collect::<Vec<_>>()
         );
         assert_ne!(auth[..14], salt[..14]);
