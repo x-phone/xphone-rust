@@ -78,6 +78,10 @@ struct Cli {
     /// Override local IP advertised in SDP
     #[arg(long)]
     local_ip: Option<String>,
+
+    /// STUN server for NAT traversal (e.g. stun.l.google.com:19302)
+    #[arg(long)]
+    stun: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -91,6 +95,7 @@ struct Profile {
     pass: Option<String>,
     transport: Option<String>,
     port: Option<u16>,
+    stun: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1252,6 +1257,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut pass = String::new();
     let mut transport = cli.transport.clone();
     let mut port = cli.port;
+    let mut stun_server: Option<String> = None;
 
     if let Some(ref profile_name) = cli.profile {
         let p = load_profile(profile_name)
@@ -1274,6 +1280,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         if let Some(pt) = p.port {
             port = pt;
+        }
+        if p.stun.is_some() {
+            stun_server = p.stun;
         }
     }
 
@@ -1309,6 +1318,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     };
     if let Some(ip) = cli.local_ip {
         cfg.local_ip = ip;
+    }
+    // STUN: CLI flag overrides profile.
+    if cli.stun.is_some() {
+        cfg.stun_server = cli.stun;
+    } else if stun_server.is_some() {
+        cfg.stun_server = stun_server;
     }
 
     let phone = Phone::new(cfg);

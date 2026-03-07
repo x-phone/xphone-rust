@@ -72,6 +72,7 @@ impl SipUA {
             domain: cfg.host.clone(),
             transport: transport.clone(),
             tls_config: cfg.tls_config.clone(),
+            stun_server: cfg.stun_server.clone(),
         };
 
         let client = Arc::new(Client::new(client_cfg)?);

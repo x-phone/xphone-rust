@@ -452,6 +452,7 @@ mod tests {
             domain: "pbx.local".into(),
             transport: "udp".into(),
             tls_config: None,
+            stun_server: None,
         };
         Arc::new(Client::new(cfg).unwrap())
     }

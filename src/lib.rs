@@ -17,6 +17,7 @@ pub mod registry;
 pub mod sdp;
 pub mod sip;
 pub mod srtp;
+pub mod stun;
 pub mod transport;
 pub mod types;
 

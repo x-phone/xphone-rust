@@ -50,6 +50,10 @@ pub struct Config {
     pub pcm_rate: u32,
     /// Enable SRTP (SDES-SRTP with AES_CM_128_HMAC_SHA1_80).
     pub srtp: bool,
+    /// STUN server address (e.g. `"stun.l.google.com:19302"`).
+    /// When set, a STUN Binding Request is used to discover the
+    /// NAT-mapped address for SIP and RTP instead of the local-IP heuristic.
+    pub stun_server: Option<String>,
 }
 
 impl Default for Config {
@@ -74,6 +78,7 @@ impl Default for Config {
             pcm_frame_size: 0,
             pcm_rate: 8000,
             srtp: false,
+            stun_server: None,
         }
     }
 }
@@ -175,6 +180,12 @@ impl PhoneBuilder {
     /// Enables SRTP (SDES-SRTP with AES_CM_128_HMAC_SHA1_80).
     pub fn srtp(mut self, enabled: bool) -> Self {
         self.config.srtp = enabled;
+        self
+    }
+
+    /// Sets the STUN server for NAT-mapped address discovery.
+    pub fn stun_server(mut self, server: &str) -> Self {
+        self.config.stun_server = Some(server.into());
         self
     }
 

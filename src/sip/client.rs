@@ -35,6 +35,8 @@ pub struct ClientConfig {
     pub transport: String,
     /// TLS configuration (required when transport is "tls").
     pub tls_config: Option<TlsConfig>,
+    /// STUN server address (e.g. `"stun.l.google.com:19302"`).
+    pub stun_server: Option<String>,
 }
 
 /// A SIP UA client that can send REGISTER and other requests,
@@ -72,19 +74,26 @@ impl Client {
         let call_id = transaction::generate_branch();
 
         // Compute a routable IP to advertise in Via/Contact headers.
+        // Priority: STUN mapped address > UDP connect heuristic > local address.
         let advertised_addr = if local_addr.ip().is_unspecified() {
-            use std::net::UdpSocket;
-            match UdpSocket::bind("0.0.0.0:0") {
-                Ok(sock) => match sock.connect(cfg.server_addr) {
-                    Ok(()) => match sock.local_addr() {
-                        Ok(addr) if !addr.ip().is_unspecified() => {
-                            SocketAddr::new(addr.ip(), local_addr.port())
-                        }
-                        _ => local_addr,
+            if let Some(stun_addr) = Self::try_stun(&cfg) {
+                info!("STUN mapped address: {}", stun_addr);
+                SocketAddr::new(stun_addr.ip(), local_addr.port())
+            } else {
+                // Fallback: UDP connect trick to determine local routable IP.
+                use std::net::UdpSocket;
+                match UdpSocket::bind("0.0.0.0:0") {
+                    Ok(sock) => match sock.connect(cfg.server_addr) {
+                        Ok(()) => match sock.local_addr() {
+                            Ok(addr) if !addr.ip().is_unspecified() => {
+                                SocketAddr::new(addr.ip(), local_addr.port())
+                            }
+                            _ => local_addr,
+                        },
+                        Err(_) => local_addr,
                     },
                     Err(_) => local_addr,
-                },
-                Err(_) => local_addr,
+                }
             }
         } else {
             local_addr
@@ -99,6 +108,35 @@ impl Client {
             via_transport,
             closed: Mutex::new(false),
         })
+    }
+
+    /// Attempts a STUN Binding Request to discover the NAT-mapped address.
+    /// Returns `None` if no STUN server is configured or if the request fails.
+    fn try_stun(cfg: &ClientConfig) -> Option<SocketAddr> {
+        let stun_server_str = cfg.stun_server.as_deref()?;
+        let stun_addr = match crate::stun::resolve_stun_server(stun_server_str) {
+            Ok(a) => a,
+            Err(e) => {
+                debug!("STUN resolve failed: {}", e);
+                return None;
+            }
+        };
+
+        let probe = match std::net::UdpSocket::bind("0.0.0.0:0") {
+            Ok(s) => s,
+            Err(e) => {
+                debug!("STUN bind failed: {}", e);
+                return None;
+            }
+        };
+
+        match crate::stun::stun_mapped_address(&probe, stun_addr, Duration::from_secs(3)) {
+            Ok(mapped) => Some(mapped),
+            Err(e) => {
+                debug!("STUN request failed: {}", e);
+                None
+            }
+        }
     }
 
     /// Returns the advertised address (routable IP + bound port)
@@ -502,6 +540,7 @@ mod tests {
             domain: "pbx.local".into(),
             transport: "udp".into(),
             tls_config: None,
+            stun_server: None,
         }
     }
 
@@ -544,6 +583,7 @@ mod tests {
             domain: "pbx.local".into(),
             transport: "udp".into(),
             tls_config: None,
+            stun_server: None,
         };
         let client = Client::new(cfg).unwrap();
 
