@@ -38,6 +38,7 @@ pub struct Phone {
 }
 
 impl Phone {
+    /// Creates a new `Phone` with the given configuration, initially in the `Disconnected` state.
     pub fn new(cfg: Config) -> Self {
         Self {
             cfg,

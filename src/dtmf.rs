@@ -7,9 +7,13 @@ pub const DTMF_PAYLOAD_TYPE: u8 = 101;
 /// A decoded DTMF event from an RTP packet.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DtmfEvent {
+    /// The DTMF digit (e.g., "0"-"9", "*", "#", "A"-"D").
     pub digit: String,
+    /// Event duration in timestamp units.
     pub duration: u16,
+    /// Whether this is the end-of-event packet (E bit set).
     pub end: bool,
+    /// Signal volume (0-63).
     pub volume: u8,
 }
 

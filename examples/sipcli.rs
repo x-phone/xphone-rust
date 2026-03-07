@@ -449,9 +449,7 @@ fn start_audio_handler(
 /// Set up cpal speaker output stream. Returns (ring_buffer, upsample_ratio)
 /// and keeps the Stream alive via ownership in the returned tuple.
 #[allow(clippy::type_complexity)]
-fn setup_speaker_stream(
-    active: Arc<AtomicBool>,
-) -> Option<(Arc<Mutex<VecDeque<f32>>>, usize)> {
+fn setup_speaker_stream(active: Arc<AtomicBool>) -> Option<(Arc<Mutex<VecDeque<f32>>>, usize)> {
     let host = cpal::default_host();
     let device = host.default_output_device()?;
     let config = device.default_output_config().ok()?;
@@ -576,7 +574,11 @@ fn exec_command(state: &SharedState, phone: &Phone, input: &str) {
                 match phone.dial(&target, opts) {
                     Ok(call) => {
                         wire_call_events(&call, &s);
-                        start_audio_handler(&call, Arc::clone(&echo_flag), Arc::clone(&speaker_flag));
+                        start_audio_handler(
+                            &call,
+                            Arc::clone(&echo_flag),
+                            Arc::clone(&speaker_flag),
+                        );
                         let mut st = s.lock().unwrap();
                         let short_id = &call.id()[..call.id().len().min(10)];
                         st.push_event(format!("[{}] connected to {}", short_id, target));
@@ -670,10 +672,7 @@ fn exec_command(state: &SharedState, phone: &Phone, input: &str) {
             flag.store(!prev, Ordering::Relaxed);
             drop(st);
             let label = if !prev { "ON" } else { "OFF" };
-            state
-                .lock()
-                .unwrap()
-                .push_event(format!("echo: {}", label));
+            state.lock().unwrap().push_event(format!("echo: {}", label));
         }
 
         "speaker" => {

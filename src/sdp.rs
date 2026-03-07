@@ -1,25 +1,35 @@
 use crate::error::Error;
 
-/// SDP direction constants.
+/// SDP direction: send and receive.
 pub const DIR_SEND_RECV: &str = "sendrecv";
+/// SDP direction: send only.
 pub const DIR_SEND_ONLY: &str = "sendonly";
+/// SDP direction: receive only.
 pub const DIR_RECV_ONLY: &str = "recvonly";
+/// SDP direction: inactive (neither send nor receive).
 pub const DIR_INACTIVE: &str = "inactive";
 
 /// A parsed SDP session description.
 #[derive(Debug, Clone)]
 pub struct Session {
+    /// The `o=` origin line value.
     pub origin: String,
+    /// The IP address from the `c=` connection line.
     pub connection: String,
+    /// Media descriptions parsed from `m=` lines.
     pub media: Vec<MediaDesc>,
+    /// The original raw SDP text.
     pub raw: String,
 }
 
 /// A single media description from an SDP m= line.
 #[derive(Debug, Clone)]
 pub struct MediaDesc {
+    /// Media port number.
     pub port: i32,
+    /// RTP payload type numbers offered/answered.
     pub codecs: Vec<i32>,
+    /// Stream direction (e.g., "sendrecv", "sendonly").
     pub direction: String,
 }
 

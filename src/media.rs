@@ -37,9 +37,13 @@ pub fn send_drop_oldest<T>(tx: &Sender<T>, rx: &Receiver<T>, item: T) {
 
 /// Configuration for the media pipeline.
 pub struct MediaConfig {
+    /// How long to wait without RTP before firing a media timeout.
     pub media_timeout: Duration,
+    /// Playout delay for the jitter buffer.
     pub jitter_depth: Duration,
+    /// PCM sample rate in Hz (typically 8000).
     pub pcm_rate: i32,
+    /// Audio codec to use for encoding/decoding.
     pub codec: Codec,
 }
 
@@ -57,7 +61,9 @@ impl Default for MediaConfig {
 /// A pair of sender and receiver for a bounded crossbeam channel.
 #[derive(Clone)]
 pub struct ChannelPair<T> {
+    /// Sending half of the channel.
     pub tx: Sender<T>,
+    /// Receiving half of the channel.
     pub rx: Receiver<T>,
 }
 
@@ -87,6 +93,7 @@ pub struct MediaChannels {
 }
 
 impl MediaChannels {
+    /// Creates a new set of media channels with no sent-RTP tap.
     pub fn new() -> Self {
         Self {
             rtp_inbound: ChannelPair::new(),
@@ -99,6 +106,7 @@ impl MediaChannels {
         }
     }
 
+    /// Enables the sent-RTP tap channel for testing outbound packets.
     pub fn with_sent_rtp(mut self) -> Self {
         self.sent_rtp = Some(ChannelPair::new());
         self
@@ -115,14 +123,20 @@ type Callback<T> = Mutex<Option<Arc<dyn Fn(T) + Send + Sync>>>;
 
 /// Shared mutable state the media thread reads from the call.
 pub struct MediaSharedState {
+    /// Whether outbound audio is muted.
     pub muted: AtomicBool,
+    /// Current call state, used to suspend timeout while on hold.
     pub state: Mutex<CallState>,
+    /// Callback fired when a DTMF digit is detected.
     pub on_dtmf_fn: Callback<String>,
+    /// Callback fired when the call ends (e.g., media timeout).
     pub on_ended_fn: Callback<EndReason>,
+    /// Callback fired on call state transitions.
     pub on_state_fn: Callback<CallState>,
 }
 
 impl MediaSharedState {
+    /// Creates shared state with the given initial call state.
     pub fn new(initial_state: CallState) -> Self {
         Self {
             muted: AtomicBool::new(false),
@@ -136,11 +150,14 @@ impl MediaSharedState {
 
 /// RTP transport for sending/receiving packets over UDP.
 pub struct MediaTransport {
+    /// The UDP socket for sending and receiving RTP.
     pub socket: Arc<UdpSocket>,
+    /// Remote address to send outbound RTP to.
     pub remote_addr: Mutex<SocketAddr>,
 }
 
 impl MediaTransport {
+    /// Wraps a UDP socket and remote address for RTP transport.
     pub fn new(socket: UdpSocket, remote_addr: SocketAddr) -> Self {
         socket
             .set_nonblocking(false)
@@ -184,6 +201,7 @@ pub struct MediaHandle {
 }
 
 impl MediaHandle {
+    /// Signals the media threads to stop and joins them.
     pub fn stop(&mut self) {
         let _ = self.done_tx.try_send(());
         if let Some(ref tx) = self.reader_done_tx {

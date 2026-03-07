@@ -3,10 +3,15 @@ pub mod pcmu;
 
 /// Handles encoding and decoding for a specific audio codec.
 pub trait CodecProcessor: Send {
+    /// Decodes an RTP payload into PCM samples.
     fn decode(&mut self, payload: &[u8]) -> Vec<i16>;
+    /// Encodes PCM samples into an RTP payload.
     fn encode(&mut self, samples: &[i16]) -> Vec<u8>;
+    /// Returns the RTP payload type number for this codec.
     fn payload_type(&self) -> u8;
+    /// Returns the codec clock rate in Hz.
     fn clock_rate(&self) -> u32;
+    /// Returns the number of samples per frame (e.g., 160 for 20ms at 8kHz).
     fn samples_per_frame(&self) -> u32;
 }
 

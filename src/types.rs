@@ -3,20 +3,21 @@ use std::fmt;
 /// Current state of a call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum CallState {
+    /// No active call.
     Idle,
     /// Inbound: INVITE received, not yet accepted.
     Ringing,
     /// Outbound: INVITE sent, no response yet.
     Dialing,
-    /// Outbound: 180 received.
+    /// Outbound: 180 Ringing received from remote.
     RemoteRinging,
-    /// Outbound: 183 received + early media enabled.
+    /// Outbound: 183 Session Progress received with early media.
     EarlyMedia,
     /// Call established, RTP flowing.
     Active,
-    /// Re-INVITE with a=sendonly/inactive.
+    /// Local hold via re-INVITE with `a=sendonly` or `a=inactive`.
     OnHold,
-    /// Terminal state.
+    /// Terminal state; see [`EndReason`] for cause.
     Ended,
 }
 
@@ -38,10 +39,15 @@ impl fmt::Display for CallState {
 /// Registration state of the phone.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum PhoneState {
+    /// Not connected to the SIP server.
     Disconnected,
+    /// REGISTER request in flight.
     Registering,
+    /// Successfully registered with the SIP server.
     Registered,
+    /// Un-REGISTER request in flight.
     Unregistering,
+    /// Registration attempt failed.
     RegistrationFailed,
 }
 
@@ -60,19 +66,19 @@ impl fmt::Display for PhoneState {
 /// Reason why a call ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EndReason {
-    /// End() while Active/OnHold.
+    /// Local hangup while call was active or on hold.
     Local,
-    /// BYE received.
+    /// Remote party sent BYE.
     Remote,
-    /// MediaTimeout exceeded.
+    /// RTP media timeout exceeded.
     Timeout,
     /// Internal or transport error.
     Error,
-    /// REFER completed.
+    /// Call ended after successful REFER transfer.
     Transfer,
-    /// Reject() called.
+    /// Inbound call rejected by local party.
     Rejected,
-    /// End() before 200 OK (outbound).
+    /// Outbound call cancelled before receiving 200 OK.
     Cancelled,
 }
 
@@ -93,7 +99,9 @@ impl fmt::Display for EndReason {
 /// Direction of a call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Direction {
+    /// Call received from a remote party.
     Inbound,
+    /// Call initiated by the local party.
     Outbound,
 }
 
@@ -106,21 +114,29 @@ impl fmt::Display for Direction {
     }
 }
 
-/// RTP packet header.
+/// Fixed portion of an RTP packet header (no CSRC or extensions).
 #[derive(Debug, Clone, Copy)]
 pub struct RtpHeader {
+    /// RTP version, typically `2`.
     pub version: u8,
+    /// Marker bit, often used to signal the start of a talkspurt.
     pub marker: bool,
+    /// Payload type identifying the codec (e.g., 0 = PCMU).
     pub payload_type: u8,
+    /// Monotonically increasing packet sequence number.
     pub sequence_number: u16,
+    /// Sampling-clock timestamp of the first octet in the payload.
     pub timestamp: u32,
+    /// Synchronization source identifier.
     pub ssrc: u32,
 }
 
-/// RTP packet.
+/// An RTP packet consisting of a header and a media payload.
 #[derive(Debug, Clone)]
 pub struct RtpPacket {
+    /// Parsed RTP header fields.
     pub header: RtpHeader,
+    /// Raw media payload bytes (codec-encoded audio).
     pub payload: Vec<u8>,
 }
 

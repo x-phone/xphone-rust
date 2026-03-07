@@ -1,3 +1,8 @@
+//! A SIP telephony library with an event-driven API.
+//!
+//! Provides registration lifecycle, call state management, media pipeline,
+//! and mock types for testing consumer code without a real SIP transport.
+
 pub mod call;
 pub mod codec;
 pub mod config;

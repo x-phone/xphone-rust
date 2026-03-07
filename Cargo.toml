@@ -2,8 +2,15 @@
 name = "xphone"
 version = "0.1.0"
 edition = "2021"
-description = "SIP telephony library with event-driven API"
+rust-version = "1.87"
+description = "SIP telephony library with event-driven API — handles SIP signaling, RTP media, codecs, and call state"
 license = "MIT"
+repository = "https://github.com/x-phone/xphone-rust"
+homepage = "https://github.com/x-phone/xphone-rust"
+documentation = "https://docs.rs/xphone"
+readme = "README.md"
+keywords = ["sip", "voip", "telephony", "rtp", "audio"]
+categories = ["multimedia::audio", "network-programming"]
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }

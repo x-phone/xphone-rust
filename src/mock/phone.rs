@@ -32,6 +32,7 @@ impl std::fmt::Debug for MockPhone {
 }
 
 impl MockPhone {
+    /// Creates a new `MockPhone` in the `Disconnected` state.
     pub fn new() -> Self {
         Self {
             inner: Mutex::new(Inner {
@@ -45,6 +46,7 @@ impl MockPhone {
         }
     }
 
+    /// Connects and registers the phone. Fires the on_registered callback.
     pub fn connect(&self) -> Result<()> {
         let cb = {
             let mut inner = self.inner.lock();
@@ -60,6 +62,7 @@ impl MockPhone {
         Ok(())
     }
 
+    /// Disconnects the phone. Fires the on_unregistered callback.
     pub fn disconnect(&self) -> Result<()> {
         let cb = {
             let mut inner = self.inner.lock();
@@ -75,6 +78,7 @@ impl MockPhone {
         Ok(())
     }
 
+    /// Dials a target URI, returning an outbound `MockCall` in the `Active` state.
     pub fn dial(&self, target: &str, _opts: DialOptions) -> Result<Arc<MockCall>> {
         let mut inner = self.inner.lock();
         if inner.state != PhoneState::Registered {
@@ -89,22 +93,27 @@ impl MockPhone {
         Ok(call)
     }
 
+    /// Registers a callback fired when an incoming call arrives.
     pub fn on_incoming<F: Fn(Arc<MockCall>) + Send + Sync + 'static>(&self, f: F) {
         self.inner.lock().on_incoming_fn = Some(Arc::new(f));
     }
 
+    /// Registers a callback fired when the phone becomes registered.
     pub fn on_registered<F: Fn() + Send + Sync + 'static>(&self, f: F) {
         self.inner.lock().on_registered_fn = Some(Arc::new(f));
     }
 
+    /// Registers a callback fired when the phone becomes unregistered.
     pub fn on_unregistered<F: Fn() + Send + Sync + 'static>(&self, f: F) {
         self.inner.lock().on_unregistered_fn = Some(Arc::new(f));
     }
 
+    /// Registers a callback fired on errors.
     pub fn on_error<F: Fn(Error) + Send + Sync + 'static>(&self, f: F) {
         self.inner.lock().on_error_fn = Some(Arc::new(f));
     }
 
+    /// Returns the current phone state.
     pub fn state(&self) -> PhoneState {
         self.inner.lock().state
     }

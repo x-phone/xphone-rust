@@ -138,13 +138,16 @@ struct CallInner {
     session_timer_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
 }
 
-/// A SIP call with state machine, dialog operations, and callbacks.
+/// Manages a single SIP call lifecycle including state transitions, media, and callbacks.
+///
+/// Created via [`Call::new_inbound`] or [`Call::new_outbound`] and returned as `Arc<Call>`.
 pub struct Call {
     inner: Mutex<CallInner>,
     dlg: Arc<dyn Dialog>,
 }
 
 impl Call {
+    /// Creates a new inbound call in the `Ringing` state.
     pub fn new_inbound(dlg: Arc<dyn Dialog>) -> Arc<Self> {
         Arc::new(Call {
             inner: Mutex::new(CallInner {
@@ -183,6 +186,7 @@ impl Call {
         })
     }
 
+    /// Creates a new outbound call in the `Dialing` state with the given dial options.
     pub fn new_outbound(dlg: Arc<dyn Dialog>, opts: DialOptions) -> Arc<Self> {
         Arc::new(Call {
             inner: Mutex::new(CallInner {
@@ -223,38 +227,47 @@ impl Call {
 
     // --- Getters ---
 
+    /// Returns the unique internal call identifier.
     pub fn id(&self) -> String {
         self.inner.lock().id.clone()
     }
 
+    /// Returns the SIP Call-ID header value from the underlying dialog.
     pub fn call_id(&self) -> String {
         self.dlg.call_id()
     }
 
+    /// Returns the call direction (inbound or outbound).
     pub fn direction(&self) -> Direction {
         self.inner.lock().direction
     }
 
+    /// Returns the current call state (e.g., Ringing, Active, OnHold, Ended).
     pub fn state(&self) -> CallState {
         self.inner.lock().state
     }
 
+    /// Returns the negotiated audio codec for this call.
     pub fn codec(&self) -> Codec {
         self.inner.lock().codec
     }
 
+    /// Returns the local SDP offer or answer for this call.
     pub fn local_sdp(&self) -> String {
         self.inner.lock().local_sdp.clone()
     }
 
+    /// Returns the remote SDP received from the far end.
     pub fn remote_sdp(&self) -> String {
         self.inner.lock().remote_sdp.clone()
     }
 
+    /// Returns the instant the call became active, or `None` if not yet answered.
     pub fn start_time(&self) -> Option<Instant> {
         self.inner.lock().start_time
     }
 
+    /// Returns the elapsed duration since the call became active, or zero if not yet answered.
     pub fn duration(&self) -> Duration {
         let inner = self.inner.lock();
         match inner.start_time {
@@ -263,6 +276,7 @@ impl Call {
         }
     }
 
+    /// Returns the full SIP URI of the remote party (e.g., `sip:user@host`).
     pub fn remote_uri(&self) -> String {
         let vals = self.dlg.header("From");
         vals.first()
@@ -270,6 +284,7 @@ impl Call {
             .unwrap_or_default()
     }
 
+    /// Returns the user part of the SIP From header (e.g., `+15551234567`).
     pub fn from(&self) -> String {
         let vals = self.dlg.header("From");
         vals.first()
@@ -277,6 +292,7 @@ impl Call {
             .unwrap_or_default()
     }
 
+    /// Returns the user part of the SIP To header.
     pub fn to(&self) -> String {
         let vals = self.dlg.header("To");
         vals.first()
@@ -284,6 +300,7 @@ impl Call {
             .unwrap_or_default()
     }
 
+    /// Returns the display name from the SIP From header (e.g., `Alice`).
     pub fn from_name(&self) -> String {
         let vals = self.dlg.header("From");
         vals.first()
@@ -291,6 +308,7 @@ impl Call {
             .unwrap_or_default()
     }
 
+    /// Returns the remote media IP address, parsed from the remote SDP.
     pub fn remote_ip(&self) -> String {
         let inner = self.inner.lock();
         if !inner.remote_ip.is_empty() {
@@ -304,6 +322,7 @@ impl Call {
             .unwrap_or_default()
     }
 
+    /// Returns the remote RTP port, parsed from the remote SDP.
     pub fn remote_port(&self) -> i32 {
         let inner = self.inner.lock();
         if inner.remote_port != 0 {
@@ -317,14 +336,17 @@ impl Call {
             .unwrap_or(0)
     }
 
+    /// Returns the values of a specific SIP header by name.
     pub fn header(&self, name: &str) -> Vec<String> {
         self.dlg.header(name)
     }
 
+    /// Returns all SIP headers from the underlying dialog.
     pub fn headers(&self) -> HashMap<String, Vec<String>> {
         self.dlg.headers()
     }
 
+    /// Returns whether the media session is currently active.
     pub fn media_session_active(&self) -> bool {
         self.inner.lock().media_active
     }
@@ -450,6 +472,9 @@ impl Call {
 
     // --- Actions ---
 
+    /// Accepts an inbound call, transitioning from `Ringing` to `Active`.
+    ///
+    /// Sends a 200 OK with SDP, starts the media pipeline, and fires state/media callbacks.
     pub fn accept(self: &Arc<Self>) -> Result<()> {
         info!(call_id = %self.call_id(), "Call accepting");
         let on_media_fn;
@@ -489,6 +514,7 @@ impl Call {
         Ok(())
     }
 
+    /// Rejects an inbound call with the given SIP response code and reason.
     pub fn reject(&self, code: u16, reason: &str) -> Result<()> {
         let mut inner = self.inner.lock();
         if inner.state != CallState::Ringing {
@@ -501,6 +527,7 @@ impl Call {
         Ok(())
     }
 
+    /// Ends the call. Sends CANCEL if dialing, or BYE if active/on-hold.
     pub fn end(&self) -> Result<()> {
         let mut inner = self.inner.lock();
         if let Some(ref cancel) = inner.session_timer_cancel {
@@ -528,6 +555,7 @@ impl Call {
         }
     }
 
+    /// Places the call on hold by sending a re-INVITE with `sendonly` SDP.
     pub fn hold(&self) -> Result<()> {
         let mut inner = self.inner.lock();
         if inner.state != CallState::Active {
@@ -540,6 +568,7 @@ impl Call {
         Ok(())
     }
 
+    /// Resumes a held call by sending a re-INVITE with `sendrecv` SDP.
     pub fn resume(&self) -> Result<()> {
         let mut inner = self.inner.lock();
         if inner.state != CallState::OnHold {
@@ -552,6 +581,7 @@ impl Call {
         Ok(())
     }
 
+    /// Mutes the local audio. Returns an error if already muted or not active.
     pub fn mute(&self) -> Result<()> {
         let on_mute;
         {
@@ -571,6 +601,7 @@ impl Call {
         Ok(())
     }
 
+    /// Unmutes the local audio. Returns an error if not muted or not active.
     pub fn unmute(&self) -> Result<()> {
         let on_unmute;
         {
@@ -590,6 +621,7 @@ impl Call {
         Ok(())
     }
 
+    /// Sends a DTMF digit (e.g., `"1"`, `"#"`, `"*"`) as RFC 2833 RTP events.
     pub fn send_dtmf(&self, digit: &str) -> Result<()> {
         let (rtp_socket, remote_ip, remote_port) = {
             let inner = self.inner.lock();
@@ -621,6 +653,7 @@ impl Call {
         Ok(())
     }
 
+    /// Initiates a blind (unattended) transfer to the given SIP target URI.
     pub fn blind_transfer(self: &Arc<Self>, target: &str) -> Result<()> {
         {
             let inner = self.inner.lock();
@@ -646,6 +679,7 @@ impl Call {
 
     // --- Simulation methods (for tests and incoming SIP events) ---
 
+    /// Simulates receiving a SIP response (180, 183, 200) to drive outbound call state transitions.
     pub fn simulate_response(self: &Arc<Self>, code: u16, _reason: &str) {
         let start_timer;
         {
@@ -700,6 +734,7 @@ impl Call {
         }
     }
 
+    /// Simulates receiving a remote BYE, ending the call.
     pub fn simulate_bye(&self) {
         let mut inner = self.inner.lock();
         if inner.state == CallState::Ended {
@@ -721,6 +756,7 @@ impl Call {
         Self::fire_on_ended(&inner, reason);
     }
 
+    /// Simulates receiving a remote re-INVITE, handling hold/resume based on SDP direction.
     pub fn simulate_reinvite(&self, raw_sdp: &str) {
         let mut inner = self.inner.lock();
         if inner.state == CallState::Ended {
@@ -847,18 +883,22 @@ impl Call {
 
     // --- Callback setters ---
 
+    /// Registers a callback invoked on every state transition.
     pub fn on_state(&self, f: impl Fn(CallState) + Send + Sync + 'static) {
         self.inner.lock().on_state_fn = Some(Arc::new(f));
     }
 
+    /// Registers a callback invoked when the call ends, with the reason.
     pub fn on_ended(&self, f: impl Fn(EndReason) + Send + Sync + 'static) {
         self.inner.lock().on_ended_fn = Some(Arc::new(f));
     }
 
+    /// Registers a callback invoked when the media session becomes available.
     pub fn on_media(&self, f: impl Fn() + Send + Sync + 'static) {
         self.inner.lock().on_media_fn = Some(Arc::new(f));
     }
 
+    /// Registers a callback invoked when a DTMF digit is received.
     pub fn on_dtmf(&self, f: impl Fn(String) + Send + Sync + 'static) {
         let cb: Arc<dyn Fn(String) + Send + Sync> = Arc::new(f);
         let mut inner = self.inner.lock();
@@ -869,18 +909,22 @@ impl Call {
         }
     }
 
+    /// Registers a callback invoked when the call is placed on hold.
     pub fn on_hold(&self, f: impl Fn() + Send + Sync + 'static) {
         self.inner.lock().on_hold_fn = Some(Arc::new(f));
     }
 
+    /// Registers a callback invoked when the call is resumed from hold.
     pub fn on_resume(&self, f: impl Fn() + Send + Sync + 'static) {
         self.inner.lock().on_resume_fn = Some(Arc::new(f));
     }
 
+    /// Registers a callback invoked when the call is muted.
     pub fn on_mute(&self, f: impl Fn() + Send + Sync + 'static) {
         self.inner.lock().on_mute_fn = Some(Arc::new(f));
     }
 
+    /// Registers a callback invoked when the call is unmuted.
     pub fn on_unmute(&self, f: impl Fn() + Send + Sync + 'static) {
         self.inner.lock().on_unmute_fn = Some(Arc::new(f));
     }

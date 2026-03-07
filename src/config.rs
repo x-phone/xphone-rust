@@ -2,29 +2,48 @@ use std::time::Duration;
 
 use crate::types::Codec;
 
-/// Configuration for a Phone instance.
+/// Configuration for a [`Phone`](crate::phone::Phone) instance.
+///
+/// Use [`PhoneBuilder`] for ergonomic construction with defaults.
 #[derive(Debug, Clone)]
 pub struct Config {
+    /// SIP username / extension.
     pub username: String,
+    /// SIP password for digest authentication.
     pub password: String,
+    /// SIP server hostname or IP address.
     pub host: String,
+    /// SIP server port (default `5060`).
     pub port: u16,
+    /// Transport protocol, e.g. `"udp"` or `"tcp"`.
     pub transport: String,
 
+    /// REGISTER expiry duration advertised to the server.
     pub register_expiry: Duration,
+    /// Delay between registration retry attempts.
     pub register_retry: Duration,
+    /// Maximum number of consecutive registration retries.
     pub register_max_retry: u32,
 
+    /// Interval for NAT keep-alive packets. `None` disables keep-alive.
     pub nat_keepalive_interval: Option<Duration>,
 
-    /// Override the local IP advertised in SDP. If empty, auto-detected.
+    /// Override the local IP advertised in SDP/Via/Contact.
+    /// If empty, the address is auto-detected.
     pub local_ip: String,
+    /// Minimum port in the RTP port range (0 = OS-assigned).
     pub rtp_port_min: u16,
+    /// Maximum port in the RTP port range (0 = OS-assigned).
     pub rtp_port_max: u16,
+    /// Preferred codecs in priority order.
     pub codec_prefs: Vec<Codec>,
+    /// Jitter buffer depth for inbound RTP.
     pub jitter_buffer: Duration,
+    /// Duration of RTP silence before a media timeout is raised.
     pub media_timeout: Duration,
+    /// PCM frame size in samples. 0 uses the codec default.
     pub pcm_frame_size: usize,
+    /// PCM sample rate in Hz (default `8000`).
     pub pcm_rate: u32,
 }
 
@@ -58,12 +77,14 @@ pub struct PhoneBuilder {
 }
 
 impl PhoneBuilder {
+    /// Creates a new builder with default configuration values.
     pub fn new() -> Self {
         PhoneBuilder {
             config: Config::default(),
         }
     }
 
+    /// Sets SIP username, password, and server host.
     pub fn credentials(mut self, username: &str, password: &str, host: &str) -> Self {
         self.config.username = username.into();
         self.config.password = password.into();
@@ -71,62 +92,74 @@ impl PhoneBuilder {
         self
     }
 
+    /// Sets the transport protocol (e.g. `"udp"`, `"tcp"`).
     pub fn transport(mut self, protocol: &str) -> Self {
         self.config.transport = protocol.into();
         self
     }
 
+    /// Sets the SIP server port.
     pub fn port(mut self, port: u16) -> Self {
         self.config.port = port;
         self
     }
 
+    /// Sets the RTP port range.
     pub fn rtp_ports(mut self, min: u16, max: u16) -> Self {
         self.config.rtp_port_min = min;
         self.config.rtp_port_max = max;
         self
     }
 
+    /// Sets the preferred codec list in priority order.
     pub fn codecs(mut self, codecs: Vec<Codec>) -> Self {
         self.config.codec_prefs = codecs;
         self
     }
 
+    /// Sets the jitter buffer depth for inbound RTP.
     pub fn jitter_buffer(mut self, d: Duration) -> Self {
         self.config.jitter_buffer = d;
         self
     }
 
+    /// Sets the media timeout duration.
     pub fn media_timeout(mut self, d: Duration) -> Self {
         self.config.media_timeout = d;
         self
     }
 
+    /// Enables NAT keep-alive with the given interval.
     pub fn nat_keepalive(mut self, d: Duration) -> Self {
         self.config.nat_keepalive_interval = Some(d);
         self
     }
 
+    /// Sets the PCM sample rate in Hz.
     pub fn pcm_rate(mut self, rate: u32) -> Self {
         self.config.pcm_rate = rate;
         self
     }
 
+    /// Sets the REGISTER expiry duration.
     pub fn register_expiry(mut self, d: Duration) -> Self {
         self.config.register_expiry = d;
         self
     }
 
+    /// Sets the delay between registration retry attempts.
     pub fn register_retry(mut self, d: Duration) -> Self {
         self.config.register_retry = d;
         self
     }
 
+    /// Sets the maximum number of registration retries.
     pub fn register_max_retry(mut self, n: u32) -> Self {
         self.config.register_max_retry = n;
         self
     }
 
+    /// Consumes the builder and returns the finished [`Config`].
     pub fn build(self) -> Config {
         self.config
     }
@@ -139,12 +172,19 @@ impl Default for PhoneBuilder {
 }
 
 /// Configuration for an outbound call.
+///
+/// Use [`DialOptionsBuilder`] for ergonomic construction with defaults.
 #[derive(Debug, Clone)]
 pub struct DialOptions {
+    /// Caller-ID string to place in the From header. `None` uses the default.
     pub caller_id: Option<String>,
+    /// Extra SIP headers to include in the INVITE.
     pub custom_headers: std::collections::HashMap<String, String>,
+    /// Whether to accept early media (183 Session Progress).
     pub early_media: bool,
+    /// Maximum time to wait for the callee to answer.
     pub timeout: Duration,
+    /// Codec list that overrides the phone-level preferences for this call.
     pub codec_override: Vec<Codec>,
 }
 
@@ -166,37 +206,44 @@ pub struct DialOptionsBuilder {
 }
 
 impl DialOptionsBuilder {
+    /// Creates a new builder with default dial options.
     pub fn new() -> Self {
         DialOptionsBuilder {
             opts: DialOptions::default(),
         }
     }
 
+    /// Sets the caller-ID string for the From header.
     pub fn caller_id(mut self, id: &str) -> Self {
         self.opts.caller_id = Some(id.into());
         self
     }
 
+    /// Adds a custom SIP header to the INVITE.
     pub fn header(mut self, name: &str, value: &str) -> Self {
         self.opts.custom_headers.insert(name.into(), value.into());
         self
     }
 
+    /// Enables early media (183 Session Progress).
     pub fn early_media(mut self) -> Self {
         self.opts.early_media = true;
         self
     }
 
+    /// Sets the dial timeout.
     pub fn timeout(mut self, d: Duration) -> Self {
         self.opts.timeout = d;
         self
     }
 
+    /// Overrides the phone-level codec preferences for this call.
     pub fn codec_override(mut self, codecs: Vec<Codec>) -> Self {
         self.opts.codec_override = codecs;
         self
     }
 
+    /// Consumes the builder and returns the finished [`DialOptions`].
     pub fn build(self) -> DialOptions {
         self.opts
     }

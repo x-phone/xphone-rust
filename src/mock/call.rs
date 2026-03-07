@@ -68,6 +68,7 @@ impl std::fmt::Debug for MockCall {
 }
 
 impl MockCall {
+    /// Creates a new `MockCall` with default state (`Ringing`, `Inbound`).
     pub fn new() -> Self {
         Self {
             inner: Mutex::new(Inner {
@@ -103,62 +104,77 @@ impl MockCall {
 
     // --- Getters (mirror Call API) ---
 
+    /// Returns the unique mock call identifier.
     pub fn id(&self) -> String {
         self.inner.lock().id.clone()
     }
 
+    /// Returns the SIP Call-ID.
     pub fn call_id(&self) -> String {
         self.inner.lock().call_id.clone()
     }
 
+    /// Returns the current call state.
     pub fn state(&self) -> CallState {
         self.inner.lock().state
     }
 
+    /// Returns the call direction (inbound or outbound).
     pub fn direction(&self) -> Direction {
         self.inner.lock().direction
     }
 
+    /// Returns the From URI.
     pub fn from(&self) -> String {
         self.inner.lock().from.clone()
     }
 
+    /// Returns the To URI.
     pub fn to(&self) -> String {
         self.inner.lock().to.clone()
     }
 
+    /// Returns the display name from the From header.
     pub fn from_name(&self) -> String {
         self.inner.lock().from_name.clone()
     }
 
+    /// Returns the remote party's SIP URI.
     pub fn remote_uri(&self) -> String {
         self.inner.lock().remote_uri.clone()
     }
 
+    /// Returns the remote party's IP address.
     pub fn remote_ip(&self) -> String {
         self.inner.lock().remote_ip.clone()
     }
 
+    /// Returns the remote party's RTP port.
     pub fn remote_port(&self) -> i32 {
         self.inner.lock().remote_port
     }
 
+    /// Returns the negotiated audio codec.
     pub fn codec(&self) -> Codec {
         self.inner.lock().codec
     }
 
+    /// Returns the local SDP offer/answer.
     pub fn local_sdp(&self) -> String {
         self.inner.lock().local_sdp.clone()
     }
 
+    /// Returns the remote SDP offer/answer.
     pub fn remote_sdp(&self) -> String {
         self.inner.lock().remote_sdp.clone()
     }
 
+    /// Returns the time when the call became active, if any.
     pub fn start_time(&self) -> Option<Instant> {
         self.inner.lock().start_time
     }
 
+    /// Returns how long the call has been active. Zero if not yet active.
     pub fn duration(&self) -> Duration {
         self.inner
             .lock()
@@ -167,6 +183,7 @@ impl MockCall {
             .unwrap_or(Duration::ZERO)
     }
 
+    /// Returns values for the given SIP header name (case-insensitive).
     pub fn header(&self, name: &str) -> Vec<String> {
         let inner = self.inner.lock();
         let lower = name.to_lowercase();
@@ -178,12 +195,14 @@ impl MockCall {
         Vec::new()
     }
 
+    /// Returns all SIP headers as a map.
     pub fn headers(&self) -> HashMap<String, Vec<String>> {
         self.inner.lock().headers.clone()
     }
 
     // --- Actions (mirror Call API) ---
 
+    /// Accepts a ringing call, transitioning it to `Active`.
     pub fn accept(&self) -> Result<()> {
         let cb = {
             let mut inner = self.inner.lock();
@@ -200,6 +219,7 @@ impl MockCall {
         Ok(())
     }
 
+    /// Rejects a ringing call with the given SIP status code and reason.
     pub fn reject(&self, _code: u16, _reason: &str) -> Result<()> {
         let (state_cb, ended_cb) = {
             let mut inner = self.inner.lock();
@@ -218,6 +238,7 @@ impl MockCall {
         Ok(())
     }
 
+    /// Ends an active, on-hold, or dialing call.
     pub fn end(&self) -> Result<()> {
         let (reason, state_cb, ended_cb) = {
             let mut inner = self.inner.lock();
@@ -240,6 +261,7 @@ impl MockCall {
         Ok(())
     }
 
+    /// Places an active call on hold.
     pub fn hold(&self) -> Result<()> {
         let (state_cb, hold_cb) = {
             let mut inner = self.inner.lock();
@@ -258,6 +280,7 @@ impl MockCall {
         Ok(())
     }
 
+    /// Resumes a held call back to active.
     pub fn resume(&self) -> Result<()> {
         let (state_cb, resume_cb) = {
             let mut inner = self.inner.lock();
@@ -276,6 +299,7 @@ impl MockCall {
         Ok(())
     }
 
+    /// Mutes the call's outgoing audio.
     pub fn mute(&self) -> Result<()> {
         let cb = {
             let mut inner = self.inner.lock();
@@ -294,6 +318,7 @@ impl MockCall {
         Ok(())
     }
 
+    /// Unmutes the call's outgoing audio.
     pub fn unmute(&self) -> Result<()> {
         let cb = {
             let mut inner = self.inner.lock();
@@ -312,6 +337,7 @@ impl MockCall {
         Ok(())
     }
 
+    /// Sends a DTMF digit. Records it for later inspection via [`sent_dtmf`](Self::sent_dtmf).
     pub fn send_dtmf(&self, digit: &str) -> Result<()> {
         let mut inner = self.inner.lock();
         if inner.state != CallState::Active {
@@ -321,6 +347,7 @@ impl MockCall {
         Ok(())
     }
 
+    /// Initiates a blind transfer. Records the target for inspection via [`last_transfer_target`](Self::last_transfer_target).
     pub fn blind_transfer(&self, target: &str) -> Result<()> {
         let mut inner = self.inner.lock();
         if inner.state != CallState::Active && inner.state != CallState::OnHold {
@@ -332,84 +359,104 @@ impl MockCall {
 
     // --- Callback setters ---
 
+    /// Registers a callback fired when a DTMF digit is received.
     pub fn on_dtmf(&self, f: impl Fn(String) + Send + Sync + 'static) {
         self.inner.lock().on_dtmf_fn = Some(Arc::new(f));
     }
 
+    /// Registers a callback fired when the call is placed on hold.
     pub fn on_hold(&self, f: impl Fn() + Send + Sync + 'static) {
         self.inner.lock().on_hold_fn = Some(Arc::new(f));
     }
 
+    /// Registers a callback fired when the call is resumed from hold.
     pub fn on_resume(&self, f: impl Fn() + Send + Sync + 'static) {
         self.inner.lock().on_resume_fn = Some(Arc::new(f));
     }
 
+    /// Registers a callback fired when the call is muted.
     pub fn on_mute(&self, f: impl Fn() + Send + Sync + 'static) {
         self.inner.lock().on_mute_fn = Some(Arc::new(f));
     }
 
+    /// Registers a callback fired when the call is unmuted.
     pub fn on_unmute(&self, f: impl Fn() + Send + Sync + 'static) {
         self.inner.lock().on_unmute_fn = Some(Arc::new(f));
     }
 
+    /// Registers a callback fired when media starts flowing.
     pub fn on_media(&self, f: impl Fn() + Send + Sync + 'static) {
         self.inner.lock().on_media_fn = Some(Arc::new(f));
     }
 
+    /// Registers a callback fired on every state transition.
     pub fn on_state(&self, f: impl Fn(CallState) + Send + Sync + 'static) {
         self.inner.lock().on_state_fn = Some(Arc::new(f));
     }
 
+    /// Registers a callback fired when the call ends, with the reason.
     pub fn on_ended(&self, f: impl Fn(EndReason) + Send + Sync + 'static) {
         self.inner.lock().on_ended_fn = Some(Arc::new(f));
     }
 
     // --- Test setters ---
 
+    /// Sets the call state directly (test helper).
     pub fn set_state(&self, s: CallState) {
         self.inner.lock().state = s;
     }
 
+    /// Sets the call direction (test helper).
     pub fn set_direction(&self, d: Direction) {
         self.inner.lock().direction = d;
     }
 
+    /// Sets the From URI (test helper).
     pub fn set_from(&self, from: &str) {
         self.inner.lock().from = from.into();
     }
 
+    /// Sets the To URI (test helper).
     pub fn set_to(&self, to: &str) {
         self.inner.lock().to = to.into();
     }
 
+    /// Sets the From display name (test helper).
     pub fn set_from_name(&self, name: &str) {
         self.inner.lock().from_name = name.into();
     }
 
+    /// Sets the remote SIP URI (test helper).
     pub fn set_remote_uri(&self, uri: &str) {
         self.inner.lock().remote_uri = uri.into();
     }
 
+    /// Sets the remote IP address (test helper).
     pub fn set_remote_ip(&self, ip: &str) {
         self.inner.lock().remote_ip = ip.into();
     }
 
+    /// Sets the remote RTP port (test helper).
     pub fn set_remote_port(&self, port: i32) {
         self.inner.lock().remote_port = port;
     }
 
+    /// Sets the negotiated codec (test helper).
     pub fn set_codec(&self, codec: Codec) {
         self.inner.lock().codec = codec;
     }
 
+    /// Sets the local SDP (test helper).
     pub fn set_local_sdp(&self, sdp: &str) {
         self.inner.lock().local_sdp = sdp.into();
     }
 
+    /// Sets the remote SDP (test helper).
     pub fn set_remote_sdp(&self, sdp: &str) {
         self.inner.lock().remote_sdp = sdp.into();
     }
 
+    /// Sets a SIP header value (test helper).
     pub fn set_header(&self, name: &str, value: &str) {
         self.inner
             .lock()
@@ -419,20 +466,24 @@ impl MockCall {
 
     // --- Test inspection ---
 
+    /// Returns whether the call is currently muted.
     pub fn muted(&self) -> bool {
         self.inner.lock().muted
     }
 
+    /// Returns all DTMF digits sent via [`send_dtmf`](Self::send_dtmf).
     pub fn sent_dtmf(&self) -> Vec<String> {
         self.inner.lock().sent_dtmf.clone()
     }
 
+    /// Returns the target URI from the last [`blind_transfer`](Self::blind_transfer) call.
     pub fn last_transfer_target(&self) -> String {
         self.inner.lock().transfer_to.clone()
     }
 
     // --- Simulation ---
 
+    /// Simulates receiving a DTMF digit, firing the on_dtmf callback.
     pub fn simulate_dtmf(&self, digit: &str) {
         let cb = self.inner.lock().on_dtmf_fn.clone();
         if let Some(f) = cb {
