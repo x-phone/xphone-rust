@@ -8,7 +8,7 @@ All notable changes to this project will be documented in this file.
 
 - SIP registration with digest authentication and automatic refresh
 - Outbound and inbound call support with full state machine
-- G.711 codecs (PCMU / PCMA)
+- G.711 codecs (PCMU / PCMA) and G.722 wideband codec
 - Jitter buffer with configurable depth
 - Media pipeline on dedicated `std::thread` with crossbeam channels
 - DTMF send (RFC 2833 telephone-event) and receive
@@ -24,7 +24,7 @@ All notable changes to this project will be documented in this file.
 ### Known Limitations
 
 - SRTP not yet production-ready
-- G.722 and Opus codecs not yet supported
+- Opus codec not yet supported
 - TCP/TLS SIP transport not implemented
 - No STUN/TURN/ICE support
 - No attended (consultative) transfer

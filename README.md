@@ -193,10 +193,10 @@ if let Some(pcm_rx) = call.pcm_reader() {
 | Session timers (RFC 4028) | Done |
 | Mute / Unmute | Done |
 | G.711 u-law (PCMU), G.711 A-law (PCMA) | Done |
+| G.722 wideband codec | Done |
 | PCM audio frames (`Vec<i16>`) and raw RTP access | Done |
 | Jitter buffer | Done |
 | MockPhone & MockCall for unit testing | Done |
-| G.722 codec | Planned |
 | Attended transfer | Planned |
 | Opus codec | Planned |
 | SRTP (encrypted media) | Planned |
@@ -471,7 +471,7 @@ cargo run --example sipcli --features cli -- --server pbx.example.com --user 100
 |---|---|
 | SIP Signaling | Custom (message parsing, digest auth, transactions) |
 | RTP Media | Custom (`std::net::UdpSocket`) |
-| G.711 | Built-in (PCMU + PCMA) |
+| G.711 / G.722 | Built-in (PCMU, PCMA, G.722) |
 | Jitter Buffer | Built-in |
 | TUI (sipcli) | [ratatui](https://github.com/ratatui/ratatui) + [cpal](https://github.com/RustAudio/cpal) |
 
@@ -489,7 +489,7 @@ This library is actively developed but not yet complete. The gaps below are wort
 
 ### Codec coverage
 
-**G.722 and Opus are not yet supported.** Only G.711 (PCMU/PCMA) is implemented. Some SIP trunk providers default to wideband codecs and may require explicit configuration to fall back to G.711.
+**Opus is not yet supported.** G.711 (PCMU/PCMA) and G.722 are implemented. Some SIP trunk providers may require explicit codec configuration.
 
 **G.729 is not supported.** G.729 is widely deployed in enterprise PBX environments. If your SIP trunk or PBX requires G.729, xphone cannot currently interoperate with it.
 
@@ -514,7 +514,6 @@ This is an early-stage project. The API may change between releases. Evaluate ac
 ## Roadmap
 
 - SRTP — encrypted media (RFC 3711)
-- G.722 codec
 - Opus codec
 - TCP/TLS SIP transport
 - Attended (consultative) transfer
