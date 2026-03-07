@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::call::Call;
 use crate::config::{Config, DialOptions};
@@ -537,7 +537,7 @@ fn handle_bye(inner: &Arc<Mutex<Inner>>, call_id: &str) {
     if let Some(call) = call {
         call.simulate_bye();
     } else {
-        warn!(call_id = %call_id, "Phone BYE for unknown call");
+        debug!(call_id = %call_id, "Phone BYE for unknown call (already ended)");
     }
 }
 
