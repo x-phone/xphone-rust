@@ -260,13 +260,14 @@ pub fn start_media(
 
                     // Check media timeout on each tick.
                     if last_rtp_time.elapsed() >= timeout {
-                        let state = *shared.state.lock();
-                        if state == CallState::OnHold {
+                        let mut state = shared.state.lock();
+                        if *state == CallState::OnHold {
                             // Suspend timeout while on hold.
                             last_rtp_time = Instant::now();
                         } else {
                             // Fire timeout.
-                            *shared.state.lock() = CallState::Ended;
+                            *state = CallState::Ended;
+                            drop(state);
                             let on_state = shared.on_state_fn.lock().clone();
                             if let Some(f) = on_state {
                                 std::thread::spawn(move || f(CallState::Ended));
