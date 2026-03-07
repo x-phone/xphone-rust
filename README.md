@@ -196,10 +196,11 @@ if let Some(pcm_rx) = call.pcm_reader() {
 | G.722 wideband codec | Done |
 | PCM audio frames (`Vec<i16>`) and raw RTP access | Done |
 | Jitter buffer | Done |
+| SRTP (encrypted media, AES_CM_128_HMAC_SHA1_80) | Done |
+| TCP and TLS SIP transport | Done |
 | MockPhone & MockCall for unit testing | Done |
 | Attended transfer | Planned |
 | Opus codec | Planned |
-| SRTP (encrypted media) | Planned |
 
 ---
 
@@ -469,8 +470,8 @@ cargo run --example sipcli --features cli -- --server pbx.example.com --user 100
 
 | Layer | Implementation |
 |---|---|
-| SIP Signaling | Custom (message parsing, digest auth, transactions) |
-| RTP Media | Custom (`std::net::UdpSocket`) |
+| SIP Signaling | Custom (message parsing, digest auth, transactions, UDP/TCP/TLS) |
+| RTP / SRTP | Custom (`std::net::UdpSocket`, AES_CM_128_HMAC_SHA1_80) |
 | G.711 / G.722 | Built-in (PCMU, PCMA, G.722) |
 | Jitter Buffer | Built-in |
 | TUI (sipcli) | [ratatui](https://github.com/ratatui/ratatui) + [cpal](https://github.com/RustAudio/cpal) |
@@ -485,17 +486,13 @@ This library is actively developed but not yet complete. The gaps below are wort
 
 ### Security
 
-**SRTP is not implemented.** All RTP audio is transmitted unencrypted over UDP. On untrusted or public networks, audio can be intercepted and recorded by anyone on the path between your server and the SIP trunk. Do not use in production environments where call privacy is required until SRTP support lands.
+**SRTP is implemented but not yet hardened.** The `AES_CM_128_HMAC_SHA1_80` cipher suite is supported with SDES key exchange. However, replay protection, key material zeroization, and per-SSRC crypto state tracking are not yet implemented. Evaluate accordingly for high-security environments.
 
 ### Codec coverage
 
 **Opus is not yet supported.** G.711 (PCMU/PCMA) and G.722 are implemented. Some SIP trunk providers may require explicit codec configuration.
 
 **G.729 is not supported.** G.729 is widely deployed in enterprise PBX environments. If your SIP trunk or PBX requires G.729, xphone cannot currently interoperate with it.
-
-### Transport
-
-**Only UDP is implemented.** TCP and TLS SIP transports are not yet available. Most SIP deployments use UDP, but some providers or firewalls require TCP/TLS.
 
 ### Call control
 
@@ -513,9 +510,8 @@ This is an early-stage project. The API may change between releases. Evaluate ac
 
 ## Roadmap
 
-- SRTP — encrypted media (RFC 3711)
+- SRTP hardening — replay protection, key zeroization
 - Opus codec
-- TCP/TLS SIP transport
 - Attended (consultative) transfer
 - STUN/ICE for NAT traversal
 
