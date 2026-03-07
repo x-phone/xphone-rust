@@ -147,18 +147,27 @@ fn save_history(history: &[String]) {
 }
 
 // ---------------------------------------------------------------------------
+// Multi-call tracking
+// ---------------------------------------------------------------------------
+
+struct TrackedCall {
+    call: Arc<Call>,
+    label: String,  // remote DID (e.g. "1001")
+    status: String, // human-readable state (e.g. "ringing", "active")
+}
+
+// ---------------------------------------------------------------------------
 // Shared TUI state (written by xphone callbacks, read by render loop)
 // ---------------------------------------------------------------------------
 
 struct AppState {
     reg_status: String,
-    call_status: String,
-    call_id: String,
+    calls: Vec<TrackedCall>,
+    selected: usize, // index into calls (0-based)
     events: Vec<String>,
     debug_logs: Vec<String>,
     input: String,
     error: String,
-    call: Option<Arc<Call>>,
     quitting: bool,
     echo_active: Arc<AtomicBool>,
     speaker_active: Arc<AtomicBool>,
@@ -175,13 +184,12 @@ impl AppState {
     fn new() -> Self {
         AppState {
             reg_status: "disconnected".into(),
-            call_status: "idle".into(),
-            call_id: String::new(),
+            calls: Vec::new(),
+            selected: 0,
             events: Vec::new(),
             debug_logs: Vec::new(),
             input: String::new(),
             error: String::new(),
-            call: None,
             quitting: false,
             echo_active: Arc::new(AtomicBool::new(false)),
             speaker_active: Arc::new(AtomicBool::new(true)),
@@ -198,10 +206,9 @@ impl AppState {
         }
         match self.history_pos {
             None => {
-                // Start browsing — save current input.
                 self.history_draft = self.input.clone();
                 self.history_pos = Some(self.history.len() - 1);
-                self.input = self.history[self.history.len() - 1].clone();
+                self.input = self.history.last().cloned().unwrap_or_default();
             }
             Some(pos) if pos > 0 => {
                 self.history_pos = Some(pos - 1);
@@ -212,14 +219,17 @@ impl AppState {
     }
 
     fn history_down(&mut self) {
-        if let Some(pos) = self.history_pos {
-            if pos + 1 < self.history.len() {
-                self.history_pos = Some(pos + 1);
-                self.input = self.history[pos + 1].clone();
-            } else {
-                self.history_pos = None;
-                self.input = self.history_draft.clone();
-                self.history_draft.clear();
+        match self.history_pos {
+            None => {}
+            Some(pos) => {
+                if pos + 1 < self.history.len() {
+                    self.history_pos = Some(pos + 1);
+                    self.input = self.history[pos + 1].clone();
+                } else {
+                    self.history_pos = None;
+                    self.input = self.history_draft.clone();
+                    self.history_draft.clear();
+                }
             }
         }
     }
@@ -231,6 +241,24 @@ impl AppState {
     fn push_debug(&mut self, msg: String) {
         self.debug_logs.push(msg);
     }
+
+    /// Find the index of a tracked call by its call_id.
+    fn find_call_idx(&self, call_id: &str) -> Option<usize> {
+        self.calls
+            .iter()
+            .position(|tc| tc.call.call_id() == call_id)
+    }
+
+    /// Remove a call by call_id and fix up the selected index.
+    fn remove_call(&mut self, call_id: &str) {
+        if let Some(idx) = self.find_call_idx(call_id) {
+            self.calls.remove(idx);
+            if self.selected >= self.calls.len() && !self.calls.is_empty() {
+                self.selected = self.calls.len() - 1;
+            }
+        }
+    }
+
 }
 
 type SharedState = Arc<Mutex<AppState>>;
@@ -318,30 +346,27 @@ fn wire_phone_events(phone: &Phone, state: &SharedState) {
         st.push_event(format!("ERROR {}", err));
     });
 
-    // Phone-level call callbacks — auto-wired to every call BEFORE state transitions.
+    // Phone-level call callbacks — update the tracked calls list.
     let s = Arc::clone(state);
     phone.on_call_state(move |call, cs| {
         let did = call.remote_did();
         let name = call_state_name(cs);
         let mut st = s.lock().unwrap();
         st.push_event(format!("[{}] {}", did, name));
-        if cs == CallState::Ended {
-            st.call_status = "idle".into();
-            st.call_id.clear();
-            st.call = None;
-        } else {
-            st.call_status = name;
+        // Update status in tracked call.
+        let cid = call.call_id();
+        if let Some(idx) = st.find_call_idx(&cid) {
+            st.calls[idx].status = name;
         }
     });
 
     let s = Arc::clone(state);
     phone.on_call_ended(move |call, reason| {
         let did = call.remote_did();
+        let cid = call.call_id();
         let mut st = s.lock().unwrap();
         st.push_event(format!("[{}] ended: {}", did, end_reason_name(reason)));
-        st.call_status = "idle".into();
-        st.call_id.clear();
-        st.call = None;
+        st.remove_call(&cid);
     });
 
     let s = Arc::clone(state);
@@ -361,14 +386,20 @@ fn wire_phone_events(phone: &Phone, state: &SharedState) {
             format!("{} ({})", from_name, from)
         };
 
-        // Wire hold/resume per-call (only fire after Active, no timing issue).
+        // Wire hold/resume per-call.
         wire_call_events(&call, &s);
 
         let mut st = s.lock().unwrap();
         st.push_event(format!("[{}] incoming from {}", from, display));
-        st.call_status = format!("ringing < {}", display);
-        st.call_id = call.id();
-        st.call = Some(call);
+        st.calls.push(TrackedCall {
+            call,
+            label: from,
+            status: "ringing".into(),
+        });
+        // Auto-select the new call if it's the only one.
+        if st.calls.len() == 1 {
+            st.selected = 0;
+        }
     });
 }
 
@@ -648,6 +679,22 @@ fn end_reason_name(r: EndReason) -> String {
 // Command dispatch
 // ---------------------------------------------------------------------------
 
+/// Parse an optional call number from the argument.
+/// "a 2" → Some(2), "a" → None, "accept" → None.
+fn parse_call_num(arg: &str) -> Option<usize> {
+    arg.trim().parse::<usize>().ok()
+}
+
+/// Get the call to act on: either the explicitly numbered call or the selected one.
+fn resolve_call(st: &AppState, num: Option<usize>) -> Option<Arc<Call>> {
+    let idx = match num {
+        Some(n) if n >= 1 && n <= st.calls.len() => n - 1,
+        Some(_) => return None,
+        None => st.selected,
+    };
+    st.calls.get(idx).map(|tc| Arc::clone(&tc.call))
+}
+
 fn exec_command(state: &SharedState, phone: &Phone, input: &str) {
     let parts: Vec<&str> = input.split_whitespace().collect();
     if parts.is_empty() {
@@ -662,12 +709,13 @@ fn exec_command(state: &SharedState, phone: &Phone, input: &str) {
 
     match cmd.as_str() {
         "quit" | "q" | "exit" => {
-            let mut st = state.lock().unwrap();
-            if let Some(ref call) = st.call {
-                let _ = call.end();
+            {
+                let st = state.lock().unwrap();
+                for tc in &st.calls {
+                    let _ = tc.call.end();
+                }
             }
-            st.quitting = true;
-            drop(st);
+            state.lock().unwrap().quitting = true;
             let _ = phone.disconnect();
         }
 
@@ -675,14 +723,6 @@ fn exec_command(state: &SharedState, phone: &Phone, input: &str) {
             if arg.is_empty() {
                 state.lock().unwrap().error = "usage: dial <target>".into();
                 return;
-            }
-            {
-                let st = state.lock().unwrap();
-                if st.call.is_some() {
-                    drop(st);
-                    state.lock().unwrap().error = "already in a call -- hangup first".into();
-                    return;
-                }
             }
             state
                 .lock()
@@ -711,8 +751,15 @@ fn exec_command(state: &SharedState, phone: &Phone, input: &str) {
                         );
                         let mut st = s.lock().unwrap();
                         st.push_event(format!("[{}] connected", target));
-                        st.call_id = call.id();
-                        st.call = Some(call);
+                        let is_first = st.calls.is_empty();
+                        st.calls.push(TrackedCall {
+                            call,
+                            label: target,
+                            status: "active".into(),
+                        });
+                        if is_first {
+                            st.selected = 0;
+                        }
                     }
                     Err(e) => {
                         let mut st = s.lock().unwrap();
@@ -723,10 +770,11 @@ fn exec_command(state: &SharedState, phone: &Phone, input: &str) {
         }
 
         "accept" | "a" => {
+            let num = parse_call_num(&arg);
             let echo_flag = Arc::clone(&state.lock().unwrap().echo_active);
             let speaker_flag = Arc::clone(&state.lock().unwrap().speaker_active);
             let mic_flag = Arc::clone(&state.lock().unwrap().mic_active);
-            call_action(state, "accept", move |c| {
+            call_action(state, "accept", num, move |c| {
                 let result = c.accept();
                 if result.is_ok() {
                     start_audio_handler(c, echo_flag, speaker_flag, mic_flag);
@@ -736,42 +784,49 @@ fn exec_command(state: &SharedState, phone: &Phone, input: &str) {
         }
 
         "reject" => {
-            call_action(state, "reject", |c| c.reject(486, "Busy Here"));
+            let num = parse_call_num(&arg);
+            call_action(state, "reject", num, |c| c.reject(486, "Busy Here"));
         }
 
         "hangup" | "h" => {
-            call_action(state, "hangup", |c| c.end());
+            let num = parse_call_num(&arg);
+            call_action(state, "hangup", num, |c| c.end());
         }
 
         "hold" => {
-            call_action(state, "hold", |c| c.hold());
+            let num = parse_call_num(&arg);
+            call_action(state, "hold", num, |c| c.hold());
         }
 
         "resume" => {
-            call_action(state, "resume", |c| c.resume());
+            let num = parse_call_num(&arg);
+            call_action(state, "resume", num, |c| c.resume());
         }
 
         "mute" => {
-            call_action(state, "mute", |c| c.mute());
+            let num = parse_call_num(&arg);
+            call_action(state, "mute", num, |c| c.mute());
         }
 
         "unmute" => {
-            call_action(state, "unmute", |c| c.unmute());
+            let num = parse_call_num(&arg);
+            call_action(state, "unmute", num, |c| c.unmute());
         }
 
         "dtmf" => {
-            let st = state.lock().unwrap();
-            if st.call.is_none() {
-                drop(st);
-                state.lock().unwrap().error = "no active call".into();
-                return;
-            }
             if arg.is_empty() {
-                drop(st);
                 state.lock().unwrap().error = "usage: dtmf <digits>".into();
                 return;
             }
-            let call = st.call.as_ref().unwrap().clone();
+            let st = state.lock().unwrap();
+            let call = match resolve_call(&st, None) {
+                Some(c) => c,
+                None => {
+                    drop(st);
+                    state.lock().unwrap().error = "no active call".into();
+                    return;
+                }
+            };
             drop(st);
             for ch in arg.chars() {
                 if let Err(e) = call.send_dtmf(&ch.to_string()) {
@@ -792,7 +847,7 @@ fn exec_command(state: &SharedState, phone: &Phone, input: &str) {
             }
             let label = format!("transfer to {}", arg);
             let target = arg.clone();
-            call_action(state, &label, move |c| c.blind_transfer(&target));
+            call_action(state, &label, None, move |c| c.blind_transfer(&target));
         }
 
         "echo" => {
@@ -801,7 +856,6 @@ fn exec_command(state: &SharedState, phone: &Phone, input: &str) {
             let mic = Arc::clone(&st.mic_active);
             let prev = flag.load(Ordering::Relaxed);
             flag.store(!prev, Ordering::Relaxed);
-            // Disable mic when echo is turned on (both feed pcm_writer).
             if !prev {
                 mic.store(false, Ordering::Relaxed);
             }
@@ -833,7 +887,6 @@ fn exec_command(state: &SharedState, phone: &Phone, input: &str) {
             let echo = Arc::clone(&st.echo_active);
             let prev = mic.load(Ordering::Relaxed);
             mic.store(!prev, Ordering::Relaxed);
-            // Disable echo when mic is turned on (both feed pcm_writer).
             if !prev {
                 echo.store(false, Ordering::Relaxed);
             }
@@ -846,30 +899,45 @@ fn exec_command(state: &SharedState, phone: &Phone, input: &str) {
             }
         }
 
+        // Select a call by number: "1", "2", "3", etc.
+        other if other.parse::<usize>().is_ok() => {
+            let n: usize = other.parse().unwrap();
+            let mut st = state.lock().unwrap();
+            if n >= 1 && n <= st.calls.len() {
+                st.selected = n - 1;
+            } else {
+                st.error = format!("no call #{}", n);
+            }
+        }
+
         _ => {
             state.lock().unwrap().error = format!("unknown command: {}", cmd);
         }
     }
 }
 
-fn call_action<F>(state: &SharedState, name: &str, action: F)
+fn call_action<F>(state: &SharedState, name: &str, num: Option<usize>, action: F)
 where
     F: FnOnce(&Arc<Call>) -> xphone::Result<()>,
 {
     let st = state.lock().unwrap();
-    if let Some(ref call) = st.call {
-        let call = call.clone();
+    let call = resolve_call(&st, num);
+    drop(st);
+
+    if let Some(ref call) = call {
         let name = name.to_string();
-        let s = Arc::clone(state);
-        drop(st);
-        if let Err(e) = action(&call) {
-            s.lock()
+        if let Err(e) = action(call) {
+            state
+                .lock()
                 .unwrap()
                 .push_event(format!("ERROR {}: {}", name, e));
         }
     } else {
-        drop(st);
-        state.lock().unwrap().error = "no active call".into();
+        let msg = match num {
+            Some(n) => format!("no call #{}", n),
+            None => "no active call".into(),
+        };
+        state.lock().unwrap().error = msg;
     }
 }
 
@@ -893,27 +961,22 @@ fn reg_status_style(status: &str) -> (Span<'_>, Span<'_>) {
     )
 }
 
-fn call_status_style(status: &str) -> (Span<'_>, Span<'_>) {
-    let color = match status {
+fn call_status_color(status: &str) -> Color {
+    match status {
         "active" => GREEN,
-        s if s.starts_with("ringing") => YELLOW,
-        "dialing" | "ringing remote" | "early media" => YELLOW,
+        "ringing" | "ringing remote" | "dialing" | "early media" => YELLOW,
         "on hold" => MAGENTA,
-        "idle" | "ended" => DIM,
         _ => DIM,
-    };
-    let indicator = match status {
+    }
+}
+
+fn call_status_indicator(status: &str) -> &str {
+    match status {
         "active" => "●",
-        "idle" => "○",
-        _ => "◌",
-    };
-    (
-        Span::styled(format!(" {} ", indicator), Style::default().fg(color)),
-        Span::styled(
-            status,
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
-        ),
-    )
+        "ringing" | "ringing remote" | "dialing" | "early media" => "◌",
+        "on hold" => "◊",
+        _ => "○",
+    }
 }
 
 fn event_style(line: &str) -> Style {
@@ -973,28 +1036,13 @@ fn draw(f: &mut ratatui::Frame, state: &SharedState) {
         ])
         .split(area);
 
-    // --- Status bar (bordered block) ---
+    // --- Status bar ---
     let (reg_dot, reg_text) = reg_status_style(&st.reg_status);
-    let (call_dot, call_text) = call_status_style(&st.call_status);
-    let mut status_spans = vec![
+    let status_spans = vec![
         Span::styled("  REG", Style::default().fg(DIM)),
         reg_dot,
         reg_text,
-        Span::styled("    CALL", Style::default().fg(DIM)),
-        call_dot,
-        call_text,
     ];
-    if !st.call_id.is_empty() {
-        let short = if st.call_id.len() > 10 {
-            &st.call_id[..10]
-        } else {
-            &st.call_id
-        };
-        status_spans.push(Span::styled(
-            format!("  [{}]", short),
-            Style::default().fg(DIM),
-        ));
-    }
     let status_line = Line::from(status_spans);
     let status_block = Paragraph::new(status_line).block(
         Block::default()
@@ -1015,7 +1063,70 @@ fn draw(f: &mut ratatui::Frame, state: &SharedState) {
         .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
         .split(outer[1]);
 
-    // Events panel (left)
+    // Left side: Calls panel (top) + Events panel (bottom)
+    let calls_height = (st.calls.len() as u16 + 2).max(3).min(8); // 2 for borders, min 3, max 8
+    let left_chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(calls_height), Constraint::Min(4)])
+        .split(panel_chunks[0]);
+
+    // --- Calls panel ---
+    let call_lines: Vec<Line> = if st.calls.is_empty() {
+        vec![Line::from(Span::styled(
+            "  (no calls)",
+            Style::default().fg(DIM),
+        ))]
+    } else {
+        st.calls
+            .iter()
+            .enumerate()
+            .map(|(i, tc)| {
+                let selected = i == st.selected;
+                let color = call_status_color(&tc.status);
+                let indicator = call_status_indicator(&tc.status);
+                let marker = if selected { ">" } else { " " };
+                let num = i + 1;
+                Line::from(vec![
+                    Span::styled(
+                        format!(" {}", marker),
+                        Style::default()
+                            .fg(if selected { GREEN } else { DIM })
+                            .add_modifier(if selected {
+                                Modifier::BOLD
+                            } else {
+                                Modifier::empty()
+                            }),
+                    ),
+                    Span::styled(format!("#{} ", num), Style::default().fg(DIM)),
+                    Span::styled(format!("{} ", indicator), Style::default().fg(color)),
+                    Span::styled(
+                        &tc.label,
+                        Style::default().fg(Color::White).add_modifier(if selected {
+                            Modifier::BOLD
+                        } else {
+                            Modifier::empty()
+                        }),
+                    ),
+                    Span::styled(format!("  {}", tc.status), Style::default().fg(color)),
+                ])
+            })
+            .collect()
+    };
+
+    let calls_panel = Paragraph::new(call_lines).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_set(border::ROUNDED)
+            .border_style(Style::default().fg(ACCENT_DIM))
+            .title(Span::styled(
+                " Calls ",
+                Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+            ))
+            .style(Style::default().bg(SURFACE)),
+    );
+    f.render_widget(calls_panel, left_chunks[0]);
+
+    // --- Events panel ---
     let event_lines: Vec<Line> = st
         .events
         .iter()
@@ -1038,13 +1149,13 @@ fn draw(f: &mut ratatui::Frame, state: &SharedState) {
         .scroll((
             scroll_offset(
                 st.events.len(),
-                panel_chunks[0].height.saturating_sub(2) as usize,
+                left_chunks[1].height.saturating_sub(2) as usize,
             ),
             0,
         ));
-    f.render_widget(events_panel, panel_chunks[0]);
+    f.render_widget(events_panel, left_chunks[1]);
 
-    // Debug panel (right)
+    // --- Debug panel (right) ---
     let debug_lines: Vec<Line> = st
         .debug_logs
         .iter()
@@ -1073,7 +1184,7 @@ fn draw(f: &mut ratatui::Frame, state: &SharedState) {
         ));
     f.render_widget(debug_panel, panel_chunks[1]);
 
-    // --- Command area (bordered block with input + help + error) ---
+    // --- Command area ---
     let cmd_title = if st.error.is_empty() {
         Span::styled(
             " Command ",
@@ -1087,7 +1198,7 @@ fn draw(f: &mut ratatui::Frame, state: &SharedState) {
     };
 
     let help_text =
-        "dial(d) accept(a) reject hangup(h) hold resume mute unmute dtmf transfer(xfer) echo speaker mic quit(q)";
+        "dial(d) accept(a) reject hangup(h) hold resume mute unmute dtmf transfer(xfer) echo speaker mic 1/2/3 quit(q)";
 
     let cmd_lines = vec![
         Line::from(vec![
@@ -1256,12 +1367,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 match key.code {
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        let mut st = state.lock().unwrap();
-                        if let Some(ref call) = st.call {
-                            let _ = call.end();
+                        {
+                            let st = state.lock().unwrap();
+                            for tc in &st.calls {
+                                let _ = tc.call.end();
+                            }
                         }
-                        st.quitting = true;
-                        drop(st);
+                        state.lock().unwrap().quitting = true;
                         let _ = phone.disconnect();
                         break;
                     }
