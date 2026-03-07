@@ -1,3 +1,4 @@
+pub mod g722;
 pub mod pcma;
 pub mod pcmu;
 
@@ -17,11 +18,11 @@ pub trait CodecProcessor: Send {
 
 /// Returns a [`CodecProcessor`] for the given RTP payload type.
 /// Returns `None` for unsupported payload types.
-pub fn new_codec_processor(payload_type: i32, _pcm_rate: i32) -> Option<Box<dyn CodecProcessor>> {
+pub fn new_codec_processor(payload_type: i32, pcm_rate: i32) -> Option<Box<dyn CodecProcessor>> {
     match payload_type {
         0 => Some(Box::new(pcmu::PcmuProcessor::new())),
         8 => Some(Box::new(pcma::PcmaProcessor::new())),
-        // G.722 (PT 9) deferred — ship with G.711 only for now.
+        9 => Some(Box::new(g722::G722Processor::new(pcm_rate as u32))),
         _ => None,
     }
 }
@@ -42,6 +43,14 @@ mod tests {
     fn codec_processor_pcma_interface() {
         let cp = new_codec_processor(8, 8000).unwrap();
         assert_eq!(cp.payload_type(), 8);
+        assert_eq!(cp.clock_rate(), 8000);
+        assert_eq!(cp.samples_per_frame(), 160);
+    }
+
+    #[test]
+    fn codec_processor_g722_interface() {
+        let cp = new_codec_processor(9, 8000).unwrap();
+        assert_eq!(cp.payload_type(), 9);
         assert_eq!(cp.clock_rate(), 8000);
         assert_eq!(cp.samples_per_frame(), 160);
     }
