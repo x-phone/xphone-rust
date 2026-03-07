@@ -7,6 +7,8 @@ pub mod error;
 pub mod jitter;
 pub mod media;
 pub mod mock;
+pub mod phone;
+pub mod registry;
 pub mod sdp;
 pub mod sip;
 pub mod transport;

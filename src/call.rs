@@ -765,7 +765,6 @@ impl Call {
         self.inner.lock().on_unmute_fn = Some(Arc::new(f));
     }
 
-    #[allow(dead_code)] // Used by Phone struct in Phase 5
     pub(crate) fn on_ended_internal(&self, f: impl Fn(EndReason) + Send + Sync + 'static) {
         self.inner.lock().on_ended_internal = Some(Arc::new(f));
     }
