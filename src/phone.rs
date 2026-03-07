@@ -47,7 +47,20 @@ impl Phone {
         }
     }
 
-    /// Connects with a mock transport (test hook).
+    /// Connects to the SIP server using the configured transport.
+    /// Creates a real SipUA, performs registration, and wires up incoming INVITE handling.
+    pub fn connect(&self) -> crate::error::Result<()> {
+        let tr = Arc::new(crate::sip::ua::SipUA::new(&self.cfg)?);
+        self.connect_with_transport(tr);
+        let state = self.state();
+        if state == PhoneState::Registered {
+            Ok(())
+        } else {
+            Err(crate::error::Error::RegistrationFailed)
+        }
+    }
+
+    /// Connects with a provided transport (test hook).
     /// Performs registration and wires up incoming INVITE handling.
     pub fn connect_with_transport(&self, tr: Arc<dyn SipTransport>) {
         let reg = Arc::new(Registry::new(Arc::clone(&tr), self.cfg.clone()));

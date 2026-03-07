@@ -11,7 +11,9 @@
 
 use std::time::Duration;
 
+use xphone::config::Config;
 use xphone::sip::client::{Client, ClientConfig};
+use xphone::Phone;
 
 fn asterisk_host() -> String {
     std::env::var("ASTERISK_HOST").unwrap_or_else(|_| "127.0.0.1".into())
@@ -28,11 +30,27 @@ fn integration_client_config(ext: &str, password: &str) -> ClientConfig {
     }
 }
 
-// --- E1: Registration ---
+fn integration_phone_config(ext: &str, password: &str) -> Config {
+    Config {
+        username: ext.into(),
+        password: password.into(),
+        host: asterisk_host(),
+        port: 5060,
+        register_expiry: Duration::from_secs(10),
+        register_retry: Duration::from_secs(1),
+        register_max_retry: 3,
+        media_timeout: Duration::from_secs(10),
+        rtp_port_min: 20000,
+        rtp_port_max: 20099,
+        ..Config::default()
+    }
+}
 
-/// Register extension 1001 with Asterisk and get 200 OK.
+// --- E1: Registration (low-level Client) ---
+
+/// Register extension 1001 with Asterisk using raw SIP client.
 #[test]
-fn register_1001() {
+fn register_1001_raw() {
     let cfg = integration_client_config("1001", "test");
     let client = Client::new(cfg).unwrap();
 
@@ -42,9 +60,9 @@ fn register_1001() {
     client.close();
 }
 
-/// Register extension 1002 with Asterisk.
+/// Register extension 1002 with Asterisk using raw SIP client.
 #[test]
-fn register_1002() {
+fn register_1002_raw() {
     let cfg = integration_client_config("1002", "test");
     let client = Client::new(cfg).unwrap();
 
@@ -54,7 +72,7 @@ fn register_1002() {
     client.close();
 }
 
-/// Registration with wrong password should fail (401 or rejected).
+/// Registration with wrong password should fail.
 #[test]
 fn register_wrong_password() {
     let cfg = integration_client_config("1001", "wrong");
@@ -75,50 +93,71 @@ fn keepalive() {
     let cfg = integration_client_config("1001", "test");
     let client = Client::new(cfg).unwrap();
 
-    // Register first.
     let (code, _) = client.send_register(Duration::from_secs(5)).unwrap();
     assert_eq!(code, 200);
 
-    // Send keepalive — should not error.
     client.send_keepalive().unwrap();
-
     client.close();
 }
 
-// --- Placeholder tests for full E2E (require production SipTransport) ---
-// These will be implemented once FakePBX-Rust / real SipTransport is ready.
+// --- E1b: Registration via Phone::connect() ---
+
+/// Register extension 1001 via the full Phone::connect() path.
+#[test]
+fn phone_connect_and_disconnect() {
+    let cfg = integration_phone_config("1001", "test");
+    let phone = Phone::new(cfg);
+
+    phone.connect().unwrap();
+    assert_eq!(phone.state(), xphone::PhoneState::Registered);
+
+    phone.disconnect().unwrap();
+    assert_eq!(phone.state(), xphone::PhoneState::Disconnected);
+}
+
+/// Phone::connect() with wrong password should fail.
+#[test]
+fn phone_connect_wrong_password() {
+    let cfg = integration_phone_config("1001", "wrong");
+    let phone = Phone::new(cfg);
+
+    let result = phone.connect();
+    assert!(result.is_err());
+}
+
+// --- Placeholder tests for full E2E (require INVITE support in SipUA) ---
 
 #[test]
-#[ignore = "requires production SipTransport (Phase 5.3)"]
+#[ignore = "requires INVITE support in SipUA"]
 fn dial_between_extensions() {
     // E2: p1 (1001) dials p2 (1002), p2 accepts, p1 ends call.
-    todo!("implement once Phone can connect to real Asterisk")
+    todo!()
 }
 
 #[test]
-#[ignore = "requires production SipTransport (Phase 5.3)"]
+#[ignore = "requires INVITE support in SipUA"]
 fn inbound_accept_and_remote_bye() {
     // E3: p1 dials p2, p2 accepts, p1 sends BYE, p2 sees EndedByRemote.
-    todo!("implement once Phone can connect to real Asterisk")
+    todo!()
 }
 
 #[test]
-#[ignore = "requires production SipTransport (Phase 5.3)"]
+#[ignore = "requires INVITE support in SipUA"]
 fn hold_resume() {
     // E4: establish call, hold, resume.
-    todo!("implement once Phone can connect to real Asterisk")
+    todo!()
 }
 
 #[test]
-#[ignore = "requires production SipTransport (Phase 5.3)"]
+#[ignore = "requires INVITE support in SipUA"]
 fn dtmf_send_receive() {
     // E5: establish call, send DTMF from p2, receive on p1.
-    todo!("implement once Phone can connect to real Asterisk")
+    todo!()
 }
 
 #[test]
-#[ignore = "requires production SipTransport (Phase 5.3)"]
+#[ignore = "requires INVITE support in SipUA"]
 fn echo_test() {
     // E6: dial 9999, send RTP, verify echo.
-    todo!("implement once Phone can connect to real Asterisk")
+    todo!()
 }
