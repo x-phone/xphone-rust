@@ -68,6 +68,13 @@ pub trait SipTransport: Send + Sync {
         Ok(())
     }
 
+    /// Returns the advertised address (routable or STUN-mapped IP + port).
+    /// Used by the phone layer to set the SDP media address.
+    /// Returns `None` if unknown (e.g. mock transports).
+    fn advertised_addr(&self) -> Option<std::net::SocketAddr> {
+        None
+    }
+
     /// Closes the transport.
     fn close(&self) -> Result<()>;
 }

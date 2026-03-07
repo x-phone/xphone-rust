@@ -103,25 +103,29 @@ impl Phone {
         // Perform registration.
         let reg_result = reg.start();
 
+        // Determine the local IP for SDP media address.
+        // Priority: explicit config override > STUN-mapped IP > UDP heuristic.
+        let effective_ip = if !self.cfg.local_ip.is_empty() {
+            self.cfg.local_ip.clone()
+        } else if let Some(addr) = tr.advertised_addr() {
+            addr.ip().to_string()
+        } else {
+            local_ip_for(&self.cfg.host)
+        };
+
         // Wire up incoming INVITE handling (dialog-based for production, simple for mock).
         let inner_clone = Arc::clone(&self.inner);
-        let host = self.cfg.host.clone();
-        let cfg_local_ip = self.cfg.local_ip.clone();
+        let incoming_ip = effective_ip.clone();
         let rtp_port_min = self.cfg.rtp_port_min;
         let rtp_port_max = self.cfg.rtp_port_max;
         tr.on_dialog_invite(Box::new(move |dlg, from, to, remote_sdp| {
-            let local_ip = if cfg_local_ip.is_empty() {
-                local_ip_for(&host)
-            } else {
-                cfg_local_ip.clone()
-            };
             handle_dialog_incoming(
                 &inner_clone,
                 dlg,
                 &from,
                 &to,
                 &remote_sdp,
-                &local_ip,
+                &incoming_ip,
                 rtp_port_min,
                 rtp_port_max,
             );
@@ -194,10 +198,13 @@ impl Phone {
         };
 
         // Allocate RTP port and build SDP offer.
-        let local_ip = if self.cfg.local_ip.is_empty() {
-            local_ip_for(&self.cfg.host)
-        } else {
+        // Use STUN-mapped IP from transport if available.
+        let local_ip = if !self.cfg.local_ip.is_empty() {
             self.cfg.local_ip.clone()
+        } else if let Some(addr) = tr.advertised_addr() {
+            addr.ip().to_string()
+        } else {
+            local_ip_for(&self.cfg.host)
         };
         let (rtp_socket, rtp_port) = if self.cfg.rtp_port_min > 0 && self.cfg.rtp_port_max > 0 {
             match crate::media::listen_rtp_port(self.cfg.rtp_port_min, self.cfg.rtp_port_max) {

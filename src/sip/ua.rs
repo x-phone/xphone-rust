@@ -340,6 +340,10 @@ impl SipTransport for SipUA {
         Ok(())
     }
 
+    fn advertised_addr(&self) -> Option<std::net::SocketAddr> {
+        Some(self.client.local_addr())
+    }
+
     fn close(&self) -> Result<()> {
         self.client.close();
         Ok(())
