@@ -198,6 +198,7 @@ if let Some(pcm_rx) = call.pcm_reader() {
 | Jitter buffer | Done |
 | SRTP (encrypted media, AES_CM_128_HMAC_SHA1_80) | Done |
 | TCP and TLS SIP transport | Done |
+| STUN NAT traversal (RFC 5389) | Done |
 | MockPhone & MockCall for unit testing | Done |
 | Attended transfer | Planned |
 | Opus codec | Planned |
@@ -470,7 +471,7 @@ cargo run --example sipcli --features cli -- --server pbx.example.com --user 100
 
 | Layer | Implementation |
 |---|---|
-| SIP Signaling | Custom (message parsing, digest auth, transactions, UDP/TCP/TLS) |
+| SIP Signaling | Custom (message parsing, digest auth, transactions, UDP/TCP/TLS, STUN) |
 | RTP / SRTP | Custom (`std::net::UdpSocket`, AES_CM_128_HMAC_SHA1_80) |
 | G.711 / G.722 | Built-in (PCMU, PCMA, G.722) |
 | Jitter Buffer | Built-in |
@@ -500,7 +501,7 @@ This library is actively developed but not yet complete. The gaps below are wort
 
 ### Network & NAT
 
-**No STUN/TURN/ICE support.** Only basic NAT keepalive is provided. In environments with strict or symmetric NAT (common in cloud VMs), RTP media may fail to flow even if SIP signaling succeeds.
+**STUN is supported for NAT-mapped address discovery.** Configure `stun_server` to use a public STUN server (e.g. `stun.l.google.com:19302`) for discovering your external IP. TURN and full ICE are not implemented. In environments with symmetric NAT (common in cloud VMs), STUN alone may not be sufficient and RTP media may fail to flow.
 
 ### Project maturity
 
@@ -513,7 +514,7 @@ This is an early-stage project. The API may change between releases. Evaluate ac
 - SRTP hardening — replay protection, key zeroization
 - Opus codec
 - Attended (consultative) transfer
-- STUN/ICE for NAT traversal
+- TURN relay and full ICE for symmetric NAT
 
 ---
 
