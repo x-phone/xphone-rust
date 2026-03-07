@@ -1,5 +1,7 @@
 # xphone
 
+[![Crates.io](https://img.shields.io/crates/v/xphone.svg)](https://crates.io/crates/xphone)
+[![docs.rs](https://docs.rs/xphone/badge.svg)](https://docs.rs/xphone)
 [![CI](https://github.com/x-phone/xphone-rust/actions/workflows/ci.yml/badge.svg)](https://github.com/x-phone/xphone-rust/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 
@@ -224,9 +226,7 @@ let phone = Phone::new(Config {
 
 // Or use the builder:
 let phone = PhoneBuilder::new()
-    .username("1001")
-    .password("secret")
-    .host("pbx.example.com")
+    .credentials("1001", "secret", "pbx.example.com")
     .rtp_ports(10000, 20000)
     .build();
 ```
@@ -408,7 +408,7 @@ assert_eq!(phone.last_call().unwrap().state(), CallState::Active);
 ```rust
 use xphone::mock::call::MockCall;
 
-let call = MockCall::new_inbound();
+let call = MockCall::new();
 call.accept().unwrap();
 call.send_dtmf("5").unwrap();
 assert_eq!(call.sent_dtmf(), vec!["5"]);
@@ -423,9 +423,15 @@ call.simulate_dtmf("9");
 Tests against a Docker Asterisk instance:
 
 ```bash
-cd testutil/docker && docker compose up -d
-cargo test --features integration --test integration_test -- --test-threads=1
-cd testutil/docker && docker compose down
+docker compose -f testutil/docker/docker-compose.yml up -d --wait
+cargo test --features integration --test integration_test -- --nocapture --test-threads=1
+docker compose -f testutil/docker/docker-compose.yml down
+```
+
+Or using the Makefile:
+
+```bash
+make test-docker
 ```
 
 ---
@@ -495,8 +501,6 @@ This library is actively developed but not yet complete. The gaps below are wort
 
 **Attended (consultative) transfer is not implemented.** Only blind transfer via REFER is supported.
 
-**Call waiting is not handled.** A second inbound INVITE while a call is active is not surfaced to the application.
-
 ### Network & NAT
 
 **No STUN/TURN/ICE support.** Only basic NAT keepalive is provided. In environments with strict or symmetric NAT (common in cloud VMs), RTP media may fail to flow even if SIP signaling succeeds.
@@ -517,6 +521,10 @@ This is an early-stage project. The API may change between releases. Evaluate ac
 - STUN/ICE for NAT traversal
 
 ---
+
+## Changelog
+
+See [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 
