@@ -87,8 +87,19 @@ impl Phone {
 
         // Wire up incoming INVITE handling (dialog-based for production, simple for mock).
         let inner_clone = Arc::clone(&self.inner);
+        let host = self.cfg.host.clone();
+        let rtp_port_min = self.cfg.rtp_port_min;
         tr.on_dialog_invite(Box::new(move |dlg, from, to, remote_sdp| {
-            handle_dialog_incoming(&inner_clone, dlg, &from, &to, &remote_sdp);
+            let local_ip = local_ip_for(&host);
+            handle_dialog_incoming(
+                &inner_clone,
+                dlg,
+                &from,
+                &to,
+                &remote_sdp,
+                &local_ip,
+                rtp_port_min,
+            );
         }));
 
         let inner_clone = Arc::clone(&self.inner);
@@ -149,19 +160,26 @@ impl Phone {
             inner.tr.as_ref().cloned().ok_or(Error::NotConnected)?
         };
 
+        // Build SDP offer with default codecs and detected local IP.
+        let local_ip = local_ip_for(&self.cfg.host);
+        let local_sdp =
+            crate::sdp::build_offer(&local_ip, 20000, &[8, 0, 9, 101], crate::sdp::DIR_SEND_RECV);
+
         // Try dialog-based dial (production SipUA path).
-        let dial_result = tr.dial(target, b"v=0\r\n", opts.timeout);
+        let dial_result = tr.dial(target, local_sdp.as_bytes(), opts.timeout);
 
         let (call, responses) = match dial_result {
             Ok((dlg, remote_sdp)) => {
                 // Production path: got a real dialog from SipUA.
+                // tr.dial() already consumed the 200 OK, so transition to Active.
                 let call = Call::new_outbound(dlg, opts);
                 if !remote_sdp.is_empty() {
                     call.set_remote_sdp(&remote_sdp);
                 }
+                call.simulate_response(200, "OK");
                 (call, Vec::new())
             }
-            Err(_) => {
+            Err(e) if e.to_string().contains("not supported") => {
                 // Fallback path (MockTransport): use send_request + MockDialog.
                 let resp = tr.send_request("INVITE", None, opts.timeout)?;
                 let mut code = resp.status_code;
@@ -177,6 +195,7 @@ impl Phone {
                 let call = Call::new_outbound(dlg as Arc<dyn Dialog>, opts);
                 (call, responses)
             }
+            Err(e) => return Err(e),
         };
 
         // Wire up call tracking cleanup.
@@ -258,6 +277,23 @@ impl Phone {
     }
 }
 
+/// Discovers the local IP address used to reach the given host.
+/// Uses a connectionless UDP dial (no packets sent).
+fn local_ip_for(host: &str) -> String {
+    use std::net::UdpSocket;
+    let target = format!("{}:5060", host);
+    match UdpSocket::bind("0.0.0.0:0") {
+        Ok(sock) => match sock.connect(&target) {
+            Ok(()) => match sock.local_addr() {
+                Ok(addr) if !addr.ip().is_unspecified() => addr.ip().to_string(),
+                _ => "127.0.0.1".into(),
+            },
+            Err(_) => "127.0.0.1".into(),
+        },
+        Err(_) => "127.0.0.1".into(),
+    }
+}
+
 /// Handles an incoming INVITE from the transport.
 fn handle_incoming(inner: &Arc<Mutex<Inner>>, from: &str, to: &str) {
     let (tr, incoming_fn) = {
@@ -305,11 +341,14 @@ fn handle_dialog_incoming(
     _from: &str,
     _to: &str,
     remote_sdp: &str,
+    local_ip: &str,
+    rtp_port: u16,
 ) {
     let incoming_fn = inner.lock().incoming.clone();
 
     // Create an inbound call with the real dialog.
     let call = Call::new_inbound(dlg);
+    call.set_local_media(local_ip, rtp_port as i32);
     if !remote_sdp.is_empty() {
         call.set_remote_sdp(remote_sdp);
     }

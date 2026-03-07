@@ -38,7 +38,8 @@ pub struct Client {
     cfg: ClientConfig,
     cseq: AtomicU32,
     call_id: String,
-    conn_local_addr: SocketAddr,
+    /// The address advertised in Via/Contact headers (routable IP + bound port).
+    advertised_addr: SocketAddr,
     closed: Mutex<bool>,
 }
 
@@ -53,19 +54,42 @@ impl Client {
         let tm = TransactionManager::new(conn);
         let call_id = transaction::generate_branch();
 
+        // Compute a routable IP to advertise in Via/Contact headers.
+        // When bound to 0.0.0.0, the OS-reported local_addr is 0.0.0.0:PORT,
+        // which is invalid for SIP peers. Use a UDP connect trick to discover
+        // the actual outgoing interface IP for the server.
+        let advertised_addr = if local_addr.ip().is_unspecified() {
+            use std::net::UdpSocket;
+            match UdpSocket::bind("0.0.0.0:0") {
+                Ok(sock) => match sock.connect(cfg.server_addr) {
+                    Ok(()) => match sock.local_addr() {
+                        Ok(addr) if !addr.ip().is_unspecified() => {
+                            SocketAddr::new(addr.ip(), local_addr.port())
+                        }
+                        _ => local_addr,
+                    },
+                    Err(_) => local_addr,
+                },
+                Err(_) => local_addr,
+            }
+        } else {
+            local_addr
+        };
+
         Ok(Self {
             tm: Mutex::new(tm),
             cfg,
             cseq: AtomicU32::new(0),
             call_id,
-            conn_local_addr: local_addr,
+            advertised_addr,
             closed: Mutex::new(false),
         })
     }
 
-    /// Returns the local address the client is bound to.
+    /// Returns the advertised address (routable IP + bound port)
+    /// for use in Contact/Via headers.
     pub fn local_addr(&self) -> SocketAddr {
-        self.conn_local_addr
+        self.advertised_addr
     }
 
     /// Shuts down the client.
@@ -263,11 +287,16 @@ impl Client {
         extra_headers: Option<&HashMap<String, String>>,
     ) -> Message {
         let seq = self.cseq.fetch_add(1, Ordering::Relaxed) + 1;
-        let local = self.conn_local_addr;
+        let local = self.advertised_addr;
         let from_tag = &transaction::generate_branch()[..15];
         let invite_call_id = transaction::generate_branch();
 
         let mut msg = Message::new_request("INVITE", target_uri);
+
+        // Pre-set Via so TransactionManager doesn't generate one with 0.0.0.0.
+        let branch = transaction::generate_branch();
+        msg.set_header("Via", &format!("SIP/2.0/UDP {};branch={}", local, branch));
+
         msg.set_header(
             "From",
             &format!(
@@ -304,7 +333,7 @@ impl Client {
         ack.set_header("Max-Forwards", "70");
         ack.set_header("User-Agent", "xphone");
         let branch = transaction::generate_branch();
-        let via = format!("SIP/2.0/UDP {};branch={}", self.conn_local_addr, branch);
+        let via = format!("SIP/2.0/UDP {};branch={}", self.advertised_addr, branch);
         ack.set_header("Via", &via);
         ack
     }
@@ -317,9 +346,13 @@ impl Client {
         extra_headers: Option<&HashMap<String, String>>,
     ) -> Message {
         let seq = self.cseq.fetch_add(1, Ordering::Relaxed) + 1;
-        let local = self.conn_local_addr;
+        let local = self.advertised_addr;
 
         let mut msg = Message::new_request(method, request_uri);
+
+        // Pre-set Via so TransactionManager doesn't generate one with 0.0.0.0.
+        let branch = transaction::generate_branch();
+        msg.set_header("Via", &format!("SIP/2.0/UDP {};branch={}", local, branch));
 
         let from_tag = &transaction::generate_branch()[..15];
         msg.set_header(

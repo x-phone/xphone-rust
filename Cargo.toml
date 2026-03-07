@@ -21,3 +21,4 @@ integration = []
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
+crossbeam-channel = "0.5"

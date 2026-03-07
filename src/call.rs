@@ -731,6 +731,13 @@ impl Call {
         self.inner.lock().remote_sdp = sdp.to_string();
     }
 
+    /// Sets the local media address and RTP port for this call.
+    pub(crate) fn set_local_media(&self, ip: &str, port: i32) {
+        let mut inner = self.inner.lock();
+        inner.local_ip = ip.to_string();
+        inner.rtp_port = port;
+    }
+
     /// Sends a SIP response via the dialog (e.g., 180 Ringing for inbound calls).
     pub(crate) fn dlg_respond(&self, code: u16, reason: &str) -> Result<()> {
         self.dlg.respond(code, reason, &[])
