@@ -106,10 +106,26 @@ impl SipDialogUAC {
             self.remote_target.clone()
         };
         let mut req = Message::new_request(method, &target);
+
+        // Pre-set Via with advertised address so TransactionManager doesn't use 0.0.0.0.
+        let branch = generate_branch();
+        req.set_header(
+            "Via",
+            &format!("SIP/2.0/UDP {};branch={}", self.client.local_addr(), branch),
+        );
+
         req.set_header("Call-ID", &self.call_id);
         req.set_header("From", &self.from_hdr);
         req.set_header("To", &self.to_hdr);
         req.set_header("CSeq", &format!("{} {}", cseq, method));
+        req.set_header(
+            "Contact",
+            &format!(
+                "<sip:{}@{}>",
+                self.client.username(),
+                self.client.local_addr()
+            ),
+        );
         req.set_header("Max-Forwards", "70");
         req.set_header("User-Agent", "xphone");
         for route in &self.route_set {
@@ -138,7 +154,7 @@ impl Dialog for SipDialogUAC {
         let mut req = self.build_request("INVITE");
         req.set_header("Content-Type", "application/sdp");
         req.body = sdp.to_vec();
-        let _ = self.client.send_dialog_request(&mut req, SIP_TIMEOUT)?;
+        let _ = self.client.send_dialog_reinvite(&mut req, SIP_TIMEOUT)?;
         Ok(())
     }
 
@@ -257,6 +273,14 @@ impl SipDialogUAS {
             self.remote_target.clone()
         };
         let mut req = Message::new_request(method, &target);
+
+        // Pre-set Via with advertised address so TransactionManager doesn't use 0.0.0.0.
+        let branch = generate_branch();
+        req.set_header(
+            "Via",
+            &format!("SIP/2.0/UDP {};branch={}", self.client.local_addr(), branch),
+        );
+
         req.set_header("Call-ID", &self.call_id);
         // For UAS sending requests: From = us (INVITE's To + our tag), To = them (INVITE's From)
         let our_from = if self.to_hdr.contains("tag=") {
@@ -267,6 +291,14 @@ impl SipDialogUAS {
         req.set_header("From", &our_from);
         req.set_header("To", &self.from_hdr);
         req.set_header("CSeq", &format!("{} {}", cseq, method));
+        req.set_header(
+            "Contact",
+            &format!(
+                "<sip:{}@{}>",
+                self.client.username(),
+                self.client.local_addr()
+            ),
+        );
         req.set_header("Max-Forwards", "70");
         req.set_header("User-Agent", "xphone");
         for route in &self.route_set {
@@ -325,7 +357,7 @@ impl Dialog for SipDialogUAS {
         let mut req = self.build_request("INVITE");
         req.set_header("Content-Type", "application/sdp");
         req.body = sdp.to_vec();
-        let _ = self.client.send_dialog_request(&mut req, SIP_TIMEOUT)?;
+        let _ = self.client.send_dialog_reinvite(&mut req, SIP_TIMEOUT)?;
         Ok(())
     }
 

@@ -217,11 +217,51 @@ fn inbound_accept_and_remote_bye() {
     p2.disconnect().unwrap();
 }
 
+/// E4: p1 dials p2, p2 accepts, p1 holds, p1 resumes, p1 ends.
 #[test]
-#[ignore = "requires re-INVITE hold support through Asterisk"]
 fn hold_resume() {
-    // E4: establish call, hold, resume.
-    todo!()
+    let cfg1 = integration_phone_config("1001", "test");
+    let cfg2 = integration_phone_config("1002", "test");
+
+    let p1 = Phone::new(cfg1);
+    let p2 = Phone::new(cfg2);
+
+    p1.connect().unwrap();
+    p2.connect().unwrap();
+
+    let (call_tx, call_rx) = crossbeam_channel::bounded(1);
+    p2.on_incoming(move |call| {
+        call.accept().unwrap();
+        let _ = call_tx.send(call);
+    });
+
+    let opts = xphone::config::DialOptions {
+        timeout: Duration::from_secs(10),
+        ..Default::default()
+    };
+    let call1 = p1.dial("1002", opts).unwrap();
+    let _call2 = call_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+
+    assert_eq!(call1.state(), xphone::types::CallState::Active);
+
+    // Hold.
+    call1.hold().unwrap();
+    assert_eq!(call1.state(), xphone::types::CallState::OnHold);
+
+    // Give Asterisk time to process the re-INVITE.
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Resume.
+    call1.resume().unwrap();
+    assert_eq!(call1.state(), xphone::types::CallState::Active);
+
+    std::thread::sleep(Duration::from_millis(500));
+
+    // End.
+    call1.end().unwrap();
+
+    p1.disconnect().unwrap();
+    p2.disconnect().unwrap();
 }
 
 #[test]

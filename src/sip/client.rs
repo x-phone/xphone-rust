@@ -257,7 +257,7 @@ impl Client {
         }
     }
 
-    /// Sends an in-dialog SIP request (BYE, re-INVITE, REFER) and waits for response.
+    /// Sends an in-dialog SIP request (BYE, REFER) and waits for response.
     pub fn send_dialog_request(&self, req: &mut Message, timeout: Duration) -> Result<Message> {
         if *self.closed.lock() {
             return Err(Error::Other("sip: client closed".into()));
@@ -266,6 +266,39 @@ impl Client {
         let resp = tm.send(req, self.cfg.server_addr, timeout)?;
         let branch = req.via_branch().to_string();
         tm.remove_tx(&branch);
+        Ok(resp)
+    }
+
+    /// Sends an in-dialog re-INVITE, consuming provisional responses and sending ACK on 200 OK.
+    pub fn send_dialog_reinvite(&self, req: &mut Message, timeout: Duration) -> Result<Message> {
+        if *self.closed.lock() {
+            return Err(Error::Other("sip: client closed".into()));
+        }
+
+        let invite_clone = req.clone();
+        let resp = {
+            let tm = self.tm.lock();
+            tm.send(req, self.cfg.server_addr, timeout)?
+        };
+        let branch = req.via_branch().to_string();
+
+        // Consume provisional responses.
+        let mut resp = resp;
+        while (100..200).contains(&resp.status_code) {
+            let tm = self.tm.lock();
+            resp = tm.read_response(&branch, timeout)?;
+        }
+
+        if (200..300).contains(&resp.status_code) {
+            // Send ACK for 2xx.
+            let ack = self.build_ack(&invite_clone, &resp);
+            let tm = self.tm.lock();
+            tm.remove_tx(&branch);
+            tm.send_raw(&ack.to_bytes(), self.cfg.server_addr)?;
+        } else {
+            self.tm.lock().remove_tx(&branch);
+        }
+
         Ok(resp)
     }
 
