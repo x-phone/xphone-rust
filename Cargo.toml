@@ -16,5 +16,8 @@ parking_lot = "0.12"
 bytes = "1"
 md5 = "0.7"
 
+[features]
+integration = []
+
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
