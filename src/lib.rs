@@ -5,6 +5,7 @@ pub mod dialog;
 pub mod dtmf;
 pub mod error;
 pub mod jitter;
+pub mod media;
 pub mod mock;
 pub mod sdp;
 pub mod types;

@@ -107,7 +107,7 @@ impl fmt::Display for Direction {
 }
 
 /// RTP packet header.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
 pub struct RtpHeader {
     pub version: u8,
     pub marker: bool,
