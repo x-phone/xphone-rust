@@ -388,6 +388,61 @@ fn fakepbx_blind_transfer() {
     phone.disconnect().unwrap();
 }
 
+// --- F-STUN: SDP media address matches advertised address ---
+
+#[test]
+fn fakepbx_sdp_contains_local_ip() {
+    let pbx = FakePBX::new(&[with_auth("1001", "test")]);
+
+    let (sdp_tx, sdp_rx) = crossbeam_channel::bounded(1);
+    let answer_sdp = sdp::sdp("127.0.0.1", 20700, &[sdp::PCMA]);
+    pbx.on_invite(move |inv| {
+        // Capture the SDP that xphone sent in the INVITE.
+        let received_sdp = inv.sdp().to_string();
+        let _ = sdp_tx.send(received_sdp);
+        inv.trying();
+        inv.ringing();
+        inv.answer(&answer_sdp);
+    });
+
+    let phone = connect_pbx(&pbx);
+
+    let opts = DialOptions {
+        timeout: Duration::from_secs(5),
+        ..Default::default()
+    };
+    let call = phone.dial("9999", opts).unwrap();
+    assert_eq!(call.state(), CallState::Active);
+
+    // Get the SDP that the PBX received.
+    let received_sdp = sdp_rx
+        .recv_timeout(Duration::from_secs(3))
+        .expect("INVITE handler never ran");
+
+    // The SDP c= line should contain a real IP (not 0.0.0.0).
+    assert!(
+        received_sdp.contains("c=IN IP4"),
+        "SDP should have c= line, got: {}",
+        received_sdp
+    );
+    assert!(
+        !received_sdp.contains("c=IN IP4 0.0.0.0"),
+        "SDP should not use 0.0.0.0, got: {}",
+        received_sdp
+    );
+
+    // The call's local_sdp should match what the PBX received.
+    let local_sdp = call.local_sdp();
+    assert_eq!(
+        local_sdp, received_sdp,
+        "local_sdp and sent SDP should match"
+    );
+
+    call.end().unwrap();
+    pbx.wait_for_bye(1, Duration::from_secs(2));
+    phone.disconnect().unwrap();
+}
+
 // --- F10: Disconnect fires unregistered callback ---
 
 #[test]

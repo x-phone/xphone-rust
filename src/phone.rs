@@ -769,4 +769,58 @@ mod tests {
         // Call should be untracked.
         assert!(phone.find_call(&call_id).is_none());
     }
+
+    #[test]
+    fn dial_uses_advertised_addr_in_sdp() {
+        let tr = Arc::new(MockTransport::new());
+        tr.respond_with(200, "OK"); // REGISTER
+
+        // Simulate a STUN-mapped address.
+        let stun_ip: std::net::SocketAddr = "203.0.113.42:5060".parse().unwrap();
+        tr.set_advertised_addr(stun_ip);
+
+        let phone = Phone::new(test_cfg());
+        phone.connect_with_transport(Arc::clone(&tr) as Arc<dyn SipTransport>);
+
+        tr.respond_with(200, "OK"); // INVITE
+        let call = phone
+            .dial("sip:1002@pbx.local", DialOptions::default())
+            .unwrap();
+
+        // The local SDP should contain the STUN-mapped IP, not a local IP.
+        let sdp = call.local_sdp();
+        assert!(
+            sdp.contains("c=IN IP4 203.0.113.42"),
+            "SDP should contain STUN-mapped IP, got: {}",
+            sdp
+        );
+    }
+
+    #[test]
+    fn dial_prefers_local_ip_config_over_advertised_addr() {
+        let tr = Arc::new(MockTransport::new());
+        tr.respond_with(200, "OK"); // REGISTER
+
+        // Set both advertised addr and explicit local_ip.
+        let stun_ip: std::net::SocketAddr = "203.0.113.42:5060".parse().unwrap();
+        tr.set_advertised_addr(stun_ip);
+
+        let mut cfg = test_cfg();
+        cfg.local_ip = "10.0.0.99".into();
+        let phone = Phone::new(cfg);
+        phone.connect_with_transport(Arc::clone(&tr) as Arc<dyn SipTransport>);
+
+        tr.respond_with(200, "OK"); // INVITE
+        let call = phone
+            .dial("sip:1002@pbx.local", DialOptions::default())
+            .unwrap();
+
+        // Explicit local_ip should take priority over STUN.
+        let sdp = call.local_sdp();
+        assert!(
+            sdp.contains("c=IN IP4 10.0.0.99"),
+            "SDP should use explicit local_ip over STUN, got: {}",
+            sdp
+        );
+    }
 }

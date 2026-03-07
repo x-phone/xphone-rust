@@ -41,6 +41,7 @@ struct Inner {
     sent: Vec<SentMessage>,
     keepalives: u32,
     closed: bool,
+    advertised: Option<std::net::SocketAddr>,
 
     invite_func: Option<Arc<dyn Fn() + Send + Sync>>,
     drop_handler: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -68,6 +69,7 @@ impl MockTransport {
                 sent: Vec::new(),
                 keepalives: 0,
                 closed: false,
+                advertised: None,
                 invite_func: None,
                 drop_handler: None,
                 incoming_handler: None,
@@ -166,6 +168,11 @@ impl MockTransport {
         });
 
         rx
+    }
+
+    /// Sets the advertised address (simulates STUN-mapped address).
+    pub fn set_advertised_addr(&self, addr: std::net::SocketAddr) {
+        self.inner.lock().advertised = Some(addr);
     }
 
     fn await_response(&self, timeout: Duration) -> Result<(u16, String)> {
@@ -267,6 +274,39 @@ impl SipTransport for MockTransport {
 
     fn on_incoming(&self, f: Box<dyn Fn(String, String) + Send + Sync>) {
         self.inner.lock().incoming_handler = Some(Arc::from(f));
+    }
+
+    fn dial(
+        &self,
+        _target: &str,
+        _local_sdp: &[u8],
+        timeout: Duration,
+    ) -> Result<(Arc<dyn crate::dialog::Dialog>, String)> {
+        // Record as an INVITE send.
+        {
+            let mut inner = self.inner.lock();
+            inner.sent.push(SentMessage {
+                method: "INVITE".into(),
+                headers: None,
+            });
+
+            if inner.fail_remain > 0 {
+                inner.fail_remain -= 1;
+                return Err(Error::Other("transport error".into()));
+            }
+        }
+
+        let (code, reason) = self.await_response(timeout)?;
+        if code >= 300 {
+            return Err(Error::Other(format!("INVITE failed: {} {}", code, reason)));
+        }
+
+        let dlg = Arc::new(crate::mock::dialog::MockDialog::new());
+        Ok((dlg as Arc<dyn crate::dialog::Dialog>, String::new()))
+    }
+
+    fn advertised_addr(&self) -> Option<std::net::SocketAddr> {
+        self.inner.lock().advertised
     }
 
     fn close(&self) -> Result<()> {
