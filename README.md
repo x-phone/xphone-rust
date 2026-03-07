@@ -102,7 +102,7 @@ Add to your `Cargo.toml`:
 xphone = "0.1"
 ```
 
-Requires Rust 1.75+.
+Requires Rust 1.87+.
 
 ---
 

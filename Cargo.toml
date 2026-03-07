@@ -9,6 +9,7 @@ repository = "https://github.com/x-phone/xphone-rust"
 homepage = "https://github.com/x-phone/xphone-rust"
 documentation = "https://docs.rs/xphone"
 readme = "README.md"
+exclude = ["testutil/", ".github/", "CLAUDE.md", "Makefile"]
 keywords = ["sip", "voip", "telephony", "rtp", "audio"]
 categories = ["multimedia::audio", "network-programming"]
 

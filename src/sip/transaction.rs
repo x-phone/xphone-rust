@@ -381,7 +381,10 @@ mod tests {
         req.set_header("CSeq", "1 REGISTER");
 
         let result = tm.send(&mut req, dst, Duration::from_millis(200));
-        assert!(result.is_err(), "expected error when sending to unreachable destination");
+        assert!(
+            result.is_err(),
+            "expected error when sending to unreachable destination"
+        );
 
         tm.stop();
     }

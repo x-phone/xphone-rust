@@ -470,7 +470,9 @@ pub fn start_media(
                     if shared.muted.load(Ordering::Relaxed) {
                         continue;
                     }
-                    let proc = cp.as_mut().unwrap();
+                    let Some(proc) = cp.as_mut() else {
+                        continue;
+                    };
                     let encoded = proc.encode(&pcm_frame);
                     let out_pkt = RtpPacket {
                         header: RtpHeader {
