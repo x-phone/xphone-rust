@@ -1,4 +1,4 @@
-.PHONY: fmt clippy build test test-integration lint sipcli check
+.PHONY: fmt clippy build test test-integration test-docker test-all docker-up docker-down lint sipcli check
 
 fmt:
 	cargo fmt
@@ -14,6 +14,16 @@ test:
 
 test-integration:
 	cargo test --features integration --test integration_test -- --nocapture --test-threads=1
+
+test-docker: docker-up test-integration docker-down
+
+docker-up:
+	docker compose -f testutil/docker/docker-compose.yml up -d --wait
+
+docker-down:
+	docker compose -f testutil/docker/docker-compose.yml down
+
+test-all: test test-docker
 
 lint: fmt clippy
 
