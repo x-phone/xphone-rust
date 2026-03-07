@@ -10,6 +10,7 @@ use tracing::{debug, warn};
 use crate::codec::{self, CodecProcessor};
 use crate::dtmf;
 use crate::jitter::JitterBuffer;
+use crate::srtp::SrtpContext;
 use crate::types::*;
 
 /// Default media configuration values.
@@ -45,6 +46,10 @@ pub struct MediaConfig {
     pub pcm_rate: i32,
     /// Audio codec to use for encoding/decoding.
     pub codec: Codec,
+    /// SRTP context for inbound (decrypt). None = plain RTP.
+    pub srtp_inbound: Option<SrtpContext>,
+    /// SRTP context for outbound (encrypt). None = plain RTP.
+    pub srtp_outbound: Option<SrtpContext>,
 }
 
 impl Default for MediaConfig {
@@ -54,6 +59,8 @@ impl Default for MediaConfig {
             jitter_depth: DEFAULT_JITTER_DEPTH,
             pcm_rate: DEFAULT_PCM_RATE,
             codec: Codec::PCMU,
+            srtp_inbound: None,
+            srtp_outbound: None,
         }
     }
 }
@@ -278,6 +285,10 @@ pub fn start_media(
     let codec_pt = config.codec.payload_type();
     let mut cp = codec::new_codec_processor(codec_pt, pcm_rate);
 
+    // Move SRTP contexts into Mutex for thread safety.
+    let srtp_in = config.srtp_inbound.map(|ctx| Arc::new(Mutex::new(ctx)));
+    let srtp_out = config.srtp_outbound.map(|ctx| Arc::new(Mutex::new(ctx)));
+
     // Spawn an inbound UDP reader thread if transport is available.
     let (reader_done_tx, reader_done_rx) = bounded::<()>(1);
     let reader_thread = transport.as_ref().map(|tr| {
@@ -285,6 +296,7 @@ pub fn start_media(
         let inbound_tx = channels.rtp_inbound.tx.clone();
         let inbound_rx = channels.rtp_inbound.rx.clone();
         let done = reader_done_rx;
+        let srtp_in_clone = srtp_in.clone();
         debug!("media: starting UDP reader thread");
         std::thread::spawn(move || {
             let mut buf = [0u8; 2048];
@@ -298,14 +310,26 @@ pub fn start_media(
                         if n < 12 {
                             continue;
                         }
-                        if let Some(pkt) = RtpPacket::parse(&buf[..n]) {
+                        // SRTP decrypt if configured.
+                        let rtp_data = if let Some(ref srtp) = srtp_in_clone {
+                            match srtp.lock().unprotect(&buf[..n]) {
+                                Ok(decrypted) => decrypted,
+                                Err(e) => {
+                                    warn!(error = %e, "media: SRTP unprotect failed — dropping packet");
+                                    continue;
+                                }
+                            }
+                        } else {
+                            buf[..n].to_vec()
+                        };
+                        if let Some(pkt) = RtpPacket::parse(&rtp_data) {
                             pkt_count += 1;
                             if pkt_count <= 3 || pkt_count.is_multiple_of(500) {
                                 debug!(
                                     pt = pkt.header.payload_type,
                                     seq = pkt.header.sequence_number,
                                     ssrc = pkt.header.ssrc,
-                                    len = n,
+                                    len = rtp_data.len(),
                                     total = pkt_count,
                                     "media: RTP recv"
                                 );
@@ -322,6 +346,7 @@ pub fn start_media(
     });
 
     let transport_for_thread = transport.clone();
+    let srtp_out_for_thread = srtp_out;
     let thread = std::thread::spawn(move || {
         let mut jb = JitterBuffer::new(jitter_depth);
         let mut out_seq: u16 = 0;
@@ -430,8 +455,7 @@ pub fn start_media(
                         send_drop_oldest(&sent.tx, &sent.rx, clone_packet(&pkt));
                     }
                     if let Some(ref tr) = transport_for_thread {
-                        let remote = *tr.remote_addr.lock();
-                        let _ = tr.socket.send_to(&pkt.to_bytes(), remote);
+                        send_rtp_to_transport(pkt.to_bytes(), &srtp_out_for_thread, tr);
                     }
                 },
 
@@ -465,8 +489,7 @@ pub fn start_media(
                         send_drop_oldest(&sent.tx, &sent.rx, clone_packet(&out_pkt));
                     }
                     if let Some(ref tr) = transport_for_thread {
-                        let remote = *tr.remote_addr.lock();
-                        let _ = tr.socket.send_to(&out_pkt.to_bytes(), remote);
+                        send_rtp_to_transport(out_pkt.to_bytes(), &srtp_out_for_thread, tr);
                     }
                 },
             }
@@ -483,6 +506,27 @@ pub fn start_media(
         thread: Some(thread),
         reader_thread,
     }
+}
+
+/// Optionally encrypts with SRTP and sends an RTP packet via transport.
+fn send_rtp_to_transport(
+    raw: Vec<u8>,
+    srtp: &Option<Arc<Mutex<SrtpContext>>>,
+    transport: &MediaTransport,
+) {
+    let data = if let Some(ref ctx) = srtp {
+        match ctx.lock().protect(&raw) {
+            Ok(encrypted) => encrypted,
+            Err(e) => {
+                warn!(error = %e, "media: SRTP protect failed");
+                return;
+            }
+        }
+    } else {
+        raw
+    };
+    let remote = *transport.remote_addr.lock();
+    let _ = transport.socket.send_to(&data, remote);
 }
 
 /// Inline drain: pops from jitter buffer and fans out to readers.

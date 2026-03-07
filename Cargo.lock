@@ -1900,6 +1900,7 @@ dependencies = [
  "crossbeam-channel",
  "crossterm",
  "dirs-next",
+ "getrandom 0.2.17",
  "md5",
  "parking_lot",
  "ratatui",

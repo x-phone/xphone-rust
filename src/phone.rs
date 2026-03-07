@@ -197,12 +197,30 @@ impl Phone {
         } else {
             (None, 20000)
         };
-        let local_sdp = crate::sdp::build_offer(
-            &local_ip,
-            rtp_port,
-            &[8, 0, 9, 101],
-            crate::sdp::DIR_SEND_RECV,
-        );
+        // Generate SRTP keying material if enabled.
+        let srtp_inline_key = if self.cfg.srtp {
+            let (_material, encoded) = crate::srtp::generate_keying_material()?;
+            Some(encoded)
+        } else {
+            None
+        };
+
+        let local_sdp = if let Some(ref key) = srtp_inline_key {
+            crate::sdp::build_offer_srtp(
+                &local_ip,
+                rtp_port,
+                &[8, 0, 9, 101],
+                crate::sdp::DIR_SEND_RECV,
+                key,
+            )
+        } else {
+            crate::sdp::build_offer(
+                &local_ip,
+                rtp_port,
+                &[8, 0, 9, 101],
+                crate::sdp::DIR_SEND_RECV,
+            )
+        };
 
         // Try dialog-based dial (production SipUA path).
         let dial_result = tr.dial(target, local_sdp.as_bytes(), opts.timeout);
@@ -213,6 +231,9 @@ impl Phone {
                 // tr.dial() already consumed the 200 OK, so transition to Active.
                 let call = Call::new_outbound(dlg, opts);
                 call.set_local_media(&local_ip, rtp_port);
+                if let Some(ref key) = srtp_inline_key {
+                    call.set_srtp(key);
+                }
                 if let Some(sock) = rtp_socket {
                     call.set_rtp_socket(sock);
                 }
@@ -444,9 +465,35 @@ fn handle_dialog_incoming(
         (None, rtp_port_min as i32)
     };
 
+    // Only use SRTP if the remote actually offers RTP/SAVP with a supported suite.
+    // Local config preference alone is not enough — the remote must also offer SRTP.
+    let use_srtp = if let Ok(sess) = crate::sdp::parse(remote_sdp) {
+        if sess.is_srtp() {
+            // Validate that the remote offers a supported cipher suite.
+            if let Some(crypto) = sess.first_crypto() {
+                crypto.suite == crate::srtp::SUPPORTED_SUITE
+            } else {
+                false
+            }
+        } else {
+            false
+        }
+    } else {
+        false
+    };
+
     // Create an inbound call with the real dialog.
     let call = Call::new_inbound(dlg);
     call.set_local_media(local_ip, actual_port);
+    if use_srtp {
+        match crate::srtp::generate_keying_material() {
+            Ok((_material, encoded)) => call.set_srtp(&encoded),
+            Err(e) => {
+                tracing::error!("failed to generate SRTP keying material: {}", e);
+                return;
+            }
+        }
+    }
     if let Some(sock) = rtp_socket {
         call.set_rtp_socket(sock);
     }

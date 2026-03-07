@@ -48,6 +48,8 @@ pub struct Config {
     pub pcm_frame_size: usize,
     /// PCM sample rate in Hz (default `8000`).
     pub pcm_rate: u32,
+    /// Enable SRTP (SDES-SRTP with AES_CM_128_HMAC_SHA1_80).
+    pub srtp: bool,
 }
 
 impl Default for Config {
@@ -71,6 +73,7 @@ impl Default for Config {
             media_timeout: Duration::from_secs(30),
             pcm_frame_size: 0,
             pcm_rate: 8000,
+            srtp: false,
         }
     }
 }
@@ -166,6 +169,12 @@ impl PhoneBuilder {
     /// Sets the maximum number of registration retries.
     pub fn register_max_retry(mut self, n: u32) -> Self {
         self.config.register_max_retry = n;
+        self
+    }
+
+    /// Enables SRTP (SDES-SRTP with AES_CM_128_HMAC_SHA1_80).
+    pub fn srtp(mut self, enabled: bool) -> Self {
+        self.config.srtp = enabled;
         self
     }
 

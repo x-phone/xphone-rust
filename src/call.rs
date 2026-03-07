@@ -12,6 +12,7 @@ use crate::dtmf;
 use crate::error::{Error, Result};
 use crate::media::{self, MediaChannels, MediaConfig, MediaHandle, MediaTransport};
 use crate::sdp;
+use crate::srtp::SrtpContext;
 use crate::types::*;
 
 /// Default codec preference order (payload types).
@@ -118,6 +119,12 @@ struct CallInner {
     codec: Codec,
 
     media_active: bool,
+    /// Whether SRTP is enabled for this call.
+    srtp_enabled: bool,
+    /// Local SRTP keying material (base64 inline key).
+    srtp_local_key: String,
+    /// Remote SRTP keying material (base64 inline key).
+    srtp_remote_key: String,
 
     rtp_socket: Option<Arc<UdpSocket>>,
     media_handle: Option<MediaHandle>,
@@ -166,6 +173,9 @@ impl Call {
                 remote_sdp: String::new(),
                 codec: Codec::PCMU,
                 media_active: false,
+                srtp_enabled: false,
+                srtp_local_key: String::new(),
+                srtp_remote_key: String::new(),
                 rtp_socket: None,
                 media_handle: None,
                 media_channels: None,
@@ -205,6 +215,9 @@ impl Call {
                 remote_sdp: String::new(),
                 codec: Codec::PCMU,
                 media_active: false,
+                srtp_enabled: false,
+                srtp_local_key: String::new(),
+                srtp_remote_key: String::new(),
                 rtp_socket: None,
                 media_handle: None,
                 media_channels: None,
@@ -366,7 +379,17 @@ impl Call {
             inner.local_ip = "127.0.0.1".into();
         }
         let prefs = Self::resolve_codec_prefs(inner);
-        sdp::build_offer(&inner.local_ip, inner.rtp_port, prefs, direction)
+        if inner.srtp_enabled && !inner.srtp_local_key.is_empty() {
+            sdp::build_offer_srtp(
+                &inner.local_ip,
+                inner.rtp_port,
+                prefs,
+                direction,
+                &inner.srtp_local_key,
+            )
+        } else {
+            sdp::build_offer(&inner.local_ip, inner.rtp_port, prefs, direction)
+        }
     }
 
     fn build_answer_sdp(inner: &mut CallInner, remote: &sdp::Session, direction: &str) -> String {
@@ -379,13 +402,24 @@ impl Call {
             .map(|m| m.codecs.as_slice())
             .unwrap_or(&[]);
         let prefs = Self::resolve_codec_prefs(inner);
-        sdp::build_answer(
-            &inner.local_ip,
-            inner.rtp_port,
-            prefs,
-            remote_codecs,
-            direction,
-        )
+        if inner.srtp_enabled && !inner.srtp_local_key.is_empty() {
+            sdp::build_answer_srtp(
+                &inner.local_ip,
+                inner.rtp_port,
+                prefs,
+                remote_codecs,
+                direction,
+                &inner.srtp_local_key,
+            )
+        } else {
+            sdp::build_answer(
+                &inner.local_ip,
+                inner.rtp_port,
+                prefs,
+                remote_codecs,
+                direction,
+            )
+        }
     }
 
     fn negotiate_codec(inner: &mut CallInner, sess: &sdp::Session) {
@@ -818,6 +852,17 @@ impl Call {
         if let Ok(sess) = sdp::parse(raw_sdp) {
             Self::set_remote_endpoint(&mut inner, &sess);
             Self::negotiate_codec(&mut inner, &sess);
+            // Extract remote SRTP key if present and suite is supported.
+            if sess.is_srtp() {
+                if let Some(crypto) = sess.first_crypto() {
+                    if crypto.suite == crate::srtp::SUPPORTED_SUITE {
+                        inner.srtp_remote_key = crypto.key_params.clone();
+                        inner.srtp_enabled = true;
+                    } else {
+                        tracing::warn!("remote offered unsupported SRTP suite: {}", crypto.suite);
+                    }
+                }
+            }
         }
     }
 
@@ -831,6 +876,14 @@ impl Call {
     /// Sets the RTP socket for this call (production path).
     pub(crate) fn set_rtp_socket(&self, socket: UdpSocket) {
         self.inner.lock().rtp_socket = Some(Arc::new(socket));
+    }
+
+    /// Enables SRTP and stores the local inline key.
+    /// The remote key is extracted from remote SDP when available.
+    pub(crate) fn set_srtp(&self, local_inline_key: &str) {
+        let mut inner = self.inner.lock();
+        inner.srtp_enabled = true;
+        inner.srtp_local_key = local_inline_key.to_string();
     }
 
     /// Starts the media pipeline if an RTP socket is available and remote endpoint is known.
@@ -861,8 +914,34 @@ impl Call {
         if let Some(ref f) = inner.on_dtmf_fn {
             *shared.on_dtmf_fn.lock() = Some(Arc::clone(f));
         }
+        // Create SRTP contexts if enabled and both keys are available.
+        let (srtp_in, srtp_out) = if inner.srtp_enabled
+            && !inner.srtp_local_key.is_empty()
+            && !inner.srtp_remote_key.is_empty()
+        {
+            let inbound = match SrtpContext::from_sdes_inline(&inner.srtp_remote_key) {
+                Ok(ctx) => Some(ctx),
+                Err(e) => {
+                    tracing::error!("SRTP inbound context creation failed: {}", e);
+                    return;
+                }
+            };
+            let outbound =
+                match SrtpContext::from_sdes_inline(&format!("inline:{}", inner.srtp_local_key)) {
+                    Ok(ctx) => Some(ctx),
+                    Err(e) => {
+                        tracing::error!("SRTP outbound context creation failed: {}", e);
+                        return;
+                    }
+                };
+            (inbound, outbound)
+        } else {
+            (None, None)
+        };
         let config = MediaConfig {
             codec: inner.codec,
+            srtp_inbound: srtp_in,
+            srtp_outbound: srtp_out,
             ..MediaConfig::default()
         };
         let handle = media::start_media(
