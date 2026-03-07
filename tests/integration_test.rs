@@ -50,6 +50,9 @@ fn integration_client_config(ext: &str, password: &str) -> ClientConfig {
         username: ext.into(),
         password: password.into(),
         domain: host,
+        transport: "udp".into(),
+        tls_config: None,
+        stun_server: None,
     }
 }
 
