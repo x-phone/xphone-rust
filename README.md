@@ -235,6 +235,37 @@ let phone = PhoneBuilder::new()
 
 ---
 
+## NAT Traversal (STUN)
+
+If your application runs behind NAT (most deployments), configure a STUN server so xphone can discover your public IP and advertise it correctly in SIP and SDP:
+
+```rust
+let phone = Phone::new(Config {
+    username: "1001".into(),
+    password: "secret".into(),
+    host: "sip.telnyx.com".into(),
+    stun_server: Some("stun.l.google.com:19302".into()),
+    ..Config::default()
+});
+
+// Or with the builder:
+let phone = Phone::new(
+    PhoneBuilder::new()
+        .credentials("1001", "secret", "sip.telnyx.com")
+        .stun_server("stun.l.google.com:19302")
+        .build(),
+);
+```
+
+When `stun_server` is set, xphone sends a STUN Binding Request at startup to learn your external IP. If the STUN server is unreachable, it falls back to local IP detection automatically.
+
+Common public STUN servers:
+- `stun.l.google.com:19302`
+- `stun1.l.google.com:19302`
+- `stun.cloudflare.com:3478`
+
+---
+
 ## Call States
 
 ```
