@@ -135,7 +135,9 @@ struct CallInner {
     on_ended_internal: Option<Arc<dyn Fn(EndReason) + Send + Sync>>,
     on_media_fn: Option<Arc<dyn Fn() + Send + Sync>>,
     on_state_fn: Option<Arc<dyn Fn(CallState) + Send + Sync>>,
+    on_state_internal: Option<Arc<dyn Fn(CallState) + Send + Sync>>,
     on_dtmf_fn: Option<Arc<dyn Fn(String) + Send + Sync>>,
+    on_dtmf_internal: Option<Arc<dyn Fn(String) + Send + Sync>>,
     on_hold_fn: Option<Arc<dyn Fn() + Send + Sync>>,
     on_resume_fn: Option<Arc<dyn Fn() + Send + Sync>>,
     on_mute_fn: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -184,7 +186,9 @@ impl Call {
                 on_ended_internal: None,
                 on_media_fn: None,
                 on_state_fn: None,
+                on_state_internal: None,
                 on_dtmf_fn: None,
+                on_dtmf_internal: None,
                 on_hold_fn: None,
                 on_resume_fn: None,
                 on_mute_fn: None,
@@ -226,7 +230,9 @@ impl Call {
                 on_ended_internal: None,
                 on_media_fn: None,
                 on_state_fn: None,
+                on_state_internal: None,
                 on_dtmf_fn: None,
+                on_dtmf_internal: None,
                 on_hold_fn: None,
                 on_resume_fn: None,
                 on_mute_fn: None,
@@ -456,6 +462,10 @@ impl Call {
     // --- Callback dispatch (copy fn under lock, fire outside) ---
 
     fn fire_on_state(inner: &CallInner, state: CallState) {
+        if let Some(ref f) = inner.on_state_internal {
+            let f = Arc::clone(f);
+            std::thread::spawn(move || f(state));
+        }
         if let Some(ref f) = inner.on_state_fn {
             let f = Arc::clone(f);
             std::thread::spawn(move || f(state));
@@ -930,10 +940,9 @@ impl Call {
         ));
         let channels = Arc::new(MediaChannels::new());
         let shared = Arc::new(media::MediaSharedState::new(inner.state));
-        // Wire callbacks from Call into the media thread's shared state.
-        if let Some(ref f) = inner.on_dtmf_fn {
-            *shared.on_dtmf_fn.lock() = Some(Arc::clone(f));
-        }
+        // Wire DTMF callbacks from Call into the media thread's shared state.
+        // Combine internal + user callbacks into a single dispatcher.
+        Self::sync_dtmf_to_media(inner, &shared);
         // Create SRTP contexts if enabled and both keys are available.
         let (srtp_in, srtp_out) = if inner.srtp_enabled
             && !inner.srtp_local_key.is_empty()
@@ -999,12 +1008,10 @@ impl Call {
 
     /// Registers a callback invoked when a DTMF digit is received.
     pub fn on_dtmf(&self, f: impl Fn(String) + Send + Sync + 'static) {
-        let cb: Arc<dyn Fn(String) + Send + Sync> = Arc::new(f);
         let mut inner = self.inner.lock();
-        inner.on_dtmf_fn = Some(Arc::clone(&cb));
-        // Propagate to media thread's shared state if pipeline is running.
+        inner.on_dtmf_fn = Some(Arc::new(f));
         if let Some(ref shared) = inner.media_shared {
-            *shared.on_dtmf_fn.lock() = Some(cb);
+            Self::sync_dtmf_to_media(&inner, shared);
         }
     }
 
@@ -1030,6 +1037,38 @@ impl Call {
 
     pub(crate) fn on_ended_internal(&self, f: impl Fn(EndReason) + Send + Sync + 'static) {
         self.inner.lock().on_ended_internal = Some(Arc::new(f));
+    }
+
+    /// Internal state callback — used by phone layer, not overwritten by user's on_state().
+    pub(crate) fn on_state_internal(&self, f: impl Fn(CallState) + Send + Sync + 'static) {
+        self.inner.lock().on_state_internal = Some(Arc::new(f));
+    }
+
+    /// Internal DTMF callback — used by phone layer, not overwritten by user's on_dtmf().
+    pub(crate) fn on_dtmf_internal(&self, f: impl Fn(String) + Send + Sync + 'static) {
+        let mut inner = self.inner.lock();
+        inner.on_dtmf_internal = Some(Arc::new(f));
+        if let Some(ref shared) = inner.media_shared {
+            Self::sync_dtmf_to_media(&inner, shared);
+        }
+    }
+
+    /// Builds a single dispatcher from internal + user DTMF callbacks and sets it on the media shared state.
+    fn sync_dtmf_to_media(inner: &CallInner, shared: &Arc<media::MediaSharedState>) {
+        let f_int = inner.on_dtmf_internal.clone();
+        let f_usr = inner.on_dtmf_fn.clone();
+        match (f_int, f_usr) {
+            (Some(a), Some(b)) => {
+                *shared.on_dtmf_fn.lock() = Some(Arc::new(move |d: String| {
+                    a(d.clone());
+                    b(d);
+                }));
+            }
+            (Some(f), None) | (None, Some(f)) => {
+                *shared.on_dtmf_fn.lock() = Some(f);
+            }
+            (None, None) => {}
+        }
     }
 
     // --- Media channel accessors ---

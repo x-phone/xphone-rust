@@ -466,17 +466,17 @@ fn wire_phone_call_callbacks(inner: &Arc<Mutex<Inner>>, call: &Arc<Call>) {
     if let Some(ref f) = locked.on_call_state_fn {
         let f = Arc::clone(f);
         let c = Arc::clone(call);
-        call.on_state(move |s| f(Arc::clone(&c), s));
+        call.on_state_internal(move |s| f(Arc::clone(&c), s));
     }
     if let Some(ref f) = locked.on_call_ended_fn {
         let f = Arc::clone(f);
         let c = Arc::clone(call);
-        call.on_ended(move |r| f(Arc::clone(&c), r));
+        call.on_ended_internal(move |r| f(Arc::clone(&c), r));
     }
     if let Some(ref f) = locked.on_call_dtmf_fn {
         let f = Arc::clone(f);
         let c = Arc::clone(call);
-        call.on_dtmf(move |d| f(Arc::clone(&c), d));
+        call.on_dtmf_internal(move |d| f(Arc::clone(&c), d));
     }
 }
 
@@ -868,5 +868,45 @@ mod tests {
 
         // Remote SDP should have been set from the early media SDP.
         assert!(!call.remote_sdp().is_empty());
+    }
+
+    #[test]
+    fn phone_and_user_callbacks_both_fire() {
+        let tr = Arc::new(MockTransport::new());
+        tr.respond_with(200, "OK"); // REGISTER
+
+        let phone = Phone::new(test_cfg());
+
+        // Phone-level callback (wired internally).
+        let (phone_tx, phone_rx) = crossbeam_channel::bounded(1);
+        phone.on_call_state(move |_call, state| {
+            if state == crate::types::CallState::Active {
+                let _ = phone_tx.try_send(());
+            }
+        });
+
+        phone.connect_with_transport(Arc::clone(&tr) as Arc<dyn SipTransport>);
+
+        tr.respond_with(200, "OK"); // INVITE
+        let call = phone
+            .dial("sip:1002@pbx.local", DialOptions::default())
+            .unwrap();
+
+        // User-level callback (should NOT overwrite phone-level).
+        let (user_tx, user_rx) = crossbeam_channel::bounded(1);
+        call.on_state(move |state| {
+            if state == crate::types::CallState::Ended {
+                let _ = user_tx.try_send(());
+            }
+        });
+
+        // Phone-level should have already fired for Active.
+        let got_phone = phone_rx.recv_timeout(Duration::from_secs(2)).is_ok();
+        assert!(got_phone, "phone-level on_call_state should have fired");
+
+        // End the call — user-level callback should fire.
+        call.end().unwrap();
+        let got_user = user_rx.recv_timeout(Duration::from_secs(2)).is_ok();
+        assert!(got_user, "user-level on_state should have fired");
     }
 }
