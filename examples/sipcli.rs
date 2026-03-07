@@ -112,6 +112,41 @@ fn load_profile(name: &str) -> Result<Profile, String> {
 }
 
 // ---------------------------------------------------------------------------
+// Persistent command history
+// ---------------------------------------------------------------------------
+
+const HISTORY_FILE: &str = ".sipcli_history";
+const HISTORY_MAX: usize = 500;
+
+fn history_path() -> Option<std::path::PathBuf> {
+    dirs_next::home_dir().map(|h| h.join(HISTORY_FILE))
+}
+
+fn load_history() -> Vec<String> {
+    let path = match history_path() {
+        Some(p) => p,
+        None => return Vec::new(),
+    };
+    match std::fs::read_to_string(&path) {
+        Ok(data) => data.lines().map(|l| l.to_string()).collect(),
+        Err(_) => Vec::new(),
+    }
+}
+
+fn save_history(history: &[String]) {
+    let path = match history_path() {
+        Some(p) => p,
+        None => return,
+    };
+    let start = if history.len() > HISTORY_MAX {
+        history.len() - HISTORY_MAX
+    } else {
+        0
+    };
+    let _ = std::fs::write(&path, history[start..].join("\n") + "\n");
+}
+
+// ---------------------------------------------------------------------------
 // Shared TUI state (written by xphone callbacks, read by render loop)
 // ---------------------------------------------------------------------------
 
@@ -1150,7 +1185,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let phone = Phone::new(cfg);
-    let state: SharedState = Arc::new(Mutex::new(AppState::new()));
+    let mut app = AppState::new();
+    app.history = load_history();
+    let state: SharedState = Arc::new(Mutex::new(app));
 
     // Install tracing subscriber that feeds library logs into the debug panel.
     let tui_layer = TuiLayer {
@@ -1251,6 +1288,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             }
         }
     }
+
+    // Save command history.
+    save_history(&state.lock().unwrap().history);
 
     // Restore terminal.
     disable_raw_mode()?;
