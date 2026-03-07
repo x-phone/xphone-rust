@@ -59,6 +59,10 @@ pub trait SipTransport: Send + Sync {
     /// Arg: Call-ID of the terminated dialog.
     fn on_bye(&self, _f: Box<dyn Fn(String) + Send + Sync>) {}
 
+    /// Registers a callback for incoming NOTIFY requests (REFER progress).
+    /// Args: Call-ID, status code parsed from sipfrag body.
+    fn on_notify(&self, _f: Box<dyn Fn(String, u16) + Send + Sync>) {}
+
     /// Sends REGISTER with Expires: 0 to unregister.
     fn unregister(&self, _timeout: Duration) -> Result<()> {
         Ok(())

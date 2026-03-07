@@ -146,6 +146,13 @@ impl Dialog for MockDialog {
         self.inner.lock().on_notify = Some(Arc::from(f));
     }
 
+    fn fire_notify(&self, code: u16) {
+        let f = self.inner.lock().on_notify.clone();
+        if let Some(f) = f {
+            f(code);
+        }
+    }
+
     fn call_id(&self) -> String {
         self.inner.lock().call_id.clone()
     }

@@ -134,6 +134,12 @@ impl Phone {
             handle_bye(&inner_clone, &call_id);
         }));
 
+        // Wire up NOTIFY handling (REFER progress).
+        let inner_clone = Arc::clone(&self.inner);
+        tr.on_notify(Box::new(move |call_id, code| {
+            handle_notify(&inner_clone, &call_id, code);
+        }));
+
         let mut inner = self.inner.lock();
         inner.tr = Some(tr);
         inner.reg = Some(reg);
@@ -532,6 +538,16 @@ fn handle_bye(inner: &Arc<Mutex<Inner>>, call_id: &str) {
         call.simulate_bye();
     } else {
         warn!(call_id = %call_id, "Phone BYE for unknown call");
+    }
+}
+
+fn handle_notify(inner: &Arc<Mutex<Inner>>, call_id: &str, code: u16) {
+    info!(call_id = %call_id, code = code, "Phone handling NOTIFY");
+    let call = inner.lock().calls.get(call_id).cloned();
+    if let Some(call) = call {
+        call.fire_notify(code);
+    } else {
+        warn!(call_id = %call_id, "Phone NOTIFY for unknown call");
     }
 }
 

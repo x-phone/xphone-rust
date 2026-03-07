@@ -18,6 +18,8 @@ pub trait Dialog: Send + Sync {
     fn send_refer(&self, target: &str) -> Result<()>;
     /// Registers a callback for NOTIFY events (REFER progress).
     fn on_notify(&self, f: Box<dyn Fn(u16) + Send + Sync>);
+    /// Fires the on_notify callback with the given status code.
+    fn fire_notify(&self, code: u16);
     /// Returns the SIP Call-ID.
     fn call_id(&self) -> String;
     /// Returns values for a SIP header (case-insensitive).

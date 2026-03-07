@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use fakepbx::{sdp, with_auth, FakePBX};
 use xphone::config::{Config, DialOptions};
-use xphone::types::{CallState, EndReason, PhoneState};
+use xphone::types::{CallState, Codec, EndReason, PhoneState};
 use xphone::Phone;
 
 /// Builds a Config pointing at the given FakePBX instance.
@@ -260,7 +260,135 @@ fn fakepbx_register_no_auth() {
     phone.disconnect().unwrap();
 }
 
-// --- F8: Disconnect fires unregistered callback ---
+// --- F8: Full outbound dial (sipcli path) — media pipeline + callbacks ---
+
+#[test]
+fn fakepbx_outbound_dial_full() {
+    let pbx = FakePBX::new(&[with_auth("1001", "test")]);
+
+    let rtp_port = 20500u16;
+    let answer_sdp = sdp::sdp("127.0.0.1", rtp_port, &[sdp::PCMA]);
+    pbx.on_invite(move |inv| {
+        inv.trying();
+        inv.ringing();
+        inv.answer(&answer_sdp);
+    });
+
+    let phone = connect_pbx(&pbx);
+
+    // Wire phone-level callbacks (same pattern as sipcli).
+    let (state_tx, state_rx) = crossbeam_channel::unbounded();
+    phone.on_call_state(move |cs| {
+        let _ = state_tx.send(cs);
+    });
+
+    let opts = DialOptions {
+        timeout: Duration::from_secs(5),
+        ..Default::default()
+    };
+    let call = phone.dial("9999", opts).unwrap();
+    assert_eq!(call.state(), CallState::Active);
+
+    // Verify media pipeline is running (pcm channels available).
+    assert!(
+        call.pcm_reader().is_some(),
+        "pcm_reader should be available after Active"
+    );
+    assert!(
+        call.pcm_writer().is_some(),
+        "pcm_writer should be available after Active"
+    );
+
+    // Verify codec negotiated (PBX offered PCMA).
+    assert_eq!(call.codec(), Codec::PCMA);
+
+    // Verify call duration is tracking.
+    std::thread::sleep(Duration::from_millis(100));
+    assert!(call.duration() >= Duration::from_millis(50));
+
+    // End the call.
+    call.end().unwrap();
+    assert_eq!(call.state(), CallState::Ended);
+
+    // Verify we received state callbacks (at least Active).
+    let mut states = Vec::new();
+    while let Ok(cs) = state_rx.try_recv() {
+        states.push(cs);
+    }
+    assert!(
+        states.contains(&CallState::Active),
+        "on_call_state should have fired Active, got: {:?}",
+        states
+    );
+
+    phone.disconnect().unwrap();
+}
+
+// --- F9: Blind transfer — REFER + NOTIFY sipfrag 200 ---
+
+#[test]
+fn fakepbx_blind_transfer() {
+    use std::sync::Arc;
+
+    let pbx = FakePBX::new(&[with_auth("1001", "test")]);
+
+    // Capture the ActiveCall so the PBX can send NOTIFY later.
+    // Use a channel to pass the ActiveCall from INVITE handler to REFER handler.
+    let (ac_tx, ac_rx) = crossbeam_channel::bounded::<fakepbx::ActiveCall>(1);
+    let answer_sdp = sdp::sdp("127.0.0.1", 20600, &[sdp::PCMA]);
+    pbx.on_invite(move |inv| {
+        inv.trying();
+        inv.ringing();
+        if let Some(ac) = inv.answer(&answer_sdp) {
+            let _ = ac_tx.send(ac);
+        }
+    });
+
+    let phone = connect_pbx(&pbx);
+
+    let opts = DialOptions {
+        timeout: Duration::from_secs(5),
+        ..Default::default()
+    };
+    let call = phone.dial("9999", opts).unwrap();
+    assert_eq!(call.state(), CallState::Active);
+
+    // Get the ActiveCall handle from the INVITE flow.
+    let ac = ac_rx
+        .recv_timeout(Duration::from_secs(3))
+        .expect("INVITE handler never completed");
+
+    // Wire up REFER handler: accept + send NOTIFY with transfer success.
+    let ac = Arc::new(ac);
+    let ac_for_refer = Arc::clone(&ac);
+    pbx.on_refer(move |r| {
+        r.accept();
+        // Brief delay to let the 202 Accepted reach xphone before the NOTIFY.
+        std::thread::sleep(Duration::from_millis(50));
+        let _ = ac_for_refer.send_notify("refer", "SIP/2.0 200 OK");
+    });
+
+    // Wire up ended callback to capture the reason.
+    let (ended_tx, ended_rx) = crossbeam_channel::bounded(1);
+    call.on_ended(move |reason| {
+        let _ = ended_tx.send(reason);
+    });
+
+    // Initiate blind transfer.
+    call.blind_transfer("5000").unwrap();
+
+    // Verify PBX received the REFER.
+    // Verify call ended with Transfer reason.
+    let reason = ended_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("call never ended after transfer");
+    assert_eq!(reason, EndReason::Transfer);
+    assert_eq!(call.state(), CallState::Ended);
+
+    phone.disconnect().unwrap();
+}
+
+// --- F10: Disconnect fires unregistered callback ---
 
 #[test]
 fn fakepbx_disconnect_fires_unregistered() {

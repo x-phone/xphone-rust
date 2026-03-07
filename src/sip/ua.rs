@@ -21,6 +21,7 @@ struct Inner {
     dialog_invite_handler:
         Option<Arc<dyn Fn(Arc<dyn Dialog>, String, String, String) + Send + Sync>>,
     bye_handler: Option<Arc<dyn Fn(String) + Send + Sync>>,
+    notify_handler: Option<Arc<dyn Fn(String, u16) + Send + Sync>>,
 }
 
 /// Production SIP transport backed by `sip::client::Client`.
@@ -80,6 +81,7 @@ impl SipUA {
             incoming_handler: None,
             dialog_invite_handler: None,
             bye_handler: None,
+            notify_handler: None,
         }));
 
         // Wire up incoming SIP request handler.
@@ -107,6 +109,7 @@ fn handle_incoming_request(
         "ACK" => {
             debug!("SIP <<< ACK received");
         }
+        "NOTIFY" => handle_notify(inner, client, msg, from_addr),
         "OPTIONS" => {
             debug!("SIP <<< OPTIONS keepalive, responding 200 OK");
             let resp = build_sip_response(msg, 200, "OK");
@@ -206,6 +209,45 @@ fn handle_cancel(
     }
 }
 
+fn handle_notify(
+    inner: &Arc<Mutex<Inner>>,
+    client: &Arc<Client>,
+    msg: &Message,
+    from_addr: SocketAddr,
+) {
+    let call_id = msg.header("Call-ID").to_string();
+    info!(call_id = %call_id, "SIP <<< NOTIFY received");
+
+    // Always respond 200 OK to NOTIFY.
+    let resp = build_sip_response(msg, 200, "OK");
+    debug!("SIP >>> 200 OK (NOTIFY)");
+    let _ = client.send_raw_to(&resp.to_bytes(), from_addr);
+
+    // Parse status code from sipfrag body (e.g. "SIP/2.0 200 OK").
+    let body = String::from_utf8_lossy(&msg.body);
+    let status_code = parse_sipfrag_status(&body);
+
+    if let Some(code) = status_code {
+        let cb = inner.lock().notify_handler.clone();
+        if let Some(f) = cb {
+            f(call_id, code);
+        }
+    }
+}
+
+/// Parses the status code from a message/sipfrag body.
+/// Example: "SIP/2.0 200 OK" → Some(200)
+fn parse_sipfrag_status(body: &str) -> Option<u16> {
+    let line = body.lines().next()?.trim();
+    if line.starts_with("SIP/") {
+        let parts: Vec<&str> = line.splitn(3, ' ').collect();
+        if parts.len() >= 2 {
+            return parts[1].parse().ok();
+        }
+    }
+    None
+}
+
 impl SipTransport for SipUA {
     fn send_request(
         &self,
@@ -286,6 +328,10 @@ impl SipTransport for SipUA {
 
     fn on_bye(&self, f: Box<dyn Fn(String) + Send + Sync>) {
         self.inner.lock().bye_handler = Some(Arc::from(f));
+    }
+
+    fn on_notify(&self, f: Box<dyn Fn(String, u16) + Send + Sync>) {
+        self.inner.lock().notify_handler = Some(Arc::from(f));
     }
 
     fn unregister(&self, timeout: Duration) -> Result<()> {

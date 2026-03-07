@@ -174,6 +174,13 @@ impl Dialog for SipDialogUAC {
         *self.on_notify_fn.lock() = Some(Arc::from(f));
     }
 
+    fn fire_notify(&self, code: u16) {
+        let cb = self.on_notify_fn.lock().clone();
+        if let Some(f) = cb {
+            f(code);
+        }
+    }
+
     fn call_id(&self) -> String {
         self.call_id.clone()
     }
@@ -380,6 +387,13 @@ impl Dialog for SipDialogUAS {
 
     fn on_notify(&self, f: Box<dyn Fn(u16) + Send + Sync>) {
         *self.on_notify_fn.lock() = Some(Arc::from(f));
+    }
+
+    fn fire_notify(&self, code: u16) {
+        let cb = self.on_notify_fn.lock().clone();
+        if let Some(f) = cb {
+            f(code);
+        }
     }
 
     fn call_id(&self) -> String {

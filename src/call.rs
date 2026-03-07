@@ -790,6 +790,11 @@ impl Call {
         Self::fire_on_ended(&inner, reason);
     }
 
+    /// Fires the dialog's on_notify callback (REFER progress from the network).
+    pub fn fire_notify(&self, code: u16) {
+        self.dlg.fire_notify(code);
+    }
+
     /// Simulates receiving a remote re-INVITE, handling hold/resume based on SDP direction.
     pub fn simulate_reinvite(&self, raw_sdp: &str) {
         let mut inner = self.inner.lock();
