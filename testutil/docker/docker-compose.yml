@@ -1,0 +1,50 @@
+# xphone-rust integration test environment
+# Usage: docker compose up -d
+#        cargo test --features integration
+#        docker compose down
+#
+# Provides Asterisk with three static SIP extensions (1001, 1002, 1003)
+# for testing registration, calling, transfer, and media flows.
+
+services:
+  asterisk:
+    image: andrius/asterisk:latest
+    container_name: xphone-asterisk
+    entrypoint: ["/scripts/entrypoint.sh"]
+    command: ["-f", "-T", "-U", "asterisk", "-n"]
+    environment:
+      - EXTERNAL_IP=127.0.0.1
+    tty: true
+    stdin_open: true
+    ports:
+      - "5060:5060/udp"
+      - "5060:5060/tcp"
+      - "10000-10099:10000-10099/udp"
+      # xphone client-side RTP ports (host-only, not mapped into container).
+      # These are forwarded so Docker Desktop on macOS can route RTP back
+      # to the host when Asterisk sends to 127.0.0.1:2000x.
+      # Note: xphone binds these ports on the HOST; they don't need
+      # container-side mapping. The ports line below is a no-op for the
+      # container but documents the range used by integration tests.
+    volumes:
+      - ./asterisk/pjsip.conf:/etc/asterisk/pjsip.conf:ro
+      - ./asterisk/extensions.conf:/etc/asterisk/extensions.conf:ro
+      - ./asterisk/rtp.conf:/etc/asterisk/rtp.conf:ro
+      - ./asterisk/modules.conf:/etc/asterisk/modules.conf:ro
+      - ./asterisk/asterisk.conf:/etc/asterisk/asterisk.conf:ro
+      - ./asterisk/logger.conf:/etc/asterisk/logger.conf:ro
+      - ./asterisk/entrypoint.sh:/scripts/entrypoint.sh:ro
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD-SHELL", "asterisk -rx 'core show version' | grep -q Asterisk"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    networks:
+      - xphone-test
+
+networks:
+  xphone-test:
+    driver: bridge
