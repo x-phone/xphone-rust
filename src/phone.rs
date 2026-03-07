@@ -13,6 +13,10 @@ use crate::registry::Registry;
 use crate::transport::SipTransport;
 use crate::types::PhoneState;
 
+type CallStateCb = Arc<dyn Fn(Arc<Call>, crate::types::CallState) + Send + Sync>;
+type CallEndedCb = Arc<dyn Fn(Arc<Call>, crate::types::EndReason) + Send + Sync>;
+type CallDtmfCb = Arc<dyn Fn(Arc<Call>, String) + Send + Sync>;
+
 struct Inner {
     state: PhoneState,
     tr: Option<Arc<dyn SipTransport>>,
@@ -25,10 +29,9 @@ struct Inner {
     on_error_fn: Option<Arc<dyn Fn(Error) + Send + Sync>>,
 
     // Phone-level call callbacks — auto-wired to every new call.
-    // Each receives (call_id, payload) so the consumer can distinguish concurrent calls.
-    on_call_state_fn: Option<Arc<dyn Fn(String, crate::types::CallState) + Send + Sync>>,
-    on_call_ended_fn: Option<Arc<dyn Fn(String, crate::types::EndReason) + Send + Sync>>,
-    on_call_dtmf_fn: Option<Arc<dyn Fn(String, String) + Send + Sync>>,
+    on_call_state_fn: Option<CallStateCb>,
+    on_call_ended_fn: Option<CallEndedCb>,
+    on_call_dtmf_fn: Option<CallDtmfCb>,
 }
 
 /// Phone orchestrates SIP registration, call tracking, and incoming/outgoing calls.
@@ -353,8 +356,8 @@ impl Phone {
     }
 
     /// Sets a callback that fires for every call state change (all calls).
-    /// Receives `(call_id, state)`.
-    pub fn on_call_state<F: Fn(String, crate::types::CallState) + Send + Sync + 'static>(
+    /// Receives `(call, state)`.
+    pub fn on_call_state<F: Fn(Arc<Call>, crate::types::CallState) + Send + Sync + 'static>(
         &self,
         f: F,
     ) {
@@ -362,8 +365,8 @@ impl Phone {
     }
 
     /// Sets a callback that fires when any call ends.
-    /// Receives `(call_id, reason)`.
-    pub fn on_call_ended<F: Fn(String, crate::types::EndReason) + Send + Sync + 'static>(
+    /// Receives `(call, reason)`.
+    pub fn on_call_ended<F: Fn(Arc<Call>, crate::types::EndReason) + Send + Sync + 'static>(
         &self,
         f: F,
     ) {
@@ -371,8 +374,8 @@ impl Phone {
     }
 
     /// Sets a callback that fires for DTMF digits received on any call.
-    /// Receives `(call_id, digit)`.
-    pub fn on_call_dtmf<F: Fn(String, String) + Send + Sync + 'static>(&self, f: F) {
+    /// Receives `(call, digit)`.
+    pub fn on_call_dtmf<F: Fn(Arc<Call>, String) + Send + Sync + 'static>(&self, f: F) {
         self.inner.lock().on_call_dtmf_fn = Some(Arc::new(f));
     }
 
@@ -444,20 +447,20 @@ fn handle_incoming(inner: &Arc<Mutex<Inner>>, from: &str, to: &str) {
 /// Wire phone-level call callbacks onto an individual call.
 fn wire_phone_call_callbacks(inner: &Arc<Mutex<Inner>>, call: &Arc<Call>) {
     let locked = inner.lock();
-    let cid = call.call_id();
     if let Some(ref f) = locked.on_call_state_fn {
         let f = Arc::clone(f);
-        let cid = cid.clone();
-        call.on_state(move |s| f(cid.clone(), s));
+        let c = Arc::clone(call);
+        call.on_state(move |s| f(Arc::clone(&c), s));
     }
     if let Some(ref f) = locked.on_call_ended_fn {
         let f = Arc::clone(f);
-        let cid = cid.clone();
-        call.on_ended(move |r| f(cid.clone(), r));
+        let c = Arc::clone(call);
+        call.on_ended(move |r| f(Arc::clone(&c), r));
     }
     if let Some(ref f) = locked.on_call_dtmf_fn {
         let f = Arc::clone(f);
-        call.on_dtmf(move |d| f(cid.clone(), d));
+        let c = Arc::clone(call);
+        call.on_dtmf(move |d| f(Arc::clone(&c), d));
     }
 }
 

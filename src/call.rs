@@ -305,6 +305,15 @@ impl Call {
             .unwrap_or_default()
     }
 
+    /// Returns the remote party's DID/extension.
+    /// For inbound calls this is the From user; for outbound calls it's the To user.
+    pub fn remote_did(&self) -> String {
+        match self.direction() {
+            Direction::Inbound => self.from(),
+            Direction::Outbound => self.to(),
+        }
+    }
+
     /// Returns the user part of the SIP To header.
     pub fn to(&self) -> String {
         let vals = self.dlg.header("To");

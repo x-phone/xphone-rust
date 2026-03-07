@@ -320,11 +320,11 @@ fn wire_phone_events(phone: &Phone, state: &SharedState) {
 
     // Phone-level call callbacks — auto-wired to every call BEFORE state transitions.
     let s = Arc::clone(state);
-    phone.on_call_state(move |call_id, cs| {
-        let short = &call_id[..call_id.len().min(10)];
+    phone.on_call_state(move |call, cs| {
+        let did = call.remote_did();
         let name = call_state_name(cs);
         let mut st = s.lock().unwrap();
-        st.push_event(format!("[{}] {}", short, name));
+        st.push_event(format!("[{}] {}", did, name));
         if cs == CallState::Ended {
             st.call_status = "idle".into();
             st.call_id.clear();
@@ -335,20 +335,20 @@ fn wire_phone_events(phone: &Phone, state: &SharedState) {
     });
 
     let s = Arc::clone(state);
-    phone.on_call_ended(move |call_id, reason| {
-        let short = &call_id[..call_id.len().min(10)];
+    phone.on_call_ended(move |call, reason| {
+        let did = call.remote_did();
         let mut st = s.lock().unwrap();
-        st.push_event(format!("[{}] ended: {}", short, end_reason_name(reason)));
+        st.push_event(format!("[{}] ended: {}", did, end_reason_name(reason)));
         st.call_status = "idle".into();
         st.call_id.clear();
         st.call = None;
     });
 
     let s = Arc::clone(state);
-    phone.on_call_dtmf(move |call_id, digit| {
-        let short = &call_id[..call_id.len().min(10)];
+    phone.on_call_dtmf(move |call, digit| {
+        let did = call.remote_did();
         let mut st = s.lock().unwrap();
-        st.push_event(format!("[{}] DTMF recv: {}", short, digit));
+        st.push_event(format!("[{}] DTMF recv: {}", did, digit));
     });
 
     let s = Arc::clone(state);
@@ -365,8 +365,7 @@ fn wire_phone_events(phone: &Phone, state: &SharedState) {
         wire_call_events(&call, &s);
 
         let mut st = s.lock().unwrap();
-        let short_id = &call.id()[..call.id().len().min(10)];
-        st.push_event(format!("[{}] incoming from {}", short_id, display));
+        st.push_event(format!("[{}] incoming from {}", from, display));
         st.call_status = format!("ringing < {}", display);
         st.call_id = call.id();
         st.call = Some(call);
@@ -375,20 +374,19 @@ fn wire_phone_events(phone: &Phone, state: &SharedState) {
 
 /// Wire per-call callbacks that are only needed after the call is established.
 fn wire_call_events(call: &Arc<Call>, state: &SharedState) {
-    let short = call.id()[..call.id().len().min(10)].to_string();
+    let did = call.remote_did();
 
     let s = Arc::clone(state);
-    let sid = short.clone();
+    let did2 = did.clone();
     call.on_hold(move || {
         let mut st = s.lock().unwrap();
-        st.push_event(format!("[{}] held by remote", sid));
+        st.push_event(format!("[{}] held by remote", did2));
     });
 
     let s = Arc::clone(state);
-    let sid = short;
     call.on_resume(move || {
         let mut st = s.lock().unwrap();
-        st.push_event(format!("[{}] resumed by remote", sid));
+        st.push_event(format!("[{}] resumed by remote", did));
     });
 }
 
@@ -712,8 +710,7 @@ fn exec_command(state: &SharedState, phone: &Phone, input: &str) {
                             Arc::clone(&mic_flag),
                         );
                         let mut st = s.lock().unwrap();
-                        let short_id = &call.id()[..call.id().len().min(10)];
-                        st.push_event(format!("[{}] connected to {}", short_id, target));
+                        st.push_event(format!("[{}] connected", target));
                         st.call_id = call.id();
                         st.call = Some(call);
                     }
@@ -920,18 +917,31 @@ fn call_status_style(status: &str) -> (Span<'_>, Span<'_>) {
 }
 
 fn event_style(line: &str) -> Style {
-    if line.starts_with("ERROR") {
+    // Strip "[label] " prefix for matching.
+    let content = if line.starts_with('[') {
+        line.find("] ").map_or(line, |i| &line[i + 2..])
+    } else {
+        line
+    };
+    if content.starts_with("ERROR") {
         Style::default().fg(RED)
-    } else if line.starts_with("call:") || line.starts_with("ended:") {
+    } else if content.starts_with("ended:") {
         Style::default().fg(ACCENT)
-    } else if line.starts_with("incoming") {
+    } else if content.starts_with("incoming") {
         Style::default().fg(YELLOW).add_modifier(Modifier::BOLD)
-    } else if line.starts_with("DTMF") {
-        Style::default().fg(MAGENTA)
-    } else if line.starts_with("registered") || line.starts_with("dialing") {
+    } else if content.starts_with("active") || content.starts_with("connected") {
         Style::default().fg(GREEN)
-    } else if line.starts_with("held") || line.starts_with("resumed") {
+    } else if content.starts_with("DTMF") {
         Style::default().fg(MAGENTA)
+    } else if content.starts_with("dialing")
+        || content.starts_with("ringing")
+        || content.starts_with("early media")
+    {
+        Style::default().fg(YELLOW)
+    } else if content.starts_with("held") || content.starts_with("resumed") {
+        Style::default().fg(MAGENTA)
+    } else if content.starts_with("registered") {
+        Style::default().fg(GREEN)
     } else {
         Style::default().fg(Color::White)
     }
