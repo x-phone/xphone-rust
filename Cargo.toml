@@ -16,9 +16,44 @@ parking_lot = "0.12"
 bytes = "1"
 md5 = "0.7"
 
-[features]
-integration = []
-
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
 crossbeam-channel = "0.5"
+
+[[example]]
+name = "sipcli"
+required-features = ["cli"]
+
+[dependencies.ratatui]
+version = "0.29"
+optional = true
+
+[dependencies.crossterm]
+version = "0.28"
+optional = true
+
+[dependencies.clap]
+version = "4"
+features = ["derive"]
+optional = true
+
+[dependencies.serde]
+version = "1"
+features = ["derive"]
+optional = true
+
+[dependencies.serde_yaml]
+version = "0.9"
+optional = true
+
+[dependencies.dirs-next]
+version = "2"
+optional = true
+
+[dependencies.cpal]
+version = "0.15"
+optional = true
+
+[features]
+integration = []
+cli = ["ratatui", "crossterm", "clap", "serde", "serde_yaml", "dirs-next", "cpal"]
