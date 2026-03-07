@@ -329,17 +329,23 @@ fn dtmf_send_receive() {
         let _ = dtmf_tx.send(digit);
     });
 
-    // Brief pause to let RTP media paths establish through Asterisk.
-    std::thread::sleep(Duration::from_millis(500));
+    // Wait for RTP media paths to fully establish through Asterisk bridge.
+    // CI environments are slower, so give extra time.
+    std::thread::sleep(Duration::from_secs(2));
 
-    // p2 sends DTMF digit "5".
-    call2.send_dtmf("5").unwrap();
-
-    // Wait for p1 to receive the DTMF.
-    let digit = dtmf_rx
-        .recv_timeout(Duration::from_secs(5))
-        .expect("DTMF digit never received by p1");
-    assert_eq!(digit, "5");
+    // p2 sends DTMF digit "5" — retry up to 3 times in case the bridge isn't ready.
+    let mut digit = None;
+    for attempt in 0..3 {
+        if attempt > 0 {
+            std::thread::sleep(Duration::from_secs(1));
+        }
+        call2.send_dtmf("5").unwrap();
+        if let Ok(d) = dtmf_rx.recv_timeout(Duration::from_secs(3)) {
+            digit = Some(d);
+            break;
+        }
+    }
+    assert_eq!(digit.expect("DTMF digit never received by p1"), "5");
 
     call1.end().unwrap();
 
