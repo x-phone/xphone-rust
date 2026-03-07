@@ -11,6 +11,16 @@ use super::message::Message;
 use super::transaction::{self, TransactionManager};
 use crate::error::{Error, Result};
 
+/// Result of a successful INVITE transaction.
+pub struct InviteResult {
+    /// The INVITE request that was sent.
+    pub invite: Message,
+    /// The final 2xx response.
+    pub response: Message,
+    /// Provisional responses received before the final response.
+    pub provisionals: Vec<(u16, String)>,
+}
+
 /// Configuration for a SIP client.
 #[derive(Debug, Clone)]
 pub struct ClientConfig {
@@ -114,9 +124,189 @@ impl Client {
         Ok((resp.status_code, resp.reason.clone()))
     }
 
+    /// Returns the configured server address.
+    pub fn server_addr(&self) -> SocketAddr {
+        self.cfg.server_addr
+    }
+
+    /// Returns the configured username.
+    pub fn username(&self) -> &str {
+        &self.cfg.username
+    }
+
+    /// Returns the configured domain.
+    pub fn domain(&self) -> &str {
+        &self.cfg.domain
+    }
+
+    /// Sends a SIP INVITE with SDP body.
+    /// Handles 401/407 auth challenges, consumes provisional responses,
+    /// sends ACK on 200 OK, and returns the full result.
+    pub fn send_invite(
+        &self,
+        target_uri: &str,
+        sdp: &[u8],
+        timeout: Duration,
+    ) -> Result<InviteResult> {
+        if *self.closed.lock() {
+            return Err(Error::Other("sip: client closed".into()));
+        }
+
+        let mut req = self.build_invite_request(target_uri, sdp, None);
+
+        let (resp, branch, invite) = {
+            let tm = self.tm.lock();
+            let resp = tm.send(&mut req, self.cfg.server_addr, timeout)?;
+            let branch = req.via_branch().to_string();
+
+            if resp.status_code == 401 || resp.status_code == 407 {
+                tm.remove_tx(&branch);
+                let auth_hdr_name = if resp.status_code == 401 {
+                    "WWW-Authenticate"
+                } else {
+                    "Proxy-Authenticate"
+                };
+                let auth_hdr = resp.header(auth_hdr_name);
+                let ch = auth::parse_challenge(auth_hdr)
+                    .map_err(|_| Error::Other("sip: auth challenge parse failed".into()))?;
+                let creds = Credentials {
+                    username: self.cfg.username.clone(),
+                    password: self.cfg.password.clone(),
+                };
+                let auth_val = auth::build_authorization(&ch, &creds, "INVITE", target_uri);
+                let auth_resp_hdr = if resp.status_code == 401 {
+                    "Authorization"
+                } else {
+                    "Proxy-Authorization"
+                };
+
+                let mut extra = HashMap::new();
+                extra.insert(auth_resp_hdr.to_string(), auth_val);
+                let mut retry = self.build_invite_request(target_uri, sdp, Some(&extra));
+                let resp = tm.send(&mut retry, self.cfg.server_addr, timeout)?;
+                let branch = retry.via_branch().to_string();
+                (resp, branch, retry)
+            } else {
+                (resp, branch, req)
+            }
+        };
+
+        self.consume_invite_responses(invite, resp, &branch, timeout)
+    }
+
+    /// Consumes provisional responses and sends ACK on 200 OK.
+    fn consume_invite_responses(
+        &self,
+        invite: Message,
+        first_resp: Message,
+        branch: &str,
+        timeout: Duration,
+    ) -> Result<InviteResult> {
+        let mut provisionals = Vec::new();
+        let mut resp = first_resp;
+
+        while (100..200).contains(&resp.status_code) {
+            provisionals.push((resp.status_code, resp.reason.clone()));
+            let tm = self.tm.lock();
+            resp = tm.read_response(branch, timeout)?;
+        }
+
+        if resp.status_code >= 200 && resp.status_code < 300 {
+            // Send ACK for 2xx.
+            let ack = self.build_ack(&invite, &resp);
+            {
+                let tm = self.tm.lock();
+                tm.remove_tx(branch);
+                tm.send_raw(&ack.to_bytes(), self.cfg.server_addr)?;
+            }
+            Ok(InviteResult {
+                invite,
+                response: resp,
+                provisionals,
+            })
+        } else {
+            self.tm.lock().remove_tx(branch);
+            Err(Error::Other(format!(
+                "sip: INVITE rejected: {} {}",
+                resp.status_code, resp.reason
+            )))
+        }
+    }
+
+    /// Sends an in-dialog SIP request (BYE, re-INVITE, REFER) and waits for response.
+    pub fn send_dialog_request(&self, req: &mut Message, timeout: Duration) -> Result<Message> {
+        if *self.closed.lock() {
+            return Err(Error::Other("sip: client closed".into()));
+        }
+        let tm = self.tm.lock();
+        let resp = tm.send(req, self.cfg.server_addr, timeout)?;
+        let branch = req.via_branch().to_string();
+        tm.remove_tx(&branch);
+        Ok(resp)
+    }
+
+    /// Sends raw bytes to a specific address (for SIP responses, ACK).
+    pub fn send_raw_to(&self, data: &[u8], dst: SocketAddr) -> Result<()> {
+        self.tm.lock().send_raw(data, dst)
+    }
+
     /// Sends a CRLF NAT keepalive packet to the server.
     pub fn send_keepalive(&self) -> Result<()> {
         self.tm.lock().send_raw(b"\r\n\r\n", self.cfg.server_addr)
+    }
+
+    /// Builds an INVITE request with SDP body.
+    fn build_invite_request(
+        &self,
+        target_uri: &str,
+        sdp: &[u8],
+        extra_headers: Option<&HashMap<String, String>>,
+    ) -> Message {
+        let seq = self.cseq.fetch_add(1, Ordering::Relaxed) + 1;
+        let local = self.conn_local_addr;
+        let from_tag = &transaction::generate_branch()[..15];
+        let invite_call_id = transaction::generate_branch();
+
+        let mut msg = Message::new_request("INVITE", target_uri);
+        msg.set_header(
+            "From",
+            &format!(
+                "<sip:{}@{}>;tag={}",
+                self.cfg.username, self.cfg.domain, from_tag
+            ),
+        );
+        msg.set_header("To", &format!("<{}>", target_uri));
+        msg.set_header("Call-ID", &invite_call_id);
+        msg.set_header("CSeq", &format!("{} INVITE", seq));
+        msg.set_header("Contact", &format!("<sip:{}@{}>", self.cfg.username, local));
+        msg.set_header("Max-Forwards", "70");
+        msg.set_header("User-Agent", "xphone");
+        msg.set_header("Content-Type", "application/sdp");
+        msg.body = sdp.to_vec();
+
+        if let Some(extra) = extra_headers {
+            for (k, v) in extra {
+                msg.set_header(k, v);
+            }
+        }
+
+        msg
+    }
+
+    /// Builds an ACK for a 2xx response to INVITE.
+    fn build_ack(&self, invite: &Message, response: &Message) -> Message {
+        let mut ack = Message::new_request("ACK", &invite.request_uri);
+        ack.set_header("Call-ID", invite.header("Call-ID"));
+        ack.set_header("From", invite.header("From"));
+        ack.set_header("To", response.header("To"));
+        let (cseq_num, _) = invite.cseq();
+        ack.set_header("CSeq", &format!("{} ACK", cseq_num));
+        ack.set_header("Max-Forwards", "70");
+        ack.set_header("User-Agent", "xphone");
+        let branch = transaction::generate_branch();
+        let via = format!("SIP/2.0/UDP {};branch={}", self.conn_local_addr, branch);
+        ack.set_header("Via", &via);
+        ack
     }
 
     /// Creates a SIP request with standard headers.
