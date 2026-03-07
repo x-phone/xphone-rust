@@ -832,7 +832,7 @@ impl Call {
         let dir = sess.dir();
         let mut hold_fn = None;
         let mut resume_fn = None;
-        let mut state_fn: Option<Box<dyn FnOnce() + Send>> = None;
+        let mut new_state = None;
 
         let is_hold_dir =
             dir == sdp::DIR_SEND_ONLY || dir == sdp::DIR_RECV_ONLY || dir == sdp::DIR_INACTIVE;
@@ -840,28 +840,23 @@ impl Call {
             (true, CallState::Active) => {
                 inner.state = CallState::OnHold;
                 hold_fn = inner.on_hold_fn.clone();
-                if let Some(ref f) = inner.on_state_fn {
-                    let f = Arc::clone(f);
-                    state_fn = Some(Box::new(move || f(CallState::OnHold)));
-                }
+                new_state = Some(CallState::OnHold);
             }
             (false, CallState::OnHold) if dir == sdp::DIR_SEND_RECV => {
                 inner.state = CallState::Active;
                 resume_fn = inner.on_resume_fn.clone();
-                if let Some(ref f) = inner.on_state_fn {
-                    let f = Arc::clone(f);
-                    state_fn = Some(Box::new(move || f(CallState::Active)));
-                }
+                new_state = Some(CallState::Active);
             }
             _ => {}
         }
 
         Self::negotiate_codec(&mut inner, &sess);
+
+        if let Some(s) = new_state {
+            Self::fire_on_state(&inner, s);
+        }
         drop(inner);
 
-        if let Some(f) = state_fn {
-            std::thread::spawn(f);
-        }
         if let Some(f) = hold_fn {
             std::thread::spawn(move || f());
         }

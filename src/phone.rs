@@ -293,13 +293,6 @@ impl Phone {
             Err(e) => return Err(e),
         };
 
-        // Wire up call tracking cleanup.
-        let inner_clone = Arc::clone(&self.inner);
-        let call_id = call.call_id();
-        call.on_ended_internal(move |_| {
-            inner_clone.lock().calls.remove(&call_id);
-        });
-
         // Replay provisional responses (mock path only).
         for (c, r) in &responses {
             call.simulate_response(*c, r);
@@ -434,12 +427,8 @@ fn handle_incoming(inner: &Arc<Mutex<Inner>>, from: &str, to: &str) {
     let dlg = Arc::new(MockDialog::new());
     let call = Call::new_inbound(dlg as Arc<dyn Dialog>);
 
-    // Wire up call tracking cleanup.
-    let inner_clone = Arc::clone(inner);
-    let call_id = call.call_id();
-    call.on_ended_internal(move |_| {
-        inner_clone.lock().calls.remove(&call_id);
-    });
+    // Wire phone-level callbacks + call-tracking cleanup.
+    wire_phone_call_callbacks(inner, &call);
 
     // Track the call.
     inner.lock().calls.insert(call.call_id(), Arc::clone(&call));
@@ -462,19 +451,38 @@ fn handle_incoming(inner: &Arc<Mutex<Inner>>, from: &str, to: &str) {
 #[allow(clippy::too_many_arguments)]
 /// Wire phone-level call callbacks onto an individual call.
 fn wire_phone_call_callbacks(inner: &Arc<Mutex<Inner>>, call: &Arc<Call>) {
-    let locked = inner.lock();
-    if let Some(ref f) = locked.on_call_state_fn {
-        let f = Arc::clone(f);
+    // Copy callbacks out of Phone lock, then drop it before acquiring Call lock.
+    let (state_fn, ended_fn, dtmf_fn) = {
+        let locked = inner.lock();
+        (
+            locked.on_call_state_fn.clone(),
+            locked.on_call_ended_fn.clone(),
+            locked.on_call_dtmf_fn.clone(),
+        )
+    };
+
+    if let Some(f) = state_fn {
         let c = Arc::clone(call);
         call.on_state_internal(move |s| f(Arc::clone(&c), s));
     }
-    if let Some(ref f) = locked.on_call_ended_fn {
-        let f = Arc::clone(f);
+
+    // Combine phone-level on_ended callback with call-tracking cleanup
+    // into a single on_ended_internal closure so neither overwrites the other.
+    {
+        let inner_clone = Arc::clone(inner);
+        let call_id = call.call_id();
         let c = Arc::clone(call);
-        call.on_ended_internal(move |r| f(Arc::clone(&c), r));
+        call.on_ended_internal(move |r| {
+            // Call-tracking cleanup.
+            inner_clone.lock().calls.remove(&call_id);
+            // Phone-level on_call_ended callback.
+            if let Some(ref f) = ended_fn {
+                f(Arc::clone(&c), r);
+            }
+        });
     }
-    if let Some(ref f) = locked.on_call_dtmf_fn {
-        let f = Arc::clone(f);
+
+    if let Some(f) = dtmf_fn {
         let c = Arc::clone(call);
         call.on_dtmf_internal(move |d| f(Arc::clone(&c), d));
     }
@@ -540,14 +548,7 @@ fn handle_dialog_incoming(
         call.set_remote_sdp(remote_sdp);
     }
 
-    // Wire up call tracking cleanup.
-    let inner_clone = Arc::clone(inner);
-    let call_id = call.call_id();
-    call.on_ended_internal(move |_| {
-        inner_clone.lock().calls.remove(&call_id);
-    });
-
-    // Wire phone-level callbacks before anything fires.
+    // Wire phone-level callbacks + call-tracking cleanup before anything fires.
     wire_phone_call_callbacks(inner, &call);
 
     // Track the call.
