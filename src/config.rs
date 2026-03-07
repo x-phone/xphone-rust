@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use crate::sip::conn::TlsConfig;
 use crate::types::Codec;
 
 /// Configuration for a [`Phone`](crate::phone::Phone) instance.
@@ -15,8 +16,10 @@ pub struct Config {
     pub host: String,
     /// SIP server port (default `5060`).
     pub port: u16,
-    /// Transport protocol, e.g. `"udp"` or `"tcp"`.
+    /// Transport protocol: `"udp"`, `"tcp"`, or `"tls"`.
     pub transport: String,
+    /// TLS configuration. Required when `transport` is `"tls"`.
+    pub tls_config: Option<TlsConfig>,
 
     /// REGISTER expiry duration advertised to the server.
     pub register_expiry: Duration,
@@ -55,6 +58,7 @@ impl Default for Config {
             host: String::new(),
             port: 5060,
             transport: "udp".into(),
+            tls_config: None,
             register_expiry: Duration::from_secs(60),
             register_retry: Duration::from_secs(1),
             register_max_retry: 3,
@@ -92,9 +96,15 @@ impl PhoneBuilder {
         self
     }
 
-    /// Sets the transport protocol (e.g. `"udp"`, `"tcp"`).
+    /// Sets the transport protocol (`"udp"`, `"tcp"`, or `"tls"`).
     pub fn transport(mut self, protocol: &str) -> Self {
         self.config.transport = protocol.into();
+        self
+    }
+
+    /// Sets TLS configuration. Required when transport is `"tls"`.
+    pub fn tls_config(mut self, tls: TlsConfig) -> Self {
+        self.config.tls_config = Some(tls);
         self
     }
 

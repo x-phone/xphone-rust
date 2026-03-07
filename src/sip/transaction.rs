@@ -8,7 +8,7 @@ use parking_lot::Mutex;
 
 use tracing::{debug, warn};
 
-use super::conn::{Conn, WriteConn};
+use super::conn::SipConnection;
 use super::message::{self, Message};
 use crate::error::{Error, Result};
 
@@ -30,9 +30,11 @@ struct Inner {
 /// Dispatches incoming responses to the correct pending transaction by Via branch,
 /// and incoming requests to the OnRequest callback.
 pub struct TransactionManager {
-    write_conn: WriteConn,
+    conn: Arc<dyn SipConnection>,
     local_addr: SocketAddr,
     inner: Arc<Mutex<Inner>>,
+    /// Transport name for Via headers (UDP, TCP, TLS).
+    transport_name: String,
     /// Dropping this sender closes the channel, signaling all receivers to stop.
     done_tx: Mutex<Option<Sender<()>>>,
     done_rx: Receiver<()>,
@@ -41,10 +43,13 @@ pub struct TransactionManager {
 
 impl TransactionManager {
     /// Creates a new TransactionManager and starts its read loop.
-    /// The `Conn` is moved into the read loop; a write clone is kept for sending.
-    pub fn new(conn: Conn) -> Self {
+    pub fn new(conn: Box<dyn SipConnection>) -> Self {
         let local_addr = conn.local_addr().expect("failed to get local addr");
-        let write_conn = conn.try_clone_write().expect("failed to clone socket");
+        let transport_name = conn.transport_name().to_string();
+
+        // Wrap in Arc so both read loop and write path share the connection.
+        let conn: Arc<dyn SipConnection> = Arc::from(conn);
+
         let inner = Arc::new(Mutex::new(Inner {
             pending: HashMap::new(),
             on_request: None,
@@ -55,20 +60,27 @@ impl TransactionManager {
         let thread = {
             let inner = Arc::clone(&inner);
             let done_rx = done_rx.clone();
+            let conn_read = Arc::clone(&conn);
             std::thread::Builder::new()
                 .name("sip-transaction-reader".into())
-                .spawn(move || read_loop(conn, inner, done_rx))
+                .spawn(move || read_loop(conn_read, inner, done_rx))
                 .expect("failed to spawn transaction reader thread")
         };
 
         Self {
-            write_conn,
+            conn,
             local_addr,
             inner,
+            transport_name,
             done_tx: Mutex::new(Some(done_tx)),
             done_rx,
             thread: Mutex::new(Some(thread)),
         }
+    }
+
+    /// Returns the transport name (UDP, TCP, TLS) for Via header construction.
+    pub fn transport_name(&self) -> &str {
+        &self.transport_name
     }
 
     /// Shuts down the read loop and cancels all pending transactions.
@@ -102,7 +114,10 @@ impl TransactionManager {
         let mut branch = req.via_branch().to_string();
         if branch.is_empty() {
             branch = generate_branch();
-            let via = format!("SIP/2.0/UDP {};branch={}", self.local_addr, branch);
+            let via = format!(
+                "SIP/2.0/{} {};branch={}",
+                self.transport_name, self.local_addr, branch
+            );
             req.set_header("Via", &via);
         }
 
@@ -120,8 +135,8 @@ impl TransactionManager {
             resp_rx
         };
 
-        // Send the request (no mutex contention — write_conn is separate).
-        self.write_conn
+        // Send the request.
+        self.conn
             .send(&req.to_bytes(), dst)
             .map_err(|e| Error::Other(format!("sip: send: {}", e)))?;
 
@@ -175,7 +190,7 @@ impl TransactionManager {
 
     /// Sends raw data (e.g., keepalive) without transaction tracking.
     pub fn send_raw(&self, data: &[u8], dst: SocketAddr) -> Result<()> {
-        self.write_conn
+        self.conn
             .send(data, dst)
             .map_err(|e| Error::Other(format!("sip: send_raw: {}", e)))
     }
@@ -203,8 +218,8 @@ impl Drop for TransactionManager {
     }
 }
 
-/// Read loop runs on a dedicated thread. Owns the Conn (no mutex needed).
-fn read_loop(mut conn: Conn, inner: Arc<Mutex<Inner>>, done_rx: Receiver<()>) {
+/// Read loop runs on a dedicated thread.
+fn read_loop(conn: Arc<dyn SipConnection>, inner: Arc<Mutex<Inner>>, done_rx: Receiver<()>) {
     loop {
         // Check if stopped (channel closed).
         if done_rx.try_recv().is_ok() || done_rx.is_empty() && inner.lock().stopped {
@@ -302,7 +317,7 @@ fn rand_byte() -> u8 {
 
 #[cfg(test)]
 mod tests {
-    use super::super::conn::Conn;
+    use super::super::conn::UdpConn;
     use super::*;
 
     #[test]
@@ -321,15 +336,14 @@ mod tests {
 
     #[test]
     fn transaction_send_receive() {
-        let server_conn = Conn::listen("127.0.0.1:0").unwrap();
+        let server_conn = UdpConn::bind("127.0.0.1:0").unwrap();
         let server_addr = server_conn.local_addr().unwrap();
 
-        let client_conn = Conn::listen("127.0.0.1:0").unwrap();
-        let tm = TransactionManager::new(client_conn);
+        let client_conn = UdpConn::bind("127.0.0.1:0").unwrap();
+        let tm = TransactionManager::new(Box::new(client_conn));
 
         // Spawn a thread that reads from the server and sends a 200 OK back.
         let handle = std::thread::spawn(move || {
-            let mut server_conn = server_conn;
             let (data, from) = server_conn.receive(Duration::from_secs(2)).unwrap();
             let req = message::parse(&data).unwrap();
             assert_eq!(req.method, "REGISTER");
@@ -358,9 +372,9 @@ mod tests {
 
     #[test]
     fn transaction_timeout() {
-        let conn = Conn::listen("127.0.0.1:0").unwrap();
+        let conn = UdpConn::bind("127.0.0.1:0").unwrap();
         let dst: SocketAddr = "127.0.0.1:19999".parse().unwrap();
-        let tm = TransactionManager::new(conn);
+        let tm = TransactionManager::new(Box::new(conn));
 
         let mut req = Message::new_request("REGISTER", "sip:pbx.local");
         req.set_header("Call-ID", "timeout-test@host");
@@ -380,9 +394,9 @@ mod tests {
 
     #[test]
     fn send_after_stop_returns_error() {
-        let conn = Conn::listen("127.0.0.1:0").unwrap();
+        let conn = UdpConn::bind("127.0.0.1:0").unwrap();
         let dst: SocketAddr = "127.0.0.1:19999".parse().unwrap();
-        let tm = TransactionManager::new(conn);
+        let tm = TransactionManager::new(Box::new(conn));
 
         tm.stop();
 
@@ -396,10 +410,10 @@ mod tests {
 
     #[test]
     fn on_request_callback() {
-        let server_conn = Conn::listen("127.0.0.1:0").unwrap();
+        let server_conn = UdpConn::bind("127.0.0.1:0").unwrap();
         let server_addr = server_conn.local_addr().unwrap();
 
-        let tm = TransactionManager::new(server_conn);
+        let tm = TransactionManager::new(Box::new(server_conn));
 
         let received = Arc::new(Mutex::new(Vec::new()));
         let received_clone = Arc::clone(&received);
@@ -408,7 +422,7 @@ mod tests {
         });
 
         // Send a request from another socket.
-        let sender = Conn::listen("127.0.0.1:0").unwrap();
+        let sender = UdpConn::bind("127.0.0.1:0").unwrap();
         let mut req = Message::new_request("INVITE", "sip:1002@pbx.local");
         req.set_header("Via", "SIP/2.0/UDP 127.0.0.1:9999;branch=z9hG4bKtest");
         req.set_header("Call-ID", "incoming@host");

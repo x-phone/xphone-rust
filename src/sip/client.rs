@@ -8,7 +8,7 @@ use parking_lot::Mutex;
 use tracing::{debug, info};
 
 use super::auth::{self, Credentials};
-use super::conn::Conn;
+use super::conn::{self, TlsConfig};
 use super::message::Message;
 use super::transaction::{self, TransactionManager};
 use crate::error::{Error, Result};
@@ -31,6 +31,10 @@ pub struct ClientConfig {
     pub username: String,
     pub password: String,
     pub domain: String,
+    /// Transport protocol: "udp", "tcp", or "tls".
+    pub transport: String,
+    /// TLS configuration (required when transport is "tls").
+    pub tls_config: Option<TlsConfig>,
 }
 
 /// A SIP UA client that can send REGISTER and other requests,
@@ -42,24 +46,32 @@ pub struct Client {
     call_id: String,
     /// The address advertised in Via/Contact headers (routable IP + bound port).
     advertised_addr: SocketAddr,
+    /// Via transport tag (UDP, TCP, TLS).
+    via_transport: String,
     closed: Mutex<bool>,
 }
 
 impl Client {
-    /// Creates a new SIP client, binding to `local_addr`.
+    /// Creates a new SIP client, binding or connecting based on transport.
     pub fn new(cfg: ClientConfig) -> Result<Self> {
-        let conn = Conn::listen(&cfg.local_addr)
-            .map_err(|e| Error::Other(format!("sip: listen: {}", e)))?;
-        let local_addr = conn
+        let sip_conn = conn::connect(
+            &cfg.transport,
+            cfg.server_addr,
+            &cfg.local_addr,
+            &cfg.domain,
+            cfg.tls_config.as_ref(),
+            Duration::from_secs(10),
+        )
+        .map_err(|e| Error::Other(format!("sip: connect: {}", e)))?;
+
+        let local_addr = sip_conn
             .local_addr()
             .map_err(|e| Error::Other(format!("sip: local addr: {}", e)))?;
-        let tm = TransactionManager::new(conn);
+        let via_transport = sip_conn.transport_name().to_string();
+        let tm = TransactionManager::new(sip_conn);
         let call_id = transaction::generate_branch();
 
         // Compute a routable IP to advertise in Via/Contact headers.
-        // When bound to 0.0.0.0, the OS-reported local_addr is 0.0.0.0:PORT,
-        // which is invalid for SIP peers. Use a UDP connect trick to discover
-        // the actual outgoing interface IP for the server.
         let advertised_addr = if local_addr.ip().is_unspecified() {
             use std::net::UdpSocket;
             match UdpSocket::bind("0.0.0.0:0") {
@@ -84,6 +96,7 @@ impl Client {
             cseq: AtomicU32::new(0),
             call_id,
             advertised_addr,
+            via_transport,
             closed: Mutex::new(false),
         })
     }
@@ -92,6 +105,11 @@ impl Client {
     /// for use in Contact/Via headers.
     pub fn local_addr(&self) -> SocketAddr {
         self.advertised_addr
+    }
+
+    /// Returns the Via transport tag (UDP, TCP, TLS).
+    pub fn via_transport(&self) -> &str {
+        &self.via_transport
     }
 
     /// Shuts down the client.
@@ -374,7 +392,10 @@ impl Client {
 
         // Pre-set Via so TransactionManager doesn't generate one with 0.0.0.0.
         let branch = transaction::generate_branch();
-        msg.set_header("Via", &format!("SIP/2.0/UDP {};branch={}", local, branch));
+        msg.set_header(
+            "Via",
+            &format!("SIP/2.0/{} {};branch={}", self.via_transport, local, branch),
+        );
 
         msg.set_header(
             "From",
@@ -412,7 +433,10 @@ impl Client {
         ack.set_header("Max-Forwards", "70");
         ack.set_header("User-Agent", "xphone");
         let branch = transaction::generate_branch();
-        let via = format!("SIP/2.0/UDP {};branch={}", self.advertised_addr, branch);
+        let via = format!(
+            "SIP/2.0/{} {};branch={}",
+            self.via_transport, self.advertised_addr, branch
+        );
         ack.set_header("Via", &via);
         ack
     }
@@ -431,7 +455,10 @@ impl Client {
 
         // Pre-set Via so TransactionManager doesn't generate one with 0.0.0.0.
         let branch = transaction::generate_branch();
-        msg.set_header("Via", &format!("SIP/2.0/UDP {};branch={}", local, branch));
+        msg.set_header(
+            "Via",
+            &format!("SIP/2.0/{} {};branch={}", self.via_transport, local, branch),
+        );
 
         let from_tag = &transaction::generate_branch()[..15];
         msg.set_header(
@@ -463,32 +490,32 @@ impl Client {
 
 #[cfg(test)]
 mod tests {
+    use super::super::conn::{SipConnection, UdpConn};
     use super::*;
 
-    #[test]
-    fn client_creates_and_closes() {
-        let cfg = ClientConfig {
+    fn test_config(port: u16) -> ClientConfig {
+        ClientConfig {
             local_addr: "127.0.0.1:0".into(),
-            server_addr: "127.0.0.1:5060".parse().unwrap(),
+            server_addr: format!("127.0.0.1:{}", port).parse().unwrap(),
             username: "1001".into(),
             password: "test".into(),
             domain: "pbx.local".into(),
-        };
-        let client = Client::new(cfg).unwrap();
+            transport: "udp".into(),
+            tls_config: None,
+        }
+    }
+
+    #[test]
+    fn client_creates_and_closes() {
+        let client = Client::new(test_config(5060)).unwrap();
         assert!(client.local_addr().port() > 0);
+        assert_eq!(client.via_transport(), "UDP");
         client.close();
     }
 
     #[test]
     fn build_request_has_standard_headers() {
-        let cfg = ClientConfig {
-            local_addr: "127.0.0.1:0".into(),
-            server_addr: "127.0.0.1:5060".parse().unwrap(),
-            username: "1001".into(),
-            password: "test".into(),
-            domain: "pbx.local".into(),
-        };
-        let client = Client::new(cfg).unwrap();
+        let client = Client::new(test_config(5060)).unwrap();
 
         let req = client.build_request("REGISTER", "sip:pbx.local", None);
         assert_eq!(req.method, "REGISTER");
@@ -498,13 +525,15 @@ mod tests {
         assert_eq!(req.header("CSeq"), "1 REGISTER");
         assert_eq!(req.header("Max-Forwards"), "70");
         assert_eq!(req.header("User-Agent"), "xphone");
+        // Via should contain the correct transport.
+        assert!(req.header("Via").contains("SIP/2.0/UDP"));
 
         client.close();
     }
 
     #[test]
     fn send_register_with_401_auth() {
-        let server = Conn::listen("127.0.0.1:0").unwrap();
+        let server = UdpConn::bind("127.0.0.1:0").unwrap();
         let server_addr = server.local_addr().unwrap();
 
         let cfg = ClientConfig {
@@ -513,12 +542,12 @@ mod tests {
             username: "1001".into(),
             password: "test".into(),
             domain: "pbx.local".into(),
+            transport: "udp".into(),
+            tls_config: None,
         };
         let client = Client::new(cfg).unwrap();
 
         let handle = std::thread::spawn(move || {
-            let mut server = server;
-
             // First request → 401.
             let (data, from) = server.receive(Duration::from_secs(2)).unwrap();
             let req = super::super::message::parse(&data).unwrap();
@@ -558,14 +587,7 @@ mod tests {
 
     #[test]
     fn close_then_register_returns_error() {
-        let cfg = ClientConfig {
-            local_addr: "127.0.0.1:0".into(),
-            server_addr: "127.0.0.1:5060".parse().unwrap(),
-            username: "1001".into(),
-            password: "test".into(),
-            domain: "pbx.local".into(),
-        };
-        let client = Client::new(cfg).unwrap();
+        let client = Client::new(test_config(5060)).unwrap();
         client.close();
 
         let result = client.send_register(Duration::from_secs(1));

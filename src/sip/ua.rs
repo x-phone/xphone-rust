@@ -43,6 +43,22 @@ impl SipUA {
             return Err(Error::HostRequired);
         }
 
+        // Validate transport.
+        let transport = cfg.transport.to_lowercase();
+        match transport.as_str() {
+            "udp" | "tcp" | "tls" => {}
+            other => {
+                return Err(Error::Other(format!(
+                    "xphone: unsupported transport: {}",
+                    other
+                )));
+            }
+        }
+
+        if transport == "tls" && cfg.tls_config.is_none() {
+            return Err(Error::TlsConfigRequired);
+        }
+
         let server_addr: SocketAddr = format!("{}:{}", cfg.host, cfg.port)
             .parse()
             .map_err(|e| Error::Other(format!("invalid server address: {}", e)))?;
@@ -53,6 +69,8 @@ impl SipUA {
             username: cfg.username.clone(),
             password: cfg.password.clone(),
             domain: cfg.host.clone(),
+            transport: transport.clone(),
+            tls_config: cfg.tls_config.clone(),
         };
 
         let client = Arc::new(Client::new(client_cfg)?);
@@ -333,6 +351,54 @@ mod tests {
         let result = ua.send_request("INVITE", None, Duration::from_secs(1));
         assert!(result.is_err());
         ua.close().unwrap();
+    }
+
+    #[test]
+    fn unsupported_transport_returns_error() {
+        let cfg = Config {
+            host: "127.0.0.1".into(),
+            port: 15064,
+            transport: "sctp".into(),
+            ..Config::default()
+        };
+        let result = SipUA::new(&cfg);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("unsupported"));
+    }
+
+    #[test]
+    fn tls_without_config_returns_error() {
+        let cfg = Config {
+            host: "127.0.0.1".into(),
+            port: 15065,
+            transport: "tls".into(),
+            tls_config: None,
+            ..Config::default()
+        };
+        let result = SipUA::new(&cfg);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("TLS"));
+    }
+
+    #[test]
+    fn tcp_transport_accepted() {
+        // TCP connect will fail (no server), but we validate the transport string is accepted.
+        let cfg = Config {
+            host: "127.0.0.1".into(),
+            port: 15066,
+            transport: "tcp".into(),
+            ..Config::default()
+        };
+        // TCP connect will fail since no server is listening,
+        // but the transport validation should pass.
+        let result = SipUA::new(&cfg);
+        assert!(result.is_err()); // connection refused, not "unsupported transport"
+        let err = result.unwrap_err().to_string();
+        assert!(
+            !err.contains("unsupported"),
+            "should not be unsupported transport error: {}",
+            err
+        );
     }
 
     #[test]
