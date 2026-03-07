@@ -243,10 +243,10 @@ impl Phone {
         let dial_result = tr.dial(target, local_sdp.as_bytes(), opts.timeout);
 
         let (call, responses) = match dial_result {
-            Ok((dlg, remote_sdp)) => {
+            Ok(result) => {
                 // Production path: got a real dialog from SipUA.
                 // tr.dial() already consumed the 200 OK, so transition to Active.
-                let call = Call::new_outbound(dlg, opts);
+                let call = Call::new_outbound(result.dialog, opts);
                 call.set_local_media(&local_ip, rtp_port);
                 call.set_local_sdp(&local_sdp);
                 if let Some(ref key) = srtp_inline_key {
@@ -255,11 +255,20 @@ impl Phone {
                 if let Some(sock) = rtp_socket {
                     call.set_rtp_socket(sock);
                 }
-                if !remote_sdp.is_empty() {
-                    call.set_remote_sdp(&remote_sdp);
-                }
+
                 // Wire phone-level callbacks BEFORE simulate_response fires on_state.
                 wire_phone_call_callbacks(&self.inner, &call);
+
+                // Handle early media: if we got a 183 with SDP, set up media before
+                // the final 200 OK so the caller hears ringback/IVR prompts.
+                if let Some(ref early_sdp) = result.early_sdp {
+                    call.set_remote_sdp(early_sdp);
+                    call.simulate_response(183, "Session Progress");
+                }
+
+                if !result.remote_sdp.is_empty() {
+                    call.set_remote_sdp(&result.remote_sdp);
+                }
                 call.simulate_response(200, "OK");
                 (call, Vec::new())
             }
@@ -822,5 +831,42 @@ mod tests {
             "SDP should use explicit local_ip over STUN, got: {}",
             sdp
         );
+    }
+
+    #[test]
+    fn dial_with_early_media_transitions_through_early_media_state() {
+        let tr = Arc::new(MockTransport::new());
+        tr.respond_with(200, "OK"); // REGISTER
+
+        let phone = Phone::new(test_cfg());
+        phone.connect_with_transport(Arc::clone(&tr) as Arc<dyn SipTransport>);
+
+        // Set up early media SDP from the "remote" side.
+        let early_sdp = "v=0\r\no=- 0 0 IN IP4 10.0.0.1\r\ns=-\r\nc=IN IP4 10.0.0.1\r\nm=audio 20000 RTP/AVP 8\r\n";
+        tr.set_early_sdp(early_sdp);
+        tr.respond_with(200, "OK"); // INVITE
+
+        // Use a channel to detect EarlyMedia state (callbacks fire in spawned threads).
+        let (em_tx, em_rx) = crossbeam_channel::bounded(1);
+        phone.on_call_state(move |_call, state| {
+            if state == crate::types::CallState::EarlyMedia {
+                let _ = em_tx.try_send(());
+            }
+        });
+
+        let opts = crate::config::DialOptions {
+            early_media: true,
+            ..Default::default()
+        };
+
+        let call = phone.dial("sip:1002@pbx.local", opts).unwrap();
+        assert_eq!(call.state(), crate::types::CallState::Active);
+
+        // Verify the call transitioned through EarlyMedia.
+        let got_early = em_rx.recv_timeout(Duration::from_secs(2)).is_ok();
+        assert!(got_early, "should have transitioned through EarlyMedia");
+
+        // Remote SDP should have been set from the early media SDP.
+        assert!(!call.remote_sdp().is_empty());
     }
 }

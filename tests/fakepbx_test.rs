@@ -443,6 +443,59 @@ fn fakepbx_sdp_contains_local_ip() {
     phone.disconnect().unwrap();
 }
 
+// --- F-EM: Early media (183 Session Progress with SDP) ---
+
+#[test]
+fn fakepbx_early_media_183() {
+    use xphone::config::DialOptionsBuilder;
+
+    let pbx = FakePBX::new(&[with_auth("1001", "test")]);
+
+    let rtp_port = 20800u16;
+    let answer_sdp_str = sdp::sdp("127.0.0.1", rtp_port, &[sdp::PCMA]);
+    let early_sdp_str = answer_sdp_str.clone();
+    pbx.on_invite(move |inv| {
+        inv.trying();
+        // Send 183 with SDP — this is early media (ringback tone / IVR).
+        inv.early_media(&early_sdp_str);
+        // Brief pause to simulate real-world delay before answer.
+        std::thread::sleep(Duration::from_millis(100));
+        inv.answer(&answer_sdp_str);
+    });
+
+    let phone = connect_pbx(&pbx);
+
+    // Track state transitions.
+    let (em_tx, em_rx) = crossbeam_channel::bounded(1);
+    phone.on_call_state(move |_call, state| {
+        if state == CallState::EarlyMedia {
+            let _ = em_tx.try_send(());
+        }
+    });
+
+    let opts = DialOptionsBuilder::new()
+        .early_media()
+        .timeout(Duration::from_secs(5))
+        .build();
+
+    let call = phone.dial("9999", opts).unwrap();
+    assert_eq!(call.state(), CallState::Active);
+
+    // Verify we transitioned through EarlyMedia.
+    let got_early_media = em_rx.recv_timeout(Duration::from_secs(1)).is_ok();
+    assert!(
+        got_early_media,
+        "call should have transitioned through EarlyMedia state"
+    );
+
+    // Remote SDP should be set.
+    assert!(!call.remote_sdp().is_empty());
+
+    call.end().unwrap();
+    pbx.wait_for_bye(1, Duration::from_secs(2));
+    phone.disconnect().unwrap();
+}
+
 // --- F10: Disconnect fires unregistered callback ---
 
 #[test]

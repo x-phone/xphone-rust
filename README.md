@@ -161,6 +161,7 @@ use xphone::DialOptions;
 use std::time::Duration;
 
 let opts = DialOptions {
+    early_media: true, // hear ringback tones and IVR prompts before answer
     timeout: Duration::from_secs(30),
     ..Default::default()
 };
@@ -198,6 +199,7 @@ if let Some(pcm_rx) = call.pcm_reader() {
 | Jitter buffer | Done |
 | SRTP (encrypted media, AES_CM_128_HMAC_SHA1_80) | Done |
 | TCP and TLS SIP transport | Done |
+| Early media (183 Session Progress) | Done |
 | STUN NAT traversal (RFC 5389) | Done |
 | MockPhone & MockCall for unit testing | Done |
 | Attended transfer | Planned |
@@ -530,6 +532,8 @@ This library is actively developed but not yet complete. The gaps below are wort
 
 **Attended (consultative) transfer is not implemented.** Only blind transfer via REFER is supported.
 
+**DTMF is RFC 4733 (RTP telephone-events) only.** Some legacy PBXes use SIP INFO for DTMF instead. If your system requires SIP INFO DTMF, tones may not be received.
+
 ### Network & NAT
 
 **STUN is supported for NAT-mapped address discovery.** Configure `stun_server` to use a public STUN server (e.g. `stun.l.google.com:19302`) for discovering your external IP. TURN and full ICE are not implemented. In environments with symmetric NAT (common in cloud VMs), STUN alone may not be sufficient and RTP media may fail to flow.
@@ -545,6 +549,7 @@ This is an early-stage project. The API may change between releases. Evaluate ac
 - SRTP hardening — replay protection, key zeroization
 - Opus codec
 - Attended (consultative) transfer
+- SIP INFO DTMF (RFC 2976) for legacy PBX compatibility
 - TURN relay and full ICE for symmetric NAT
 
 ---

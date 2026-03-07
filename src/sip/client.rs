@@ -21,6 +21,8 @@ pub struct InviteResult {
     pub response: Message,
     /// Provisional responses received before the final response.
     pub provisionals: Vec<(u16, String)>,
+    /// SDP body from 183 Session Progress (early media), if any.
+    pub early_sdp: Option<String>,
 }
 
 /// Configuration for a SIP client.
@@ -334,10 +336,17 @@ impl Client {
         timeout: Duration,
     ) -> Result<InviteResult> {
         let mut provisionals = Vec::new();
+        let mut early_sdp = None;
         let mut resp = first_resp;
 
         while (100..200).contains(&resp.status_code) {
             debug!(status = resp.status_code, reason = %resp.reason, "SIP <<< provisional");
+            // Capture SDP from 183 Session Progress for early media.
+            if resp.status_code == 183 && !resp.body.is_empty() {
+                let sdp_str = String::from_utf8_lossy(&resp.body).to_string();
+                debug!(sdp_len = sdp_str.len(), "SIP <<< 183 early media SDP");
+                early_sdp = Some(sdp_str);
+            }
             provisionals.push((resp.status_code, resp.reason.clone()));
             resp = self.tm.read_response(branch, timeout)?;
         }
@@ -352,6 +361,7 @@ impl Client {
                 invite,
                 response: resp,
                 provisionals,
+                early_sdp,
             })
         } else {
             self.tm.remove_tx(branch);

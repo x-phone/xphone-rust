@@ -6,6 +6,16 @@ use crate::dialog::Dialog;
 use crate::error::{Error, Result};
 use crate::sip::message::Message;
 
+/// Result from a dial() operation.
+pub struct DialResult {
+    /// The dialog for the established call.
+    pub dialog: Arc<dyn Dialog>,
+    /// Remote SDP from the final 200 OK response.
+    pub remote_sdp: String,
+    /// SDP from 183 Session Progress (early media), if received.
+    pub early_sdp: Option<String>,
+}
+
 /// Internal interface for SIP transport.
 /// Production: implemented by SipUA (backed by sip::Client).
 /// Tests: implemented by MockTransport.
@@ -36,13 +46,8 @@ pub trait SipTransport: Send + Sync {
     fn on_incoming(&self, f: Box<dyn Fn(String, String) + Send + Sync>);
 
     /// Dials a target with an SDP offer, creating an outbound dialog.
-    /// Returns the dialog and the remote SDP from the 200 OK.
-    fn dial(
-        &self,
-        _target: &str,
-        _local_sdp: &[u8],
-        _timeout: Duration,
-    ) -> Result<(Arc<dyn Dialog>, String)> {
+    /// Returns a [`DialResult`] with the dialog, remote SDP, and optional early media SDP.
+    fn dial(&self, _target: &str, _local_sdp: &[u8], _timeout: Duration) -> Result<DialResult> {
         Err(Error::Other("dial not supported on this transport".into()))
     }
 

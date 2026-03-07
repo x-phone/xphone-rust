@@ -295,7 +295,7 @@ impl SipTransport for SipUA {
         target: &str,
         local_sdp: &[u8],
         timeout: Duration,
-    ) -> Result<(Arc<dyn Dialog>, String)> {
+    ) -> Result<crate::transport::DialResult> {
         // Normalize target to SIP URI.
         let target_uri = if target.starts_with("sip:") {
             target.to_string()
@@ -317,7 +317,11 @@ impl SipTransport for SipUA {
             result.response,
         ));
 
-        Ok((dlg as Arc<dyn Dialog>, remote_sdp))
+        Ok(crate::transport::DialResult {
+            dialog: dlg as Arc<dyn Dialog>,
+            remote_sdp,
+            early_sdp: result.early_sdp,
+        })
     }
 
     fn on_dialog_invite(

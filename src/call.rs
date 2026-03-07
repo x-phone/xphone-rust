@@ -742,6 +742,7 @@ impl Call {
                     {
                         inner.state = CallState::EarlyMedia;
                         inner.media_active = true;
+                        Self::start_media_pipeline(&mut inner);
                         Self::fire_on_state(&inner, CallState::EarlyMedia);
                         if let Some(ref f) = inner.on_media_fn {
                             let f = Arc::clone(f);

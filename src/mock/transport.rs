@@ -42,6 +42,7 @@ struct Inner {
     keepalives: u32,
     closed: bool,
     advertised: Option<std::net::SocketAddr>,
+    early_sdp: Option<String>,
 
     invite_func: Option<Arc<dyn Fn() + Send + Sync>>,
     drop_handler: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -70,6 +71,7 @@ impl MockTransport {
                 keepalives: 0,
                 closed: false,
                 advertised: None,
+                early_sdp: None,
                 invite_func: None,
                 drop_handler: None,
                 incoming_handler: None,
@@ -173,6 +175,11 @@ impl MockTransport {
     /// Sets the advertised address (simulates STUN-mapped address).
     pub fn set_advertised_addr(&self, addr: std::net::SocketAddr) {
         self.inner.lock().advertised = Some(addr);
+    }
+
+    /// Sets an early media SDP that dial() will return as early_sdp.
+    pub fn set_early_sdp(&self, sdp: &str) {
+        self.inner.lock().early_sdp = Some(sdp.to_string());
     }
 
     fn await_response(&self, timeout: Duration) -> Result<(u16, String)> {
@@ -281,7 +288,7 @@ impl SipTransport for MockTransport {
         _target: &str,
         _local_sdp: &[u8],
         timeout: Duration,
-    ) -> Result<(Arc<dyn crate::dialog::Dialog>, String)> {
+    ) -> Result<crate::transport::DialResult> {
         // Record as an INVITE send.
         {
             let mut inner = self.inner.lock();
@@ -301,8 +308,13 @@ impl SipTransport for MockTransport {
             return Err(Error::Other(format!("INVITE failed: {} {}", code, reason)));
         }
 
+        let early_sdp = self.inner.lock().early_sdp.take();
         let dlg = Arc::new(crate::mock::dialog::MockDialog::new());
-        Ok((dlg as Arc<dyn crate::dialog::Dialog>, String::new()))
+        Ok(crate::transport::DialResult {
+            dialog: dlg as Arc<dyn crate::dialog::Dialog>,
+            remote_sdp: String::new(),
+            early_sdp,
+        })
     }
 
     fn advertised_addr(&self) -> Option<std::net::SocketAddr> {
