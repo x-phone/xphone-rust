@@ -403,7 +403,9 @@ impl Call {
         if vals.is_empty() {
             return;
         }
-        let seconds: u64 = match vals[0].parse() {
+        // Handle parameters like "1800;refresher=uac" by taking text before ';'.
+        let raw = vals[0].split(';').next().unwrap_or("").trim();
+        let seconds: u64 = match raw.parse() {
             Ok(s) if s > 0 => s,
             _ => return,
         };
@@ -411,7 +413,7 @@ impl Call {
         let cancel = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let cancel_clone = Arc::clone(&cancel);
         let call = Arc::clone(self);
-        let handle = std::thread::spawn(move || {
+        let handle = std::thread::spawn(move || loop {
             std::thread::sleep(interval);
             if cancel_clone.load(std::sync::atomic::Ordering::Relaxed) {
                 return;
@@ -688,8 +690,10 @@ impl Call {
         let mut resume_fn = None;
         let mut state_fn: Option<Box<dyn FnOnce() + Send>> = None;
 
-        match (dir, inner.state) {
-            (sdp::DIR_SEND_ONLY, CallState::Active) => {
+        let is_hold_dir =
+            dir == sdp::DIR_SEND_ONLY || dir == sdp::DIR_RECV_ONLY || dir == sdp::DIR_INACTIVE;
+        match (is_hold_dir, inner.state) {
+            (true, CallState::Active) => {
                 inner.state = CallState::OnHold;
                 hold_fn = inner.on_hold_fn.clone();
                 if let Some(ref f) = inner.on_state_fn {
@@ -697,7 +701,7 @@ impl Call {
                     state_fn = Some(Box::new(move || f(CallState::OnHold)));
                 }
             }
-            (sdp::DIR_SEND_RECV, CallState::OnHold) => {
+            (false, CallState::OnHold) if dir == sdp::DIR_SEND_RECV => {
                 inner.state = CallState::Active;
                 resume_fn = inner.on_resume_fn.clone();
                 if let Some(ref f) = inner.on_state_fn {
@@ -1357,6 +1361,35 @@ mod tests {
         call.end().unwrap();
         std::thread::sleep(Duration::from_millis(600));
         assert!(dlg.last_reinvite_sdp().is_empty());
+    }
+
+    #[test]
+    fn session_timer_parses_header_with_params() {
+        let mut headers = HashMap::new();
+        headers.insert("Session-Expires".into(), vec!["1;refresher=uac".into()]);
+        let dlg = Arc::new(MockDialog::with_headers(headers));
+        let call = Call::new_inbound(dlg.clone());
+        call.accept().unwrap();
+        std::thread::sleep(Duration::from_millis(600));
+        assert!(!dlg.last_reinvite_sdp().is_empty());
+    }
+
+    // --- re-INVITE with recvonly/inactive ---
+
+    #[test]
+    fn inbound_reinvite_recvonly_triggers_hold() {
+        let call = Call::new_inbound(mock_dlg());
+        call.accept().unwrap();
+        call.simulate_reinvite(&test_sdp("192.168.1.100", 5000, "recvonly", &[0]));
+        assert_eq!(call.state(), CallState::OnHold);
+    }
+
+    #[test]
+    fn inbound_reinvite_inactive_triggers_hold() {
+        let call = Call::new_inbound(mock_dlg());
+        call.accept().unwrap();
+        call.simulate_reinvite(&test_sdp("192.168.1.100", 5000, "inactive", &[0]));
+        assert_eq!(call.state(), CallState::OnHold);
     }
 
     // --- Mute / Unmute ---
