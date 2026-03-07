@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::net::UdpSocket;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -8,6 +9,7 @@ use crate::config::DialOptions;
 use crate::dialog::Dialog;
 use crate::dtmf;
 use crate::error::{Error, Result};
+use crate::media::{self, MediaChannels, MediaConfig, MediaHandle, MediaTransport};
 use crate::sdp;
 use crate::types::*;
 
@@ -116,6 +118,10 @@ struct CallInner {
 
     media_active: bool,
 
+    rtp_socket: Option<Arc<UdpSocket>>,
+    media_handle: Option<MediaHandle>,
+    media_channels: Option<Arc<MediaChannels>>,
+
     on_ended_fn: Option<Arc<dyn Fn(EndReason) + Send + Sync>>,
     on_ended_internal: Option<Arc<dyn Fn(EndReason) + Send + Sync>>,
     on_media_fn: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -155,6 +161,9 @@ impl Call {
                 remote_sdp: String::new(),
                 codec: Codec::PCMU,
                 media_active: false,
+                rtp_socket: None,
+                media_handle: None,
+                media_channels: None,
                 on_ended_fn: None,
                 on_ended_internal: None,
                 on_media_fn: None,
@@ -189,6 +198,9 @@ impl Call {
                 remote_sdp: String::new(),
                 codec: Codec::PCMU,
                 media_active: false,
+                rtp_socket: None,
+                media_handle: None,
+                media_channels: None,
                 on_ended_fn: None,
                 on_ended_internal: None,
                 on_media_fn: None,
@@ -458,6 +470,7 @@ impl Call {
             inner.state = CallState::Active;
             inner.start_time = Some(Instant::now());
             inner.media_active = true;
+            Self::start_media_pipeline(&mut inner);
             Self::fire_on_state(&inner, CallState::Active);
             on_media_fn = inner.on_media_fn.clone();
         }
@@ -498,6 +511,9 @@ impl Call {
             CallState::Active | CallState::OnHold => {
                 let _ = self.dlg.send_bye();
                 inner.state = CallState::Ended;
+                if let Some(ref mut h) = inner.media_handle {
+                    h.stop();
+                }
                 Self::fire_on_state(&inner, CallState::Ended);
                 Self::fire_on_ended(&inner, EndReason::Local);
                 Ok(())
@@ -644,6 +660,7 @@ impl Call {
                         inner.state = CallState::Active;
                         inner.start_time = Some(Instant::now());
                         inner.media_active = true;
+                        Self::start_media_pipeline(&mut inner);
                         Self::fire_on_state(&inner, CallState::Active);
                         if let Some(ref f) = inner.on_media_fn {
                             let f = Arc::clone(f);
@@ -668,6 +685,9 @@ impl Call {
             return;
         }
         inner.state = CallState::Ended;
+        if let Some(ref mut h) = inner.media_handle {
+            h.stop();
+        }
         Self::fire_on_state(&inner, CallState::Ended);
         Self::fire_on_ended(&inner, EndReason::Remote);
     }
@@ -726,9 +746,14 @@ impl Call {
         }
     }
 
-    /// Sets the remote SDP (used in tests to set up codec negotiation before accept).
-    pub fn set_remote_sdp(&self, sdp: &str) {
-        self.inner.lock().remote_sdp = sdp.to_string();
+    /// Sets the remote SDP, parsing it to extract remote endpoint and codec info.
+    pub fn set_remote_sdp(&self, raw_sdp: &str) {
+        let mut inner = self.inner.lock();
+        inner.remote_sdp = raw_sdp.to_string();
+        if let Ok(sess) = sdp::parse(raw_sdp) {
+            Self::set_remote_endpoint(&mut inner, &sess);
+            Self::negotiate_codec(&mut inner, &sess);
+        }
     }
 
     /// Sets the local media address and RTP port for this call.
@@ -736,6 +761,44 @@ impl Call {
         let mut inner = self.inner.lock();
         inner.local_ip = ip.to_string();
         inner.rtp_port = port;
+    }
+
+    /// Sets the RTP socket for this call (production path).
+    pub(crate) fn set_rtp_socket(&self, socket: UdpSocket) {
+        self.inner.lock().rtp_socket = Some(Arc::new(socket));
+    }
+
+    /// Starts the media pipeline if an RTP socket is available and remote endpoint is known.
+    fn start_media_pipeline(inner: &mut CallInner) {
+        if inner.media_handle.is_some() {
+            return; // already started
+        }
+        let socket = match inner.rtp_socket.as_ref() {
+            Some(s) => Arc::clone(s),
+            None => return, // no socket — test path, skip media
+        };
+        if inner.remote_ip.is_empty() || inner.remote_port <= 0 {
+            return; // no remote endpoint yet
+        }
+        let remote_addr: std::net::SocketAddr =
+            match format!("{}:{}", inner.remote_ip, inner.remote_port).parse() {
+                Ok(a) => a,
+                Err(_) => return,
+            };
+
+        let transport = Arc::new(MediaTransport::new(
+            socket.try_clone().expect("failed to clone RTP socket"),
+            remote_addr,
+        ));
+        let channels = Arc::new(MediaChannels::new());
+        let shared = Arc::new(media::MediaSharedState::new(inner.state));
+        let config = MediaConfig {
+            codec: inner.codec,
+            ..MediaConfig::default()
+        };
+        let handle = media::start_media(config, Arc::clone(&channels), shared, Some(transport));
+        inner.media_handle = Some(handle);
+        inner.media_channels = Some(channels);
     }
 
     /// Sends a SIP response via the dialog (e.g., 180 Ringing for inbound calls).

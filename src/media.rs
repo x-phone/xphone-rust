@@ -1,3 +1,4 @@
+use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -132,16 +133,65 @@ impl MediaSharedState {
     }
 }
 
+/// RTP transport for sending/receiving packets over UDP.
+pub struct MediaTransport {
+    pub socket: Arc<UdpSocket>,
+    pub remote_addr: Mutex<SocketAddr>,
+}
+
+impl MediaTransport {
+    pub fn new(socket: UdpSocket, remote_addr: SocketAddr) -> Self {
+        socket
+            .set_nonblocking(false)
+            .expect("set_nonblocking failed");
+        socket
+            .set_read_timeout(Some(Duration::from_millis(20)))
+            .expect("set_read_timeout failed");
+        Self {
+            socket: Arc::new(socket),
+            remote_addr: Mutex::new(remote_addr),
+        }
+    }
+}
+
+/// Allocates a UDP socket on an even port in [min, max].
+/// Returns the socket and the allocated port.
+pub fn listen_rtp_port(min: u16, max: u16) -> crate::error::Result<(UdpSocket, u16)> {
+    let mut port = min;
+    // Ensure we start on an even port (RTP convention).
+    if !port.is_multiple_of(2) {
+        port += 1;
+    }
+    while port <= max {
+        match UdpSocket::bind(format!("0.0.0.0:{}", port)) {
+            Ok(sock) => return Ok((sock, port)),
+            Err(_) => port += 2, // Try next even port.
+        }
+    }
+    Err(crate::error::Error::Other(format!(
+        "no available RTP port in range {}-{}",
+        min, max
+    )))
+}
+
 /// Handle to a running media pipeline. Drop to stop.
 pub struct MediaHandle {
     done_tx: Sender<()>,
+    reader_done_tx: Option<Sender<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
+    reader_thread: Option<std::thread::JoinHandle<()>>,
 }
 
 impl MediaHandle {
     pub fn stop(&mut self) {
         let _ = self.done_tx.try_send(());
+        if let Some(ref tx) = self.reader_done_tx {
+            let _ = tx.try_send(());
+        }
         if let Some(handle) = self.thread.take() {
+            let _ = handle.join();
+        }
+        if let Some(handle) = self.reader_thread.take() {
             let _ = handle.join();
         }
     }
@@ -177,11 +227,16 @@ fn rand_u32() -> u32 {
 
 /// Start the media pipeline on a dedicated std::thread.
 ///
+/// If `transport` is provided, spawns an additional reader thread that reads
+/// UDP packets and pushes them into `channels.rtp_inbound`. Outbound packets
+/// are sent via the transport's socket to the remote address.
+///
 /// Returns a `MediaHandle` that stops the pipeline when dropped.
 pub fn start_media(
     config: MediaConfig,
     channels: Arc<MediaChannels>,
     shared: Arc<MediaSharedState>,
+    transport: Option<Arc<MediaTransport>>,
 ) -> MediaHandle {
     let (done_tx, done_rx) = bounded::<()>(1);
 
@@ -204,6 +259,37 @@ pub fn start_media(
     let codec_pt = config.codec.payload_type();
     let mut cp = codec::new_codec_processor(codec_pt, pcm_rate);
 
+    // Spawn an inbound UDP reader thread if transport is available.
+    let (reader_done_tx, reader_done_rx) = bounded::<()>(1);
+    let reader_thread = transport.as_ref().map(|tr| {
+        let socket = Arc::clone(&tr.socket);
+        let inbound_tx = channels.rtp_inbound.tx.clone();
+        let inbound_rx = channels.rtp_inbound.rx.clone();
+        let done = reader_done_rx;
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 2048];
+            loop {
+                if done.try_recv().is_ok() {
+                    return;
+                }
+                match socket.recv_from(&mut buf) {
+                    Ok((n, _src)) => {
+                        if n < 12 {
+                            continue;
+                        }
+                        if let Some(pkt) = RtpPacket::parse(&buf[..n]) {
+                            send_drop_oldest(&inbound_tx, &inbound_rx, pkt);
+                        }
+                    }
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
+                    Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => continue,
+                    Err(_) => return,
+                }
+            }
+        })
+    });
+
+    let transport_for_thread = transport.clone();
     let thread = std::thread::spawn(move || {
         let mut jb = JitterBuffer::new(jitter_depth);
         let mut out_seq: u16 = 0;
@@ -293,7 +379,10 @@ pub fn start_media(
                     if let Some(ref sent) = channels.sent_rtp {
                         send_drop_oldest(&sent.tx, &sent.rx, clone_packet(&pkt));
                     }
-                    // In production, would send via UDP here.
+                    if let Some(ref tr) = transport_for_thread {
+                        let remote = *tr.remote_addr.lock();
+                        let _ = tr.socket.send_to(&pkt.to_bytes(), remote);
+                    }
                 },
 
                 recv(channels.pcm_writer.rx) -> msg => {
@@ -325,7 +414,10 @@ pub fn start_media(
                     if let Some(ref sent) = channels.sent_rtp {
                         send_drop_oldest(&sent.tx, &sent.rx, clone_packet(&out_pkt));
                     }
-                    // In production, would send via UDP here.
+                    if let Some(ref tr) = transport_for_thread {
+                        let remote = *tr.remote_addr.lock();
+                        let _ = tr.socket.send_to(&out_pkt.to_bytes(), remote);
+                    }
                 },
             }
         }
@@ -333,7 +425,13 @@ pub fn start_media(
 
     MediaHandle {
         done_tx,
+        reader_done_tx: if reader_thread.is_some() {
+            Some(reader_done_tx)
+        } else {
+            None
+        },
         thread: Some(thread),
+        reader_thread,
     }
 }
 
@@ -416,7 +514,7 @@ mod tests {
     fn rtp_raw_reader_pre_jitter() {
         let ch = test_channels();
         let shared = test_shared(CallState::Active);
-        let mut handle = start_media(MediaConfig::default(), ch.clone(), shared);
+        let mut handle = start_media(MediaConfig::default(), ch.clone(), shared, None);
 
         inject(&ch, make_rtp(1, 0, vec![0; 160]));
         inject(&ch, make_rtp(3, 0, vec![0; 160]));
@@ -438,7 +536,7 @@ mod tests {
     fn rtp_reader_post_jitter() {
         let ch = test_channels();
         let shared = test_shared(CallState::Active);
-        let mut handle = start_media(MediaConfig::default(), ch.clone(), shared);
+        let mut handle = start_media(MediaConfig::default(), ch.clone(), shared, None);
 
         inject(&ch, make_rtp(3, 0, vec![0; 160]));
         inject(&ch, make_rtp(1, 0, vec![0; 160]));
@@ -460,7 +558,7 @@ mod tests {
     fn tap_independence() {
         let ch = test_channels();
         let shared = test_shared(CallState::Active);
-        let mut handle = start_media(MediaConfig::default(), ch.clone(), shared);
+        let mut handle = start_media(MediaConfig::default(), ch.clone(), shared, None);
 
         // PCMU payload so PCMReader also gets decoded audio.
         inject(&ch, make_rtp(42, 0, vec![0; 160]));
@@ -480,7 +578,7 @@ mod tests {
     fn rtp_writer_passthrough() {
         let ch = test_channels();
         let shared = test_shared(CallState::Active);
-        let mut handle = start_media(MediaConfig::default(), ch.clone(), shared);
+        let mut handle = start_media(MediaConfig::default(), ch.clone(), shared, None);
 
         let pkt = RtpPacket {
             header: RtpHeader {
@@ -508,7 +606,7 @@ mod tests {
     fn outbound_mutex_rtp_writer_suppresses_pcm() {
         let ch = test_channels();
         let shared = test_shared(CallState::Active);
-        let mut handle = start_media(MediaConfig::default(), ch.clone(), shared);
+        let mut handle = start_media(MediaConfig::default(), ch.clone(), shared, None);
 
         // Send an RTP packet first to set rtp_writer_used.
         ch.rtp_writer.tx.send(make_rtp(1, 0, vec![])).unwrap();
@@ -532,7 +630,7 @@ mod tests {
     fn pcm_writer_encode() {
         let ch = test_channels();
         let shared = test_shared(CallState::Active);
-        let mut handle = start_media(MediaConfig::default(), ch.clone(), shared);
+        let mut handle = start_media(MediaConfig::default(), ch.clone(), shared, None);
 
         // Write silence PCM frame.
         ch.pcm_writer.tx.send(vec![0i16; 160]).unwrap();
@@ -550,7 +648,7 @@ mod tests {
     fn pcm_writer_seq_and_timestamp() {
         let ch = test_channels();
         let shared = test_shared(CallState::Active);
-        let mut handle = start_media(MediaConfig::default(), ch.clone(), shared);
+        let mut handle = start_media(MediaConfig::default(), ch.clone(), shared, None);
 
         ch.pcm_writer.tx.send(vec![0i16; 160]).unwrap();
         ch.pcm_writer.tx.send(vec![0i16; 160]).unwrap();
@@ -577,7 +675,7 @@ mod tests {
             codec: Codec::PCMA,
             ..Default::default()
         };
-        let mut handle = start_media(config, ch.clone(), shared);
+        let mut handle = start_media(config, ch.clone(), shared, None);
 
         ch.pcm_writer.tx.send(vec![0i16; 160]).unwrap();
 
@@ -593,7 +691,7 @@ mod tests {
     fn codec_dispatch_pcmu() {
         let ch = test_channels();
         let shared = test_shared(CallState::Active);
-        let mut handle = start_media(MediaConfig::default(), ch.clone(), shared);
+        let mut handle = start_media(MediaConfig::default(), ch.clone(), shared, None);
 
         // mu-law 0xFF = silence (decodes to 0).
         inject(&ch, make_rtp(1, 0, vec![0xFF; 160]));
@@ -615,7 +713,7 @@ mod tests {
             codec: Codec::PCMA,
             ..Default::default()
         };
-        let mut handle = start_media(config, ch.clone(), shared);
+        let mut handle = start_media(config, ch.clone(), shared, None);
 
         // A-law 0xD5 = silence (decodes near 0).
         inject(&ch, make_rtp(1, 8, vec![0xD5; 160]));
@@ -637,7 +735,7 @@ mod tests {
     fn channel_overflow_drop_oldest() {
         let ch = test_channels();
         let shared = test_shared(CallState::Active);
-        let mut handle = start_media(MediaConfig::default(), ch.clone(), shared);
+        let mut handle = start_media(MediaConfig::default(), ch.clone(), shared, None);
 
         // Saturate with 300 packets (buffer is 256).
         for i in 0..300u16 {
@@ -669,7 +767,7 @@ mod tests {
             *ended2.lock() = Some(r);
         }));
 
-        let _handle = start_media(config, ch.clone(), shared);
+        let _handle = start_media(config, ch.clone(), shared, None);
 
         // Don't send any RTP — timeout should fire.
         std::thread::sleep(Duration::from_millis(200));
@@ -692,7 +790,7 @@ mod tests {
             *ended2.lock() = Some(r);
         }));
 
-        let _handle = start_media(config, ch.clone(), shared.clone());
+        let _handle = start_media(config, ch.clone(), shared.clone(), None);
 
         // Put on hold.
         *shared.state.lock() = CallState::OnHold;
@@ -715,7 +813,7 @@ mod tests {
     fn dtmf_inbound_fires_callback() {
         let ch = test_channels();
         let shared = test_shared(CallState::Active);
-        let mut handle = start_media(MediaConfig::default(), ch.clone(), shared.clone());
+        let mut handle = start_media(MediaConfig::default(), ch.clone(), shared.clone(), None);
 
         let (tx, rx) = std::sync::mpsc::channel();
         *shared.on_dtmf_fn.lock() = Some(Arc::new(move |digit| {
@@ -749,7 +847,7 @@ mod tests {
     fn dtmf_no_callback_no_panic() {
         let ch = test_channels();
         let shared = test_shared(CallState::Active);
-        let mut handle = start_media(MediaConfig::default(), ch.clone(), shared);
+        let mut handle = start_media(MediaConfig::default(), ch.clone(), shared, None);
 
         // No callback registered — should not panic.
         let payload = vec![5, 0x8A, 0x03, 0xE8];
@@ -776,7 +874,7 @@ mod tests {
     fn mute_suppresses_outbound_pcm() {
         let ch = test_channels();
         let shared = test_shared(CallState::Active);
-        let mut handle = start_media(MediaConfig::default(), ch.clone(), shared.clone());
+        let mut handle = start_media(MediaConfig::default(), ch.clone(), shared.clone(), None);
 
         shared.muted.store(true, Ordering::Relaxed);
 
@@ -796,7 +894,7 @@ mod tests {
     fn mute_suppresses_outbound_rtp_writer() {
         let ch = test_channels();
         let shared = test_shared(CallState::Active);
-        let mut handle = start_media(MediaConfig::default(), ch.clone(), shared.clone());
+        let mut handle = start_media(MediaConfig::default(), ch.clone(), shared.clone(), None);
 
         shared.muted.store(true, Ordering::Relaxed);
 
@@ -816,7 +914,7 @@ mod tests {
     fn unmute_restores_outbound_pcm() {
         let ch = test_channels();
         let shared = test_shared(CallState::Active);
-        let mut handle = start_media(MediaConfig::default(), ch.clone(), shared.clone());
+        let mut handle = start_media(MediaConfig::default(), ch.clone(), shared.clone(), None);
 
         shared.muted.store(true, Ordering::Relaxed);
         shared.muted.store(false, Ordering::Relaxed);
@@ -837,7 +935,7 @@ mod tests {
     fn mute_inbound_still_flows() {
         let ch = test_channels();
         let shared = test_shared(CallState::Active);
-        let mut handle = start_media(MediaConfig::default(), ch.clone(), shared.clone());
+        let mut handle = start_media(MediaConfig::default(), ch.clone(), shared.clone(), None);
 
         shared.muted.store(true, Ordering::Relaxed);
 
@@ -853,7 +951,7 @@ mod tests {
     fn stop_media_terminates_thread() {
         let ch = test_channels();
         let shared = test_shared(CallState::Active);
-        let mut handle = start_media(MediaConfig::default(), ch, shared);
+        let mut handle = start_media(MediaConfig::default(), ch, shared, None);
 
         handle.stop();
         // Thread should have joined. If not, test would hang.

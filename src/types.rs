@@ -124,6 +124,58 @@ pub struct RtpPacket {
     pub payload: Vec<u8>,
 }
 
+impl RtpPacket {
+    /// Minimum RTP header size (no CSRC, no extensions).
+    const MIN_HEADER_SIZE: usize = 12;
+
+    /// Parses an RTP packet from raw bytes. Returns None if too short.
+    pub fn parse(data: &[u8]) -> Option<Self> {
+        if data.len() < Self::MIN_HEADER_SIZE {
+            return None;
+        }
+        let version = (data[0] >> 6) & 0x03;
+        let cc = (data[0] & 0x0F) as usize;
+        let marker = (data[1] & 0x80) != 0;
+        let payload_type = data[1] & 0x7F;
+        let sequence_number = u16::from_be_bytes([data[2], data[3]]);
+        let timestamp = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
+        let ssrc = u32::from_be_bytes([data[8], data[9], data[10], data[11]]);
+
+        let header_len = Self::MIN_HEADER_SIZE + cc * 4;
+        if data.len() < header_len {
+            return None;
+        }
+
+        Some(RtpPacket {
+            header: RtpHeader {
+                version,
+                marker,
+                payload_type,
+                sequence_number,
+                timestamp,
+                ssrc,
+            },
+            payload: data[header_len..].to_vec(),
+        })
+    }
+
+    /// Serializes the RTP packet to bytes.
+    pub fn to_bytes(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(Self::MIN_HEADER_SIZE + self.payload.len());
+        buf.push((self.header.version << 6) & 0xC0); // V=2, P=0, X=0, CC=0
+        let mut byte1 = self.header.payload_type & 0x7F;
+        if self.header.marker {
+            byte1 |= 0x80;
+        }
+        buf.push(byte1);
+        buf.extend_from_slice(&self.header.sequence_number.to_be_bytes());
+        buf.extend_from_slice(&self.header.timestamp.to_be_bytes());
+        buf.extend_from_slice(&self.header.ssrc.to_be_bytes());
+        buf.extend_from_slice(&self.payload);
+        buf
+    }
+}
+
 /// Audio codec identified by RTP payload type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Codec {
@@ -217,6 +269,57 @@ mod tests {
     fn codec_display() {
         assert_eq!(Codec::PCMU.to_string(), "PCMU");
         assert_eq!(Codec::G722.to_string(), "G722");
+    }
+
+    #[test]
+    fn rtp_packet_round_trip() {
+        let pkt = RtpPacket {
+            header: RtpHeader {
+                version: 2,
+                marker: true,
+                payload_type: 0,
+                sequence_number: 1234,
+                timestamp: 56789,
+                ssrc: 0xDEADBEEF,
+            },
+            payload: vec![1, 2, 3, 4],
+        };
+        let bytes = pkt.to_bytes();
+        let parsed = RtpPacket::parse(&bytes).unwrap();
+        assert_eq!(parsed.header.version, 2);
+        assert!(parsed.header.marker);
+        assert_eq!(parsed.header.payload_type, 0);
+        assert_eq!(parsed.header.sequence_number, 1234);
+        assert_eq!(parsed.header.timestamp, 56789);
+        assert_eq!(parsed.header.ssrc, 0xDEADBEEF);
+        assert_eq!(parsed.payload, vec![1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn rtp_parse_too_short() {
+        assert!(RtpPacket::parse(&[0; 11]).is_none());
+        assert!(RtpPacket::parse(&[]).is_none());
+    }
+
+    #[test]
+    fn rtp_parse_header_only() {
+        let pkt = RtpPacket {
+            header: RtpHeader {
+                version: 2,
+                marker: false,
+                payload_type: 8,
+                sequence_number: 42,
+                timestamp: 320,
+                ssrc: 100,
+            },
+            payload: vec![],
+        };
+        let bytes = pkt.to_bytes();
+        assert_eq!(bytes.len(), 12);
+        let parsed = RtpPacket::parse(&bytes).unwrap();
+        assert_eq!(parsed.header.payload_type, 8);
+        assert!(!parsed.header.marker);
+        assert!(parsed.payload.is_empty());
     }
 
     #[test]

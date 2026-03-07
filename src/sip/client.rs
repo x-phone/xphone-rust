@@ -34,7 +34,7 @@ pub struct ClientConfig {
 /// A SIP UA client that can send REGISTER and other requests,
 /// and receive incoming requests (INVITE, BYE, etc.).
 pub struct Client {
-    tm: Mutex<TransactionManager>,
+    tm: TransactionManager,
     cfg: ClientConfig,
     cseq: AtomicU32,
     call_id: String,
@@ -77,7 +77,7 @@ impl Client {
         };
 
         Ok(Self {
-            tm: Mutex::new(tm),
+            tm,
             cfg,
             cseq: AtomicU32::new(0),
             call_id,
@@ -95,7 +95,7 @@ impl Client {
     /// Shuts down the client.
     pub fn close(&self) {
         *self.closed.lock() = true;
-        self.tm.lock().stop();
+        self.tm.stop();
     }
 
     /// Registers a callback for incoming SIP requests.
@@ -103,7 +103,7 @@ impl Client {
     where
         F: Fn(Message, SocketAddr) + Send + Sync + 'static,
     {
-        self.tm.lock().on_request(f);
+        self.tm.on_request(f);
     }
 
     /// Sends a REGISTER request.
@@ -117,13 +117,12 @@ impl Client {
         let request_uri = format!("sip:{}", self.cfg.domain);
         let mut req = self.build_request("REGISTER", &request_uri, None);
 
-        let tm = self.tm.lock();
-        let resp = tm.send(&mut req, self.cfg.server_addr, timeout)?;
+        let resp = self.tm.send(&mut req, self.cfg.server_addr, timeout)?;
         let branch = req.via_branch().to_string();
 
         // Handle 401 auth challenge.
         if resp.status_code == 401 {
-            tm.remove_tx(&branch);
+            self.tm.remove_tx(&branch);
             let auth_hdr = resp.header("WWW-Authenticate");
             let ch = match auth::parse_challenge(auth_hdr) {
                 Ok(ch) => ch,
@@ -138,13 +137,13 @@ impl Client {
             let mut extra = HashMap::new();
             extra.insert("Authorization".to_string(), auth_val);
             let mut retry = self.build_request("REGISTER", &request_uri, Some(&extra));
-            let resp = tm.send(&mut retry, self.cfg.server_addr, timeout)?;
+            let resp = self.tm.send(&mut retry, self.cfg.server_addr, timeout)?;
             let retry_branch = retry.via_branch().to_string();
-            tm.remove_tx(&retry_branch);
+            self.tm.remove_tx(&retry_branch);
             return Ok((resp.status_code, resp.reason.clone()));
         }
 
-        tm.remove_tx(&branch);
+        self.tm.remove_tx(&branch);
         Ok((resp.status_code, resp.reason.clone()))
     }
 
@@ -178,41 +177,38 @@ impl Client {
 
         let mut req = self.build_invite_request(target_uri, sdp, None);
 
-        let (resp, branch, invite) = {
-            let tm = self.tm.lock();
-            let resp = tm.send(&mut req, self.cfg.server_addr, timeout)?;
-            let branch = req.via_branch().to_string();
+        let resp = self.tm.send(&mut req, self.cfg.server_addr, timeout)?;
+        let branch = req.via_branch().to_string();
 
-            if resp.status_code == 401 || resp.status_code == 407 {
-                tm.remove_tx(&branch);
-                let auth_hdr_name = if resp.status_code == 401 {
-                    "WWW-Authenticate"
-                } else {
-                    "Proxy-Authenticate"
-                };
-                let auth_hdr = resp.header(auth_hdr_name);
-                let ch = auth::parse_challenge(auth_hdr)
-                    .map_err(|_| Error::Other("sip: auth challenge parse failed".into()))?;
-                let creds = Credentials {
-                    username: self.cfg.username.clone(),
-                    password: self.cfg.password.clone(),
-                };
-                let auth_val = auth::build_authorization(&ch, &creds, "INVITE", target_uri);
-                let auth_resp_hdr = if resp.status_code == 401 {
-                    "Authorization"
-                } else {
-                    "Proxy-Authorization"
-                };
-
-                let mut extra = HashMap::new();
-                extra.insert(auth_resp_hdr.to_string(), auth_val);
-                let mut retry = self.build_invite_request(target_uri, sdp, Some(&extra));
-                let resp = tm.send(&mut retry, self.cfg.server_addr, timeout)?;
-                let branch = retry.via_branch().to_string();
-                (resp, branch, retry)
+        let (resp, branch, invite) = if resp.status_code == 401 || resp.status_code == 407 {
+            self.tm.remove_tx(&branch);
+            let auth_hdr_name = if resp.status_code == 401 {
+                "WWW-Authenticate"
             } else {
-                (resp, branch, req)
-            }
+                "Proxy-Authenticate"
+            };
+            let auth_hdr = resp.header(auth_hdr_name);
+            let ch = auth::parse_challenge(auth_hdr)
+                .map_err(|_| Error::Other("sip: auth challenge parse failed".into()))?;
+            let creds = Credentials {
+                username: self.cfg.username.clone(),
+                password: self.cfg.password.clone(),
+            };
+            let auth_val = auth::build_authorization(&ch, &creds, "INVITE", target_uri);
+            let auth_resp_hdr = if resp.status_code == 401 {
+                "Authorization"
+            } else {
+                "Proxy-Authorization"
+            };
+
+            let mut extra = HashMap::new();
+            extra.insert(auth_resp_hdr.to_string(), auth_val);
+            let mut retry = self.build_invite_request(target_uri, sdp, Some(&extra));
+            let resp = self.tm.send(&mut retry, self.cfg.server_addr, timeout)?;
+            let branch = retry.via_branch().to_string();
+            (resp, branch, retry)
+        } else {
+            (resp, branch, req)
         };
 
         self.consume_invite_responses(invite, resp, &branch, timeout)
@@ -231,25 +227,21 @@ impl Client {
 
         while (100..200).contains(&resp.status_code) {
             provisionals.push((resp.status_code, resp.reason.clone()));
-            let tm = self.tm.lock();
-            resp = tm.read_response(branch, timeout)?;
+            resp = self.tm.read_response(branch, timeout)?;
         }
 
         if resp.status_code >= 200 && resp.status_code < 300 {
             // Send ACK for 2xx.
             let ack = self.build_ack(&invite, &resp);
-            {
-                let tm = self.tm.lock();
-                tm.remove_tx(branch);
-                tm.send_raw(&ack.to_bytes(), self.cfg.server_addr)?;
-            }
+            self.tm.remove_tx(branch);
+            self.tm.send_raw(&ack.to_bytes(), self.cfg.server_addr)?;
             Ok(InviteResult {
                 invite,
                 response: resp,
                 provisionals,
             })
         } else {
-            self.tm.lock().remove_tx(branch);
+            self.tm.remove_tx(branch);
             Err(Error::Other(format!(
                 "sip: INVITE rejected: {} {}",
                 resp.status_code, resp.reason
@@ -262,10 +254,9 @@ impl Client {
         if *self.closed.lock() {
             return Err(Error::Other("sip: client closed".into()));
         }
-        let tm = self.tm.lock();
-        let resp = tm.send(req, self.cfg.server_addr, timeout)?;
+        let resp = self.tm.send(req, self.cfg.server_addr, timeout)?;
         let branch = req.via_branch().to_string();
-        tm.remove_tx(&branch);
+        self.tm.remove_tx(&branch);
         Ok(resp)
     }
 
@@ -276,27 +267,22 @@ impl Client {
         }
 
         let invite_clone = req.clone();
-        let resp = {
-            let tm = self.tm.lock();
-            tm.send(req, self.cfg.server_addr, timeout)?
-        };
+        let resp = self.tm.send(req, self.cfg.server_addr, timeout)?;
         let branch = req.via_branch().to_string();
 
         // Consume provisional responses.
         let mut resp = resp;
         while (100..200).contains(&resp.status_code) {
-            let tm = self.tm.lock();
-            resp = tm.read_response(&branch, timeout)?;
+            resp = self.tm.read_response(&branch, timeout)?;
         }
 
         if (200..300).contains(&resp.status_code) {
             // Send ACK for 2xx.
             let ack = self.build_ack(&invite_clone, &resp);
-            let tm = self.tm.lock();
-            tm.remove_tx(&branch);
-            tm.send_raw(&ack.to_bytes(), self.cfg.server_addr)?;
+            self.tm.remove_tx(&branch);
+            self.tm.send_raw(&ack.to_bytes(), self.cfg.server_addr)?;
         } else {
-            self.tm.lock().remove_tx(&branch);
+            self.tm.remove_tx(&branch);
         }
 
         Ok(resp)
@@ -304,12 +290,12 @@ impl Client {
 
     /// Sends raw bytes to a specific address (for SIP responses, ACK).
     pub fn send_raw_to(&self, data: &[u8], dst: SocketAddr) -> Result<()> {
-        self.tm.lock().send_raw(data, dst)
+        self.tm.send_raw(data, dst)
     }
 
     /// Sends a CRLF NAT keepalive packet to the server.
     pub fn send_keepalive(&self) -> Result<()> {
-        self.tm.lock().send_raw(b"\r\n\r\n", self.cfg.server_addr)
+        self.tm.send_raw(b"\r\n\r\n", self.cfg.server_addr)
     }
 
     /// Builds an INVITE request with SDP body.

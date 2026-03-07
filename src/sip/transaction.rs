@@ -32,9 +32,9 @@ pub struct TransactionManager {
     local_addr: SocketAddr,
     inner: Arc<Mutex<Inner>>,
     /// Dropping this sender closes the channel, signaling all receivers to stop.
-    _done_tx: Option<Sender<()>>,
+    done_tx: Mutex<Option<Sender<()>>>,
     done_rx: Receiver<()>,
-    thread: Option<std::thread::JoinHandle<()>>,
+    thread: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 impl TransactionManager {
@@ -63,14 +63,14 @@ impl TransactionManager {
             write_conn,
             local_addr,
             inner,
-            _done_tx: Some(done_tx),
+            done_tx: Mutex::new(Some(done_tx)),
             done_rx,
-            thread: Some(thread),
+            thread: Mutex::new(Some(thread)),
         }
     }
 
     /// Shuts down the read loop and cancels all pending transactions.
-    pub fn stop(&mut self) {
+    pub fn stop(&self) {
         let mut inner = self.inner.lock();
         if inner.stopped {
             return;
@@ -79,9 +79,9 @@ impl TransactionManager {
         inner.pending.clear();
         drop(inner);
         // Drop the sender to close the channel — wakes all receivers.
-        self._done_tx.take();
+        self.done_tx.lock().take();
         // Join the read loop thread.
-        if let Some(handle) = self.thread.take() {
+        if let Some(handle) = self.thread.lock().take() {
             let _ = handle.join();
         }
     }
@@ -186,7 +186,18 @@ impl TransactionManager {
 
 impl Drop for TransactionManager {
     fn drop(&mut self) {
-        self.stop();
+        // Use direct field access (no lock needed since we have &mut self).
+        let mut inner = self.inner.lock();
+        if inner.stopped {
+            return;
+        }
+        inner.stopped = true;
+        inner.pending.clear();
+        drop(inner);
+        self.done_tx.get_mut().take();
+        if let Some(handle) = self.thread.get_mut().take() {
+            let _ = handle.join();
+        }
     }
 }
 

@@ -89,6 +89,7 @@ impl Phone {
         let inner_clone = Arc::clone(&self.inner);
         let host = self.cfg.host.clone();
         let rtp_port_min = self.cfg.rtp_port_min;
+        let rtp_port_max = self.cfg.rtp_port_max;
         tr.on_dialog_invite(Box::new(move |dlg, from, to, remote_sdp| {
             let local_ip = local_ip_for(&host);
             handle_dialog_incoming(
@@ -99,6 +100,7 @@ impl Phone {
                 &remote_sdp,
                 &local_ip,
                 rtp_port_min,
+                rtp_port_max,
             );
         }));
 
@@ -160,10 +162,22 @@ impl Phone {
             inner.tr.as_ref().cloned().ok_or(Error::NotConnected)?
         };
 
-        // Build SDP offer with default codecs and detected local IP.
+        // Allocate RTP port and build SDP offer.
         let local_ip = local_ip_for(&self.cfg.host);
-        let local_sdp =
-            crate::sdp::build_offer(&local_ip, 20000, &[8, 0, 9, 101], crate::sdp::DIR_SEND_RECV);
+        let (rtp_socket, rtp_port) = if self.cfg.rtp_port_min > 0 && self.cfg.rtp_port_max > 0 {
+            match crate::media::listen_rtp_port(self.cfg.rtp_port_min, self.cfg.rtp_port_max) {
+                Ok((sock, port)) => (Some(sock), port as i32),
+                Err(_) => (None, 20000),
+            }
+        } else {
+            (None, 20000)
+        };
+        let local_sdp = crate::sdp::build_offer(
+            &local_ip,
+            rtp_port,
+            &[8, 0, 9, 101],
+            crate::sdp::DIR_SEND_RECV,
+        );
 
         // Try dialog-based dial (production SipUA path).
         let dial_result = tr.dial(target, local_sdp.as_bytes(), opts.timeout);
@@ -173,6 +187,10 @@ impl Phone {
                 // Production path: got a real dialog from SipUA.
                 // tr.dial() already consumed the 200 OK, so transition to Active.
                 let call = Call::new_outbound(dlg, opts);
+                call.set_local_media(&local_ip, rtp_port);
+                if let Some(sock) = rtp_socket {
+                    call.set_rtp_socket(sock);
+                }
                 if !remote_sdp.is_empty() {
                     call.set_remote_sdp(&remote_sdp);
                 }
@@ -335,6 +353,7 @@ fn handle_incoming(inner: &Arc<Mutex<Inner>>, from: &str, to: &str) {
 }
 
 /// Handles an incoming INVITE with a real SIP dialog (production path).
+#[allow(clippy::too_many_arguments)]
 fn handle_dialog_incoming(
     inner: &Arc<Mutex<Inner>>,
     dlg: Arc<dyn Dialog>,
@@ -342,13 +361,27 @@ fn handle_dialog_incoming(
     _to: &str,
     remote_sdp: &str,
     local_ip: &str,
-    rtp_port: u16,
+    rtp_port_min: u16,
+    rtp_port_max: u16,
 ) {
     let incoming_fn = inner.lock().incoming.clone();
 
+    // Allocate an RTP socket for this call.
+    let (rtp_socket, actual_port) = if rtp_port_min > 0 && rtp_port_max > 0 {
+        match crate::media::listen_rtp_port(rtp_port_min, rtp_port_max) {
+            Ok((sock, port)) => (Some(sock), port as i32),
+            Err(_) => (None, rtp_port_min as i32),
+        }
+    } else {
+        (None, rtp_port_min as i32)
+    };
+
     // Create an inbound call with the real dialog.
     let call = Call::new_inbound(dlg);
-    call.set_local_media(local_ip, rtp_port as i32);
+    call.set_local_media(local_ip, actual_port);
+    if let Some(sock) = rtp_socket {
+        call.set_rtp_socket(sock);
+    }
     if !remote_sdp.is_empty() {
         call.set_remote_sdp(remote_sdp);
     }
