@@ -877,6 +877,53 @@ impl Call {
     pub(crate) fn on_ended_internal(&self, f: impl Fn(EndReason) + Send + Sync + 'static) {
         self.inner.lock().on_ended_internal = Some(Arc::new(f));
     }
+
+    // --- Media channel accessors ---
+
+    /// Returns the RTP writer sender (for sending raw RTP packets outbound).
+    pub fn rtp_writer(&self) -> Option<crossbeam_channel::Sender<RtpPacket>> {
+        self.inner
+            .lock()
+            .media_channels
+            .as_ref()
+            .map(|c| c.rtp_writer.tx.clone())
+    }
+
+    /// Returns the RTP reader receiver (post-jitter-buffer, reordered).
+    pub fn rtp_reader(&self) -> Option<crossbeam_channel::Receiver<RtpPacket>> {
+        self.inner
+            .lock()
+            .media_channels
+            .as_ref()
+            .map(|c| c.rtp_reader.rx.clone())
+    }
+
+    /// Returns the RTP raw reader receiver (pre-jitter-buffer, wire order).
+    pub fn rtp_raw_reader(&self) -> Option<crossbeam_channel::Receiver<RtpPacket>> {
+        self.inner
+            .lock()
+            .media_channels
+            .as_ref()
+            .map(|c| c.rtp_raw_reader.rx.clone())
+    }
+
+    /// Returns the PCM writer sender (for sending PCM samples for encoding + sending).
+    pub fn pcm_writer(&self) -> Option<crossbeam_channel::Sender<Vec<i16>>> {
+        self.inner
+            .lock()
+            .media_channels
+            .as_ref()
+            .map(|c| c.pcm_writer.tx.clone())
+    }
+
+    /// Returns the PCM reader receiver (decoded PCM from inbound RTP).
+    pub fn pcm_reader(&self) -> Option<crossbeam_channel::Receiver<Vec<i16>>> {
+        self.inner
+            .lock()
+            .media_channels
+            .as_ref()
+            .map(|c| c.pcm_reader.rx.clone())
+    }
 }
 
 #[cfg(test)]

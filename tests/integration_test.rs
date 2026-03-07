@@ -344,9 +344,48 @@ fn dtmf_send_receive() {
     p2.disconnect().unwrap();
 }
 
+/// E6: dial 9999 (echo), send silence RTP, verify we receive echoed RTP back.
 #[test]
-#[ignore = "requires RTP pipeline"]
 fn echo_test() {
-    // E6: dial 9999, send RTP, verify echo.
-    todo!()
+    let cfg = integration_phone_config("1001", &asterisk_password());
+    let p = Phone::new(cfg);
+    p.connect().unwrap();
+
+    let opts = xphone::config::DialOptions {
+        timeout: Duration::from_secs(10),
+        ..Default::default()
+    };
+    let call = p.dial("9999", opts).unwrap();
+    assert_eq!(call.state(), xphone::types::CallState::Active);
+
+    // Get media channels.
+    let rtp_writer = call.rtp_writer().expect("rtp_writer channel not available");
+    let rtp_reader = call.rtp_reader().expect("rtp_reader channel not available");
+
+    // Send silence via RTPWriter so Asterisk Echo() has something to reflect.
+    let silence = vec![0xFFu8; 160]; // PCMU silence
+    for i in 0..50 {
+        let pkt = xphone::types::RtpPacket {
+            header: xphone::types::RtpHeader {
+                version: 2,
+                payload_type: 0, // PCMU
+                sequence_number: i as u16,
+                timestamp: (i as u32) * 160,
+                ssrc: 0xDEADBEEF,
+                marker: false,
+            },
+            payload: silence.clone(),
+        };
+        let _ = rtp_writer.send(pkt);
+        std::thread::sleep(Duration::from_millis(20));
+    }
+
+    // Verify we receive echoed RTP back.
+    let pkt = rtp_reader
+        .recv_timeout(Duration::from_secs(5))
+        .expect("no echo response received");
+    assert!(!pkt.payload.is_empty());
+
+    call.end().unwrap();
+    p.disconnect().unwrap();
 }
