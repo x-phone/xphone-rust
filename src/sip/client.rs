@@ -5,6 +5,8 @@ use std::time::Duration;
 
 use parking_lot::Mutex;
 
+use tracing::{debug, info};
+
 use super::auth::{self, Credentials};
 use super::conn::Conn;
 use super::message::Message;
@@ -117,7 +119,9 @@ impl Client {
         let request_uri = format!("sip:{}", self.cfg.domain);
         let mut req = self.build_request("REGISTER", &request_uri, None);
 
+        debug!(method = "REGISTER", uri = %request_uri, server = %self.cfg.server_addr, "SIP >>> sending");
         let resp = self.tm.send(&mut req, self.cfg.server_addr, timeout)?;
+        debug!(method = "REGISTER", status = resp.status_code, reason = %resp.reason, "SIP <<< response");
         let branch = req.via_branch().to_string();
 
         // Handle 401 auth challenge.
@@ -137,13 +141,60 @@ impl Client {
             let mut extra = HashMap::new();
             extra.insert("Authorization".to_string(), auth_val);
             let mut retry = self.build_request("REGISTER", &request_uri, Some(&extra));
+            debug!(method = "REGISTER", "SIP >>> re-sending with auth");
             let resp = self.tm.send(&mut retry, self.cfg.server_addr, timeout)?;
+            info!(method = "REGISTER", status = resp.status_code, reason = %resp.reason, "SIP <<< auth response");
             let retry_branch = retry.via_branch().to_string();
             self.tm.remove_tx(&retry_branch);
             return Ok((resp.status_code, resp.reason.clone()));
         }
 
         self.tm.remove_tx(&branch);
+        Ok((resp.status_code, resp.reason.clone()))
+    }
+
+    /// Sends REGISTER with Expires: 0 to unregister from the server.
+    pub fn send_unregister(&self, timeout: Duration) -> Result<(u16, String)> {
+        if *self.closed.lock() {
+            return Err(Error::Other("sip: client closed".into()));
+        }
+
+        let request_uri = format!("sip:{}", self.cfg.domain);
+        let mut extra = HashMap::new();
+        extra.insert("Expires".to_string(), "0".to_string());
+        let mut req = self.build_request("REGISTER", &request_uri, Some(&extra));
+
+        info!("SIP >>> REGISTER Expires=0 (unregister)");
+        let resp = self.tm.send(&mut req, self.cfg.server_addr, timeout)?;
+        let branch = req.via_branch().to_string();
+
+        // Handle 401 auth challenge.
+        if resp.status_code == 401 {
+            self.tm.remove_tx(&branch);
+            let auth_hdr = resp.header("WWW-Authenticate");
+            let ch = match auth::parse_challenge(auth_hdr) {
+                Ok(ch) => ch,
+                Err(_) => return Ok((401, auth_hdr.to_string())),
+            };
+            let creds = Credentials {
+                username: self.cfg.username.clone(),
+                password: self.cfg.password.clone(),
+            };
+            let auth_val = auth::build_authorization(&ch, &creds, "REGISTER", &request_uri);
+
+            let mut extra2 = HashMap::new();
+            extra2.insert("Authorization".to_string(), auth_val);
+            extra2.insert("Expires".to_string(), "0".to_string());
+            let mut retry = self.build_request("REGISTER", &request_uri, Some(&extra2));
+            let resp = self.tm.send(&mut retry, self.cfg.server_addr, timeout)?;
+            info!(status = resp.status_code, "SIP <<< unregister response");
+            let retry_branch = retry.via_branch().to_string();
+            self.tm.remove_tx(&retry_branch);
+            return Ok((resp.status_code, resp.reason.clone()));
+        }
+
+        self.tm.remove_tx(&branch);
+        info!(status = resp.status_code, "SIP <<< unregister response");
         Ok((resp.status_code, resp.reason.clone()))
     }
 
@@ -177,7 +228,9 @@ impl Client {
 
         let mut req = self.build_invite_request(target_uri, sdp, None);
 
+        info!(method = "INVITE", target = %target_uri, server = %self.cfg.server_addr, "SIP >>> sending");
         let resp = self.tm.send(&mut req, self.cfg.server_addr, timeout)?;
+        debug!(method = "INVITE", status = resp.status_code, reason = %resp.reason, "SIP <<< response");
         let branch = req.via_branch().to_string();
 
         let (resp, branch, invite) = if resp.status_code == 401 || resp.status_code == 407 {
@@ -204,7 +257,9 @@ impl Client {
             let mut extra = HashMap::new();
             extra.insert(auth_resp_hdr.to_string(), auth_val);
             let mut retry = self.build_invite_request(target_uri, sdp, Some(&extra));
+            debug!(method = "INVITE", "SIP >>> re-sending with auth");
             let resp = self.tm.send(&mut retry, self.cfg.server_addr, timeout)?;
+            debug!(method = "INVITE", status = resp.status_code, reason = %resp.reason, "SIP <<< auth response");
             let branch = retry.via_branch().to_string();
             (resp, branch, retry)
         } else {
@@ -226,11 +281,13 @@ impl Client {
         let mut resp = first_resp;
 
         while (100..200).contains(&resp.status_code) {
+            debug!(status = resp.status_code, reason = %resp.reason, "SIP <<< provisional");
             provisionals.push((resp.status_code, resp.reason.clone()));
             resp = self.tm.read_response(branch, timeout)?;
         }
 
         if resp.status_code >= 200 && resp.status_code < 300 {
+            info!(status = resp.status_code, reason = %resp.reason, "SIP <<< final response, sending ACK");
             // Send ACK for 2xx.
             let ack = self.build_ack(&invite, &resp);
             self.tm.remove_tx(branch);
@@ -254,7 +311,9 @@ impl Client {
         if *self.closed.lock() {
             return Err(Error::Other("sip: client closed".into()));
         }
+        debug!(method = %req.method, "SIP >>> in-dialog request");
         let resp = self.tm.send(req, self.cfg.server_addr, timeout)?;
+        debug!(method = %req.method, status = resp.status_code, reason = %resp.reason, "SIP <<< in-dialog response");
         let branch = req.via_branch().to_string();
         self.tm.remove_tx(&branch);
         Ok(resp)
@@ -266,6 +325,7 @@ impl Client {
             return Err(Error::Other("sip: client closed".into()));
         }
 
+        debug!(method = "re-INVITE", "SIP >>> in-dialog re-INVITE");
         let invite_clone = req.clone();
         let resp = self.tm.send(req, self.cfg.server_addr, timeout)?;
         let branch = req.via_branch().to_string();

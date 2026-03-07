@@ -2,6 +2,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use parking_lot::Mutex;
+use tracing::{debug, info, warn};
 
 use crate::config::Config;
 use crate::error::{Error, Result};
@@ -89,8 +90,20 @@ impl Registry {
         Ok(())
     }
 
-    /// Stops the background loop and transitions to Disconnected.
+    /// Stops the background loop, sends unregister, and transitions to Disconnected.
     pub fn stop(&self) {
+        // Send REGISTER Expires=0 to unregister before tearing down.
+        {
+            let inner = self.inner.lock();
+            if inner.state == PhoneState::Registered {
+                drop(inner);
+                info!("unregistering from server");
+                if let Err(e) = self.tr.unregister(Duration::from_secs(5)) {
+                    warn!(error = %e, "unregister failed");
+                }
+            }
+        }
+
         let rereg_handle = {
             let mut inner = self.inner.lock();
             inner.state = PhoneState::Disconnected;
@@ -138,22 +151,27 @@ impl Registry {
     fn register(&self) -> Result<()> {
         for attempt in 0..self.cfg.register_max_retry {
             if attempt > 0 {
-                // Check if stopped before sleeping.
+                debug!(attempt, "REGISTER retry after delay");
                 if self.inner.lock().stopped {
                     return Err(Error::Other("registry stopped".into()));
                 }
                 std::thread::sleep(self.cfg.register_retry);
             }
 
+            info!(attempt, "REGISTER attempt");
             let result = self
                 .tr
                 .send_request("REGISTER", None, self.cfg.register_expiry);
             let msg = match result {
                 Ok(m) => m,
-                Err(_) => continue,
+                Err(ref e) => {
+                    warn!(attempt, error = %e, "REGISTER failed");
+                    continue;
+                }
             };
 
             if msg.status_code == 200 {
+                info!("REGISTER success — registered");
                 let cb = {
                     let mut inner = self.inner.lock();
                     inner.state = PhoneState::Registered;
@@ -167,6 +185,10 @@ impl Registry {
         }
 
         // All retries exhausted.
+        warn!(
+            max_retry = self.cfg.register_max_retry,
+            "REGISTER failed — all retries exhausted"
+        );
         let cb = {
             let mut inner = self.inner.lock();
             inner.state = PhoneState::RegistrationFailed;
@@ -187,6 +209,7 @@ impl Drop for Registry {
 
 /// Called when the transport connection drops.
 fn handle_drop(inner: &Arc<Mutex<Inner>>, tr: &Arc<dyn SipTransport>, cfg: &Config) {
+    warn!("transport drop detected — attempting re-registration");
     let (cb, should_reregister) = {
         let mut guard = inner.lock();
         if guard.state == PhoneState::Disconnected || guard.reregistering || guard.stopped {

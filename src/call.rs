@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
+use tracing::info;
 
 use crate::config::DialOptions;
 use crate::dialog::Dialog;
@@ -450,10 +451,12 @@ impl Call {
     // --- Actions ---
 
     pub fn accept(self: &Arc<Self>) -> Result<()> {
+        info!(call_id = %self.call_id(), "Call accepting");
         let on_media_fn;
         {
             let mut inner = self.inner.lock();
             if inner.state != CallState::Ringing {
+                info!(state = ?inner.state, "Call accept rejected — not in Ringing state");
                 return Err(Error::InvalidState);
             }
 
@@ -702,12 +705,20 @@ impl Call {
         if inner.state == CallState::Ended {
             return;
         }
+        // If the call was still ringing (not yet accepted), treat as Cancelled.
+        let reason = if inner.state == CallState::Ringing {
+            info!(call_id = %self.dlg.call_id(), state = ?inner.state, "Call cancelled by remote (BYE/CANCEL while ringing)");
+            EndReason::Cancelled
+        } else {
+            info!(call_id = %self.dlg.call_id(), state = ?inner.state, "Call ended by remote BYE");
+            EndReason::Remote
+        };
         inner.state = CallState::Ended;
         if let Some(ref mut h) = inner.media_handle {
             h.stop();
         }
         Self::fire_on_state(&inner, CallState::Ended);
-        Self::fire_on_ended(&inner, EndReason::Remote);
+        Self::fire_on_ended(&inner, reason);
     }
 
     pub fn simulate_reinvite(&self, raw_sdp: &str) {

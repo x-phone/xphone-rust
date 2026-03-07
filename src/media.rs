@@ -5,6 +5,7 @@ use std::time::{Duration, Instant};
 
 use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 use parking_lot::Mutex;
+use tracing::{debug, warn};
 
 use crate::codec::{self, CodecProcessor};
 use crate::dtmf;
@@ -266,8 +267,10 @@ pub fn start_media(
         let inbound_tx = channels.rtp_inbound.tx.clone();
         let inbound_rx = channels.rtp_inbound.rx.clone();
         let done = reader_done_rx;
+        debug!("media: starting UDP reader thread");
         std::thread::spawn(move || {
             let mut buf = [0u8; 2048];
+            let mut pkt_count: u64 = 0;
             loop {
                 if done.try_recv().is_ok() {
                     return;
@@ -278,6 +281,17 @@ pub fn start_media(
                             continue;
                         }
                         if let Some(pkt) = RtpPacket::parse(&buf[..n]) {
+                            pkt_count += 1;
+                            if pkt_count <= 3 || pkt_count.is_multiple_of(500) {
+                                debug!(
+                                    pt = pkt.header.payload_type,
+                                    seq = pkt.header.sequence_number,
+                                    ssrc = pkt.header.ssrc,
+                                    len = n,
+                                    total = pkt_count,
+                                    "media: RTP recv"
+                                );
+                            }
                             send_drop_oldest(&inbound_tx, &inbound_rx, pkt);
                         }
                     }
@@ -321,16 +335,33 @@ pub fn start_media(
 
                     // DTMF intercept: PT=101 before jitter buffer.
                     if pkt.header.payload_type == dtmf::DTMF_PAYLOAD_TYPE {
+                        debug!(
+                            seq = pkt.header.sequence_number,
+                            ts = pkt.header.timestamp,
+                            payload_len = pkt.payload.len(),
+                            "media: DTMF RTP packet (PT=101)"
+                        );
                         if let Some(ev) = dtmf::decode_dtmf(&pkt.payload) {
+                            debug!(
+                                digit = %ev.digit,
+                                end = ev.end,
+                                duration = ev.duration,
+                                "media: DTMF event decoded"
+                            );
                             if ev.end && !(last_dtmf_seen && pkt.header.timestamp == last_dtmf_timestamp) {
                                 last_dtmf_timestamp = pkt.header.timestamp;
                                 last_dtmf_seen = true;
                                 let cb = shared.on_dtmf_fn.lock().clone();
                                 if let Some(f) = cb {
+                                    debug!(digit = %ev.digit, "media: firing DTMF callback");
                                     let digit = ev.digit.clone();
                                     std::thread::spawn(move || f(digit));
+                                } else {
+                                    warn!(digit = %ev.digit, "media: DTMF received but no callback registered");
                                 }
                             }
+                        } else {
+                            warn!(payload = ?pkt.payload, "media: failed to decode DTMF payload");
                         }
                         last_rtp_time = Instant::now();
                         continue;
@@ -352,6 +383,7 @@ pub fn start_media(
                             last_rtp_time = Instant::now();
                         } else {
                             // Fire timeout.
+                            warn!(elapsed_ms = last_rtp_time.elapsed().as_millis(), "media: timeout — no RTP received");
                             *state = CallState::Ended;
                             drop(state);
                             let on_state = shared.on_state_fn.lock().clone();

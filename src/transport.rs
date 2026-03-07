@@ -59,6 +59,11 @@ pub trait SipTransport: Send + Sync {
     /// Arg: Call-ID of the terminated dialog.
     fn on_bye(&self, _f: Box<dyn Fn(String) + Send + Sync>) {}
 
+    /// Sends REGISTER with Expires: 0 to unregister.
+    fn unregister(&self, _timeout: Duration) -> Result<()> {
+        Ok(())
+    }
+
     /// Closes the transport.
     fn close(&self) -> Result<()>;
 }

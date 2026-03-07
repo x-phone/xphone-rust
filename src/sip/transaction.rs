@@ -6,6 +6,8 @@ use std::time::Duration;
 use crossbeam_channel::{bounded, Receiver, Sender};
 use parking_lot::Mutex;
 
+use tracing::{debug, warn};
+
 use super::conn::{Conn, WriteConn};
 use super::message::{self, Message};
 use crate::error::{Error, Result};
@@ -214,28 +216,49 @@ fn read_loop(mut conn: Conn, inner: Arc<Mutex<Inner>>, done_rx: Receiver<()>) {
             Err(_) => continue, // timeout or error — loop again
         };
 
+        debug!(len = data.len(), from = %addr, "SIP recv raw packet");
+
         let msg = match message::parse(&data) {
             Ok(m) => m,
-            Err(_) => continue,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    from = %addr,
+                    len = data.len(),
+                    preview = %String::from_utf8_lossy(&data[..data.len().min(120)]),
+                    "SIP parse failed — dropping packet"
+                );
+                continue;
+            }
         };
 
         if !msg.is_response() {
+            debug!(method = %msg.method, from = %addr, "SIP dispatching incoming request");
             // Dispatch incoming request to callback.
             let cb = inner.lock().on_request.clone();
             if let Some(cb) = cb {
                 cb(msg, addr);
+            } else {
+                warn!(method = %msg.method, "SIP incoming request but no callback registered");
             }
             continue;
         }
 
         let branch = msg.via_branch().to_string();
         if branch.is_empty() {
+            warn!(
+                status = msg.status_code,
+                "SIP response with empty Via branch — dropping"
+            );
             continue;
         }
 
+        debug!(status = msg.status_code, branch = %branch, "SIP dispatching response to transaction");
         let inner = inner.lock();
         if let Some(tx) = inner.pending.get(&branch) {
             let _ = tx.resp_tx.try_send(msg);
+        } else {
+            debug!(branch = %branch, "SIP no pending transaction for branch (stale response)");
         }
     }
 }
@@ -302,7 +325,7 @@ mod tests {
         let server_addr = server_conn.local_addr().unwrap();
 
         let client_conn = Conn::listen("127.0.0.1:0").unwrap();
-        let mut tm = TransactionManager::new(client_conn);
+        let tm = TransactionManager::new(client_conn);
 
         // Spawn a thread that reads from the server and sends a 200 OK back.
         let handle = std::thread::spawn(move || {
@@ -337,7 +360,7 @@ mod tests {
     fn transaction_timeout() {
         let conn = Conn::listen("127.0.0.1:0").unwrap();
         let dst: SocketAddr = "127.0.0.1:19999".parse().unwrap();
-        let mut tm = TransactionManager::new(conn);
+        let tm = TransactionManager::new(conn);
 
         let mut req = Message::new_request("REGISTER", "sip:pbx.local");
         req.set_header("Call-ID", "timeout-test@host");
@@ -359,7 +382,7 @@ mod tests {
     fn send_after_stop_returns_error() {
         let conn = Conn::listen("127.0.0.1:0").unwrap();
         let dst: SocketAddr = "127.0.0.1:19999".parse().unwrap();
-        let mut tm = TransactionManager::new(conn);
+        let tm = TransactionManager::new(conn);
 
         tm.stop();
 
@@ -376,7 +399,7 @@ mod tests {
         let server_conn = Conn::listen("127.0.0.1:0").unwrap();
         let server_addr = server_conn.local_addr().unwrap();
 
-        let mut tm = TransactionManager::new(server_conn);
+        let tm = TransactionManager::new(server_conn);
 
         let received = Arc::new(Mutex::new(Vec::new()));
         let received_clone = Arc::clone(&received);

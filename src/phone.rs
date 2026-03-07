@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
+use tracing::{info, warn};
 
 use crate::call::Call;
 use crate::config::{Config, DialOptions};
@@ -22,9 +23,15 @@ struct Inner {
     on_registered_fn: Option<Arc<dyn Fn() + Send + Sync>>,
     on_unregistered_fn: Option<Arc<dyn Fn() + Send + Sync>>,
     on_error_fn: Option<Arc<dyn Fn(Error) + Send + Sync>>,
+
+    // Phone-level call callbacks — auto-wired to every new call.
+    on_call_state_fn: Option<Arc<dyn Fn(crate::types::CallState) + Send + Sync>>,
+    on_call_ended_fn: Option<Arc<dyn Fn(crate::types::EndReason) + Send + Sync>>,
+    on_call_dtmf_fn: Option<Arc<dyn Fn(String) + Send + Sync>>,
 }
 
 /// Phone orchestrates SIP registration, call tracking, and incoming/outgoing calls.
+#[derive(Clone)]
 pub struct Phone {
     cfg: Config,
     inner: Arc<Mutex<Inner>>,
@@ -43,6 +50,9 @@ impl Phone {
                 on_registered_fn: None,
                 on_unregistered_fn: None,
                 on_error_fn: None,
+                on_call_state_fn: None,
+                on_call_ended_fn: None,
+                on_call_dtmf_fn: None,
             })),
         }
     }
@@ -50,12 +60,15 @@ impl Phone {
     /// Connects to the SIP server using the configured transport.
     /// Creates a real SipUA, performs registration, and wires up incoming INVITE handling.
     pub fn connect(&self) -> crate::error::Result<()> {
+        info!(host = %self.cfg.host, port = self.cfg.port, user = %self.cfg.username, "Phone connecting");
         let tr = Arc::new(crate::sip::ua::SipUA::new(&self.cfg)?);
         self.connect_with_transport(tr);
         let state = self.state();
         if state == PhoneState::Registered {
+            info!("Phone connected and registered");
             Ok(())
         } else {
+            warn!("Phone registration failed");
             Err(crate::error::Error::RegistrationFailed)
         }
     }
@@ -132,6 +145,7 @@ impl Phone {
 
     /// Disconnects the phone: stops registry and closes transport.
     pub fn disconnect(&self) -> Result<()> {
+        info!("Phone disconnecting");
         let (reg, tr, unreg_fn) = {
             let mut inner = self.inner.lock();
             if inner.state == PhoneState::Disconnected {
@@ -159,6 +173,7 @@ impl Phone {
 
     /// Initiates an outbound call.
     pub fn dial(&self, target: &str, opts: DialOptions) -> Result<Arc<Call>> {
+        info!(target = %target, "Phone dialing");
         let tr = {
             let inner = self.inner.lock();
             if inner.state != PhoneState::Registered {
@@ -203,6 +218,8 @@ impl Phone {
                 if !remote_sdp.is_empty() {
                     call.set_remote_sdp(&remote_sdp);
                 }
+                // Wire phone-level callbacks BEFORE simulate_response fires on_state.
+                wire_phone_call_callbacks(&self.inner, &call);
                 call.simulate_response(200, "OK");
                 (call, Vec::new())
             }
@@ -220,6 +237,8 @@ impl Phone {
 
                 let dlg = Arc::new(MockDialog::new());
                 let call = Call::new_outbound(dlg as Arc<dyn Dialog>, opts);
+                // Wire phone-level callbacks BEFORE replay.
+                wire_phone_call_callbacks(&self.inner, &call);
                 (call, responses)
             }
             Err(e) => return Err(e),
@@ -298,6 +317,26 @@ impl Phone {
         self.inner.lock().state
     }
 
+    /// Returns the configured SIP server host.
+    pub fn host(&self) -> &str {
+        &self.cfg.host
+    }
+
+    /// Sets a callback that fires for every call state change (all calls).
+    pub fn on_call_state<F: Fn(crate::types::CallState) + Send + Sync + 'static>(&self, f: F) {
+        self.inner.lock().on_call_state_fn = Some(Arc::new(f));
+    }
+
+    /// Sets a callback that fires when any call ends.
+    pub fn on_call_ended<F: Fn(crate::types::EndReason) + Send + Sync + 'static>(&self, f: F) {
+        self.inner.lock().on_call_ended_fn = Some(Arc::new(f));
+    }
+
+    /// Sets a callback that fires for DTMF digits received on any call.
+    pub fn on_call_dtmf<F: Fn(String) + Send + Sync + 'static>(&self, f: F) {
+        self.inner.lock().on_call_dtmf_fn = Some(Arc::new(f));
+    }
+
     /// Looks up an active call by dialog ID.
     pub fn find_call(&self, call_id: &str) -> Option<Arc<Call>> {
         self.inner.lock().calls.get(call_id).cloned()
@@ -363,6 +402,24 @@ fn handle_incoming(inner: &Arc<Mutex<Inner>>, from: &str, to: &str) {
 
 /// Handles an incoming INVITE with a real SIP dialog (production path).
 #[allow(clippy::too_many_arguments)]
+/// Wire phone-level call callbacks onto an individual call.
+fn wire_phone_call_callbacks(inner: &Arc<Mutex<Inner>>, call: &Arc<Call>) {
+    let locked = inner.lock();
+    if let Some(ref f) = locked.on_call_state_fn {
+        let f = Arc::clone(f);
+        call.on_state(move |s| f(s));
+    }
+    if let Some(ref f) = locked.on_call_ended_fn {
+        let f = Arc::clone(f);
+        call.on_ended(move |r| f(r));
+    }
+    if let Some(ref f) = locked.on_call_dtmf_fn {
+        let f = Arc::clone(f);
+        call.on_dtmf(move |d| f(d));
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn handle_dialog_incoming(
     inner: &Arc<Mutex<Inner>>,
     dlg: Arc<dyn Dialog>,
@@ -373,6 +430,7 @@ fn handle_dialog_incoming(
     rtp_port_min: u16,
     rtp_port_max: u16,
 ) {
+    info!(from = _from, to = _to, "Phone handling incoming INVITE");
     let incoming_fn = inner.lock().incoming.clone();
 
     // Allocate an RTP socket for this call.
@@ -402,6 +460,9 @@ fn handle_dialog_incoming(
         inner_clone.lock().calls.remove(&call_id);
     });
 
+    // Wire phone-level callbacks before anything fires.
+    wire_phone_call_callbacks(inner, &call);
+
     // Track the call.
     inner.lock().calls.insert(call.call_id(), Arc::clone(&call));
 
@@ -416,9 +477,12 @@ fn handle_dialog_incoming(
 
 /// Handles an incoming BYE — looks up the call by Call-ID and simulates BYE.
 fn handle_bye(inner: &Arc<Mutex<Inner>>, call_id: &str) {
+    info!(call_id = %call_id, "Phone handling BYE");
     let call = inner.lock().calls.get(call_id).cloned();
     if let Some(call) = call {
         call.simulate_bye();
+    } else {
+        warn!(call_id = %call_id, "Phone BYE for unknown call");
     }
 }
 

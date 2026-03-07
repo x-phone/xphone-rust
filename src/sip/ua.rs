@@ -4,6 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use parking_lot::Mutex;
+use tracing::{debug, info};
 
 use super::client::{Client, ClientConfig};
 use super::dialog::{build_sip_response, SipDialogUAC, SipDialogUAS};
@@ -80,16 +81,22 @@ fn handle_incoming_request(
     msg: &Message,
     from_addr: SocketAddr,
 ) {
+    debug!(method = %msg.method, from = %from_addr, "SIP <<< incoming request");
     match msg.method.as_str() {
         "INVITE" => handle_invite(inner, client, msg, from_addr),
         "BYE" => handle_bye(inner, client, msg, from_addr),
-        "ACK" => {} // ACK is handled implicitly
+        "CANCEL" => handle_cancel(inner, client, msg, from_addr),
+        "ACK" => {
+            debug!("SIP <<< ACK received");
+        }
         "OPTIONS" => {
-            // Respond 200 OK to OPTIONS keepalive probes.
+            debug!("SIP <<< OPTIONS keepalive, responding 200 OK");
             let resp = build_sip_response(msg, 200, "OK");
             let _ = client.send_raw_to(&resp.to_bytes(), from_addr);
         }
-        _ => {}
+        other => {
+            debug!(method = other, "SIP <<< unhandled request");
+        }
     }
 }
 
@@ -103,8 +110,11 @@ fn handle_invite(
     let to = msg.header("To").to_string();
     let remote_sdp = String::from_utf8_lossy(&msg.body).to_string();
 
+    info!(from = %from, to = %to, call_id = %msg.header("Call-ID"), "SIP <<< incoming INVITE");
+
     // Send 100 Trying immediately to stop INVITE retransmissions.
     let trying = build_sip_response(msg, 100, "Trying");
+    debug!("SIP >>> 100 Trying");
     let _ = client.send_raw_to(&trying.to_bytes(), from_addr);
 
     // Check for dialog-based handler first.
@@ -132,12 +142,46 @@ fn handle_bye(
     msg: &Message,
     from_addr: SocketAddr,
 ) {
+    let call_id = msg.header("Call-ID").to_string();
+    info!(call_id = %call_id, "SIP <<< BYE received");
+
     // Always respond 200 OK to BYE to stop retransmissions.
     let resp = build_sip_response(msg, 200, "OK");
+    debug!("SIP >>> 200 OK (BYE)");
     let _ = client.send_raw_to(&resp.to_bytes(), from_addr);
 
     // Fire BYE handler with Call-ID.
+    let cb = inner.lock().bye_handler.clone();
+    if let Some(f) = cb {
+        f(call_id);
+    }
+}
+
+fn handle_cancel(
+    inner: &Arc<Mutex<Inner>>,
+    client: &Arc<Client>,
+    msg: &Message,
+    from_addr: SocketAddr,
+) {
     let call_id = msg.header("Call-ID").to_string();
+    info!(call_id = %call_id, "SIP <<< CANCEL received");
+
+    // Respond 200 OK to CANCEL to stop retransmissions.
+    let resp = build_sip_response(msg, 200, "OK");
+    debug!("SIP >>> 200 OK (CANCEL)");
+    let _ = client.send_raw_to(&resp.to_bytes(), from_addr);
+
+    // Also send 487 Request Terminated for the original INVITE.
+    let mut terminated = build_sip_response(msg, 487, "Request Terminated");
+    // The 487 should use the original INVITE's CSeq, not the CANCEL's.
+    // Since CANCEL has the same Call-ID, branch, and CSeq method=INVITE,
+    // we can reconstruct it.
+    let (cseq_num, _) = msg.cseq();
+    terminated.set_header("CSeq", &format!("{} INVITE", cseq_num));
+    debug!("SIP >>> 487 Request Terminated");
+    let _ = client.send_raw_to(&terminated.to_bytes(), from_addr);
+
+    // Fire BYE handler with Call-ID to terminate the ringing call.
     let cb = inner.lock().bye_handler.clone();
     if let Some(f) = cb {
         f(call_id);
@@ -198,8 +242,13 @@ impl SipTransport for SipUA {
             format!("sip:{}@{}", target, self.client.domain())
         };
 
+        info!(target = %target_uri, "SIP >>> dialing");
         let result = self.client.send_invite(&target_uri, local_sdp, timeout)?;
         let remote_sdp = String::from_utf8_lossy(&result.response.body).to_string();
+        info!(
+            status = result.response.status_code,
+            "SIP <<< INVITE final response"
+        );
 
         let dlg = Arc::new(SipDialogUAC::new(
             Arc::clone(&self.client),
@@ -219,6 +268,11 @@ impl SipTransport for SipUA {
 
     fn on_bye(&self, f: Box<dyn Fn(String) + Send + Sync>) {
         self.inner.lock().bye_handler = Some(Arc::from(f));
+    }
+
+    fn unregister(&self, timeout: Duration) -> Result<()> {
+        let _ = self.client.send_unregister(timeout)?;
+        Ok(())
     }
 
     fn close(&self) -> Result<()> {
