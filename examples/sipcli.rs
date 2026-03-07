@@ -127,6 +127,7 @@ struct AppState {
     quitting: bool,
     echo_active: Arc<AtomicBool>,
     speaker_active: Arc<AtomicBool>,
+    mic_active: Arc<AtomicBool>,
     /// Command history (oldest first).
     history: Vec<String>,
     /// Current position in history (None = not browsing).
@@ -149,6 +150,7 @@ impl AppState {
             quitting: false,
             echo_active: Arc::new(AtomicBool::new(false)),
             speaker_active: Arc::new(AtomicBool::new(true)),
+            mic_active: Arc::new(AtomicBool::new(false)),
             history: Vec::new(),
             history_pos: None,
             history_draft: String::new(),
@@ -355,10 +357,12 @@ fn wire_call_events(call: &Arc<Call>, state: &SharedState) {
 /// Start the audio handler thread. Reads decoded PCM from the call and:
 /// - If echo is on: buffers ~200ms then writes back to pcm_writer (remote hears themselves)
 /// - If speaker is on: plays through default audio output device
+/// - If mic is on: captures from default input device and writes to pcm_writer
 fn start_audio_handler(
     call: &Arc<Call>,
     echo_flag: Arc<AtomicBool>,
     speaker_flag: Arc<AtomicBool>,
+    mic_flag: Arc<AtomicBool>,
 ) {
     let pcm_rx = match call.pcm_reader() {
         Some(rx) => rx,
@@ -383,6 +387,12 @@ fn start_audio_handler(
                 speaker_available = speaker_ctx.is_some(),
                 "audio: speaker stream ready"
             );
+
+            // Set up microphone input via cpal.
+            if let Some(ref tx) = pcm_tx {
+                setup_mic_stream(Arc::clone(&mic_flag), tx.clone());
+                tracing::info!("audio: mic stream ready");
+            }
 
             // Echo delay buffer: ~200ms at 20ms/frame = 10 frames.
             let echo_delay_frames = 10usize;
@@ -491,6 +501,84 @@ fn setup_speaker_stream(active: Arc<AtomicBool>) -> Option<(Arc<Mutex<VecDeque<f
     Some((ring_buf, ratio))
 }
 
+/// Set up cpal microphone input stream. Captures audio, downsamples to 8kHz mono,
+/// batches into 160-sample (20ms) frames, and sends via pcm_writer.
+fn setup_mic_stream(active: Arc<AtomicBool>, pcm_tx: crossbeam_channel::Sender<Vec<i16>>) {
+    let host = cpal::default_host();
+    let device = match host.default_input_device() {
+        Some(d) => d,
+        None => {
+            tracing::warn!("audio: no input device found — mic not available");
+            return;
+        }
+    };
+    let config = match device.default_input_config() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(
+                "audio: failed to get input config: {} — mic not available",
+                e
+            );
+            return;
+        }
+    };
+    let sample_rate = config.sample_rate().0 as usize;
+    let channels = config.channels() as usize;
+    let downsample_ratio = (sample_rate / 8000).max(1);
+
+    // Accumulator for batching into 160-sample frames (20ms at 8kHz).
+    const FRAME_SIZE: usize = 160;
+    let frame_buf: Arc<Mutex<Vec<i16>>> = Arc::new(Mutex::new(Vec::with_capacity(FRAME_SIZE)));
+
+    let buf_cb = Arc::clone(&frame_buf);
+    let stream = match device.build_input_stream(
+        &config.into(),
+        move |data: &[f32], _: &cpal::InputCallbackInfo| {
+            if !active.load(Ordering::Relaxed) {
+                return;
+            }
+            let mut buf = buf_cb.lock().unwrap();
+            // Process input: take one channel, downsample, convert to i16.
+            for chunk in data.chunks(channels * downsample_ratio) {
+                // Average the first sample of each channel in this chunk.
+                let mut sum = 0.0f32;
+                for ch in 0..channels.min(chunk.len()) {
+                    sum += chunk[ch];
+                }
+                let sample = sum / channels as f32;
+                let pcm = (sample * 32767.0).clamp(-32768.0, 32767.0) as i16;
+                buf.push(pcm);
+
+                if buf.len() >= FRAME_SIZE {
+                    let frame: Vec<i16> = buf.drain(..FRAME_SIZE).collect();
+                    let _ = pcm_tx.try_send(frame);
+                }
+            }
+        },
+        |err| {
+            tracing::error!("audio: mic stream error: {}", err);
+        },
+        None,
+    ) {
+        Ok(s) => s,
+        Err(e) => {
+            tracing::warn!(
+                "audio: failed to build input stream: {} — mic not available",
+                e
+            );
+            return;
+        }
+    };
+
+    if let Err(e) = stream.play() {
+        tracing::warn!("audio: failed to start input stream: {}", e);
+        return;
+    }
+
+    // Leak the stream so it stays alive (same pattern as speaker).
+    Box::leak(Box::new(stream));
+}
+
 fn call_state_name(s: CallState) -> String {
     match s {
         CallState::Idle => "idle".into(),
@@ -566,6 +654,7 @@ fn exec_command(state: &SharedState, phone: &Phone, input: &str) {
             let target = arg.clone();
             let echo_flag = Arc::clone(&state.lock().unwrap().echo_active);
             let speaker_flag = Arc::clone(&state.lock().unwrap().speaker_active);
+            let mic_flag = Arc::clone(&state.lock().unwrap().mic_active);
             std::thread::spawn(move || {
                 let opts = xphone::DialOptions {
                     timeout: Duration::from_secs(30),
@@ -578,6 +667,7 @@ fn exec_command(state: &SharedState, phone: &Phone, input: &str) {
                             &call,
                             Arc::clone(&echo_flag),
                             Arc::clone(&speaker_flag),
+                            Arc::clone(&mic_flag),
                         );
                         let mut st = s.lock().unwrap();
                         let short_id = &call.id()[..call.id().len().min(10)];
@@ -596,10 +686,11 @@ fn exec_command(state: &SharedState, phone: &Phone, input: &str) {
         "accept" | "a" => {
             let echo_flag = Arc::clone(&state.lock().unwrap().echo_active);
             let speaker_flag = Arc::clone(&state.lock().unwrap().speaker_active);
+            let mic_flag = Arc::clone(&state.lock().unwrap().mic_active);
             call_action(state, "accept", move |c| {
                 let result = c.accept();
                 if result.is_ok() {
-                    start_audio_handler(c, echo_flag, speaker_flag);
+                    start_audio_handler(c, echo_flag, speaker_flag, mic_flag);
                 }
                 result
             });
@@ -668,11 +759,20 @@ fn exec_command(state: &SharedState, phone: &Phone, input: &str) {
         "echo" => {
             let st = state.lock().unwrap();
             let flag = Arc::clone(&st.echo_active);
+            let mic = Arc::clone(&st.mic_active);
             let prev = flag.load(Ordering::Relaxed);
             flag.store(!prev, Ordering::Relaxed);
+            // Disable mic when echo is turned on (both feed pcm_writer).
+            if !prev {
+                mic.store(false, Ordering::Relaxed);
+            }
             drop(st);
             let label = if !prev { "ON" } else { "OFF" };
-            state.lock().unwrap().push_event(format!("echo: {}", label));
+            let mut st = state.lock().unwrap();
+            st.push_event(format!("echo: {}", label));
+            if !prev {
+                st.push_event("mic: OFF (echo takes priority)".into());
+            }
         }
 
         "speaker" => {
@@ -686,6 +786,25 @@ fn exec_command(state: &SharedState, phone: &Phone, input: &str) {
                 .lock()
                 .unwrap()
                 .push_event(format!("speaker: {}", label));
+        }
+
+        "mic" => {
+            let st = state.lock().unwrap();
+            let mic = Arc::clone(&st.mic_active);
+            let echo = Arc::clone(&st.echo_active);
+            let prev = mic.load(Ordering::Relaxed);
+            mic.store(!prev, Ordering::Relaxed);
+            // Disable echo when mic is turned on (both feed pcm_writer).
+            if !prev {
+                echo.store(false, Ordering::Relaxed);
+            }
+            drop(st);
+            let label = if !prev { "ON" } else { "OFF" };
+            let mut st = state.lock().unwrap();
+            st.push_event(format!("mic: {}", label));
+            if !prev {
+                st.push_event("echo: OFF (mic takes priority)".into());
+            }
         }
 
         _ => {
@@ -916,7 +1035,7 @@ fn draw(f: &mut ratatui::Frame, state: &SharedState) {
     };
 
     let help_text =
-        "dial(d) accept(a) reject hangup(h) hold resume mute unmute dtmf transfer(xfer) echo speaker quit(q)";
+        "dial(d) accept(a) reject hangup(h) hold resume mute unmute dtmf transfer(xfer) echo speaker mic quit(q)";
 
     let cmd_lines = vec![
         Line::from(vec![
