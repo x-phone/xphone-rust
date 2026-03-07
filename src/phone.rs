@@ -231,6 +231,7 @@ impl Phone {
                 // tr.dial() already consumed the 200 OK, so transition to Active.
                 let call = Call::new_outbound(dlg, opts);
                 call.set_local_media(&local_ip, rtp_port);
+                call.set_local_sdp(&local_sdp);
                 if let Some(ref key) = srtp_inline_key {
                     call.set_srtp(key);
                 }

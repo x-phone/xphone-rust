@@ -873,6 +873,11 @@ impl Call {
         inner.rtp_port = port;
     }
 
+    /// Stores the local SDP offer (outbound calls).
+    pub(crate) fn set_local_sdp(&self, sdp: &str) {
+        self.inner.lock().local_sdp = sdp.to_string();
+    }
+
     /// Sets the RTP socket for this call (production path).
     pub(crate) fn set_rtp_socket(&self, socket: UdpSocket) {
         self.inner.lock().rtp_socket = Some(Arc::new(socket));
