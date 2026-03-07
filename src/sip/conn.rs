@@ -100,4 +100,38 @@ mod tests {
         let result = conn.receive(Duration::from_millis(10));
         assert!(result.is_err());
     }
+
+    #[test]
+    fn large_message() {
+        let mut c1 = Conn::listen("127.0.0.1:0").unwrap();
+        let c2 = Conn::listen("127.0.0.1:0").unwrap();
+
+        let addr1 = c1.local_addr().unwrap();
+        // Build a large SIP-like message (~8KB body).
+        let body = "x".repeat(8000);
+        let msg = format!(
+            "SIP/2.0 200 OK\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        c2.send(msg.as_bytes(), addr1).unwrap();
+
+        let (data, _) = c1.receive(Duration::from_secs(1)).unwrap();
+        assert_eq!(data.len(), msg.len());
+    }
+
+    #[test]
+    fn write_conn_clone() {
+        let mut c1 = Conn::listen("127.0.0.1:0").unwrap();
+        let c2 = Conn::listen("127.0.0.1:0").unwrap();
+        let wc = c2.try_clone_write().unwrap();
+
+        let addr1 = c1.local_addr().unwrap();
+        wc.send(b"REGISTER sip:pbx\r\n\r\n", addr1).unwrap();
+
+        let (data, _) = c1.receive(Duration::from_secs(1)).unwrap();
+        assert_eq!(data, b"REGISTER sip:pbx\r\n\r\n");
+        // WriteConn and Conn share the same local address.
+        assert_eq!(wc.local_addr().unwrap(), c2.local_addr().unwrap());
+    }
 }
