@@ -278,7 +278,7 @@ fn fakepbx_outbound_dial_full() {
 
     // Wire phone-level callbacks (same pattern as sipcli).
     let (state_tx, state_rx) = crossbeam_channel::unbounded();
-    phone.on_call_state(move |cs| {
+    phone.on_call_state(move |_call_id, cs| {
         let _ = state_tx.send(cs);
     });
 

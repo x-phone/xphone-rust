@@ -320,10 +320,11 @@ fn wire_phone_events(phone: &Phone, state: &SharedState) {
 
     // Phone-level call callbacks — auto-wired to every call BEFORE state transitions.
     let s = Arc::clone(state);
-    phone.on_call_state(move |cs| {
+    phone.on_call_state(move |call_id, cs| {
+        let short = &call_id[..call_id.len().min(10)];
         let name = call_state_name(cs);
         let mut st = s.lock().unwrap();
-        st.push_event(format!("call: {}", name));
+        st.push_event(format!("[{}] {}", short, name));
         if cs == CallState::Ended {
             st.call_status = "idle".into();
             st.call_id.clear();
@@ -334,18 +335,20 @@ fn wire_phone_events(phone: &Phone, state: &SharedState) {
     });
 
     let s = Arc::clone(state);
-    phone.on_call_ended(move |reason| {
+    phone.on_call_ended(move |call_id, reason| {
+        let short = &call_id[..call_id.len().min(10)];
         let mut st = s.lock().unwrap();
-        st.push_event(format!("ended: {}", end_reason_name(reason)));
+        st.push_event(format!("[{}] ended: {}", short, end_reason_name(reason)));
         st.call_status = "idle".into();
         st.call_id.clear();
         st.call = None;
     });
 
     let s = Arc::clone(state);
-    phone.on_call_dtmf(move |digit| {
+    phone.on_call_dtmf(move |call_id, digit| {
+        let short = &call_id[..call_id.len().min(10)];
         let mut st = s.lock().unwrap();
-        st.push_event(format!("DTMF recv: {}", digit));
+        st.push_event(format!("[{}] DTMF recv: {}", short, digit));
     });
 
     let s = Arc::clone(state);
@@ -372,16 +375,20 @@ fn wire_phone_events(phone: &Phone, state: &SharedState) {
 
 /// Wire per-call callbacks that are only needed after the call is established.
 fn wire_call_events(call: &Arc<Call>, state: &SharedState) {
+    let short = call.id()[..call.id().len().min(10)].to_string();
+
     let s = Arc::clone(state);
+    let sid = short.clone();
     call.on_hold(move || {
         let mut st = s.lock().unwrap();
-        st.push_event("held by remote".into());
+        st.push_event(format!("[{}] held by remote", sid));
     });
 
     let s = Arc::clone(state);
+    let sid = short;
     call.on_resume(move || {
         let mut st = s.lock().unwrap();
-        st.push_event("resumed by remote".into());
+        st.push_event(format!("[{}] resumed by remote", sid));
     });
 }
 

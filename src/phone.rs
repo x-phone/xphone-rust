@@ -25,9 +25,10 @@ struct Inner {
     on_error_fn: Option<Arc<dyn Fn(Error) + Send + Sync>>,
 
     // Phone-level call callbacks — auto-wired to every new call.
-    on_call_state_fn: Option<Arc<dyn Fn(crate::types::CallState) + Send + Sync>>,
-    on_call_ended_fn: Option<Arc<dyn Fn(crate::types::EndReason) + Send + Sync>>,
-    on_call_dtmf_fn: Option<Arc<dyn Fn(String) + Send + Sync>>,
+    // Each receives (call_id, payload) so the consumer can distinguish concurrent calls.
+    on_call_state_fn: Option<Arc<dyn Fn(String, crate::types::CallState) + Send + Sync>>,
+    on_call_ended_fn: Option<Arc<dyn Fn(String, crate::types::EndReason) + Send + Sync>>,
+    on_call_dtmf_fn: Option<Arc<dyn Fn(String, String) + Send + Sync>>,
 }
 
 /// Phone orchestrates SIP registration, call tracking, and incoming/outgoing calls.
@@ -352,17 +353,26 @@ impl Phone {
     }
 
     /// Sets a callback that fires for every call state change (all calls).
-    pub fn on_call_state<F: Fn(crate::types::CallState) + Send + Sync + 'static>(&self, f: F) {
+    /// Receives `(call_id, state)`.
+    pub fn on_call_state<F: Fn(String, crate::types::CallState) + Send + Sync + 'static>(
+        &self,
+        f: F,
+    ) {
         self.inner.lock().on_call_state_fn = Some(Arc::new(f));
     }
 
     /// Sets a callback that fires when any call ends.
-    pub fn on_call_ended<F: Fn(crate::types::EndReason) + Send + Sync + 'static>(&self, f: F) {
+    /// Receives `(call_id, reason)`.
+    pub fn on_call_ended<F: Fn(String, crate::types::EndReason) + Send + Sync + 'static>(
+        &self,
+        f: F,
+    ) {
         self.inner.lock().on_call_ended_fn = Some(Arc::new(f));
     }
 
     /// Sets a callback that fires for DTMF digits received on any call.
-    pub fn on_call_dtmf<F: Fn(String) + Send + Sync + 'static>(&self, f: F) {
+    /// Receives `(call_id, digit)`.
+    pub fn on_call_dtmf<F: Fn(String, String) + Send + Sync + 'static>(&self, f: F) {
         self.inner.lock().on_call_dtmf_fn = Some(Arc::new(f));
     }
 
@@ -434,17 +444,20 @@ fn handle_incoming(inner: &Arc<Mutex<Inner>>, from: &str, to: &str) {
 /// Wire phone-level call callbacks onto an individual call.
 fn wire_phone_call_callbacks(inner: &Arc<Mutex<Inner>>, call: &Arc<Call>) {
     let locked = inner.lock();
+    let cid = call.call_id();
     if let Some(ref f) = locked.on_call_state_fn {
         let f = Arc::clone(f);
-        call.on_state(move |s| f(s));
+        let cid = cid.clone();
+        call.on_state(move |s| f(cid.clone(), s));
     }
     if let Some(ref f) = locked.on_call_ended_fn {
         let f = Arc::clone(f);
-        call.on_ended(move |r| f(r));
+        let cid = cid.clone();
+        call.on_ended(move |r| f(cid.clone(), r));
     }
     if let Some(ref f) = locked.on_call_dtmf_fn {
         let f = Arc::clone(f);
-        call.on_dtmf(move |d| f(d));
+        call.on_dtmf(move |d| f(cid.clone(), d));
     }
 }
 
