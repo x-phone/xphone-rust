@@ -707,7 +707,7 @@ impl Call {
                 Self::fire_on_ended(&inner, EndReason::Transfer);
             }
         }));
-        let _ = self.dlg.send_refer(target);
+        self.dlg.send_refer(target)?;
         Ok(())
     }
 

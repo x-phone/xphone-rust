@@ -14,6 +14,16 @@ use crate::error::{Error, Result};
 
 const SIP_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Normalizes a transfer target to a SIP URI.
+/// "1003" → "sip:1003@domain", "sip:1003@pbx" → "sip:1003@pbx"
+fn normalize_sip_uri(target: &str, domain: &str) -> String {
+    if target.starts_with("sip:") || target.starts_with("sips:") {
+        target.to_string()
+    } else {
+        format!("sip:{}@{}", target, domain)
+    }
+}
+
 /// Extracts the URI from a Contact/From/To header value.
 /// e.g. `<sip:1001@10.0.0.1:5060>` -> `sip:1001@10.0.0.1:5060`
 fn extract_uri(header_val: &str) -> String {
@@ -164,8 +174,9 @@ impl Dialog for SipDialogUAC {
     }
 
     fn send_refer(&self, target: &str) -> Result<()> {
+        let refer_to = normalize_sip_uri(target, self.client.domain());
         let mut req = self.build_request("REFER");
-        req.set_header("Refer-To", target);
+        req.set_header("Refer-To", &refer_to);
         let _ = self.client.send_dialog_request(&mut req, SIP_TIMEOUT)?;
         Ok(())
     }
@@ -379,8 +390,9 @@ impl Dialog for SipDialogUAS {
     }
 
     fn send_refer(&self, target: &str) -> Result<()> {
+        let refer_to = normalize_sip_uri(target, self.client.domain());
         let mut req = self.build_request("REFER");
-        req.set_header("Refer-To", target);
+        req.set_header("Refer-To", &refer_to);
         let _ = self.client.send_dialog_request(&mut req, SIP_TIMEOUT)?;
         Ok(())
     }
