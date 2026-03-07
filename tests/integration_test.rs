@@ -1,8 +1,14 @@
 //! Integration tests against a running Asterisk instance.
 //!
 //! Start with: cd testutil/docker && docker compose up -d
-//! Run with:   cargo test --features integration --test integration_test -- --nocapture --test-threads=1
+//! Run with:   LOCAL_IP=192.168.65.254 cargo test --features integration --test integration_test -- --nocapture --test-threads=1
 //! Stop with:  cd testutil/docker && docker compose down
+//!
+//! Environment variables:
+//!   ASTERISK_HOST     — SIP server address (default: 127.0.0.1)
+//!   ASTERISK_PORT     — SIP server port (default: 5160)
+//!   ASTERISK_PASSWORD — Extension password (default: test)
+//!   LOCAL_IP          — Local IP for SDP (required for Docker on macOS: 192.168.65.254)
 //!
 //! These tests are gated behind the `integration` feature flag so they
 //! never run during normal `cargo test`.
@@ -19,11 +25,28 @@ fn asterisk_host() -> String {
     std::env::var("ASTERISK_HOST").unwrap_or_else(|_| "127.0.0.1".into())
 }
 
+fn asterisk_password() -> String {
+    std::env::var("ASTERISK_PASSWORD").unwrap_or_else(|_| "test".into())
+}
+
+fn asterisk_port() -> u16 {
+    std::env::var("ASTERISK_PORT")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(5160)
+}
+
+/// Local IP to advertise in SDP, overridable for Docker-on-macOS.
+fn local_ip_override() -> Option<String> {
+    std::env::var("LOCAL_IP").ok()
+}
+
 fn integration_client_config(ext: &str, password: &str) -> ClientConfig {
     let host = asterisk_host();
+    let port = asterisk_port();
     ClientConfig {
         local_addr: "0.0.0.0:0".into(),
-        server_addr: format!("{}:5060", host).parse().unwrap(),
+        server_addr: format!("{}:{}", host, port).parse().unwrap(),
         username: ext.into(),
         password: password.into(),
         domain: host,
@@ -35,7 +58,8 @@ fn integration_phone_config(ext: &str, password: &str) -> Config {
         username: ext.into(),
         password: password.into(),
         host: asterisk_host(),
-        port: 5060,
+        port: asterisk_port(),
+        local_ip: local_ip_override().unwrap_or_default(),
         register_expiry: Duration::from_secs(10),
         register_retry: Duration::from_secs(1),
         register_max_retry: 3,
@@ -51,7 +75,7 @@ fn integration_phone_config(ext: &str, password: &str) -> Config {
 /// Register extension 1001 with Asterisk using raw SIP client.
 #[test]
 fn register_1001_raw() {
-    let cfg = integration_client_config("1001", "test");
+    let cfg = integration_client_config("1001", &asterisk_password());
     let client = Client::new(cfg).unwrap();
 
     let (code, reason) = client.send_register(Duration::from_secs(5)).unwrap();
@@ -63,7 +87,7 @@ fn register_1001_raw() {
 /// Register extension 1002 with Asterisk using raw SIP client.
 #[test]
 fn register_1002_raw() {
-    let cfg = integration_client_config("1002", "test");
+    let cfg = integration_client_config("1002", &asterisk_password());
     let client = Client::new(cfg).unwrap();
 
     let (code, reason) = client.send_register(Duration::from_secs(5)).unwrap();
@@ -90,7 +114,7 @@ fn register_wrong_password() {
 /// NAT keepalive should not error.
 #[test]
 fn keepalive() {
-    let cfg = integration_client_config("1001", "test");
+    let cfg = integration_client_config("1001", &asterisk_password());
     let client = Client::new(cfg).unwrap();
 
     let (code, _) = client.send_register(Duration::from_secs(5)).unwrap();
@@ -105,7 +129,7 @@ fn keepalive() {
 /// Register extension 1001 via the full Phone::connect() path.
 #[test]
 fn phone_connect_and_disconnect() {
-    let cfg = integration_phone_config("1001", "test");
+    let cfg = integration_phone_config("1001", &asterisk_password());
     let phone = Phone::new(cfg);
 
     phone.connect().unwrap();
@@ -130,8 +154,8 @@ fn phone_connect_wrong_password() {
 /// E2: p1 (1001) dials p2 (1002), p2 accepts, p1 ends call.
 #[test]
 fn dial_between_extensions() {
-    let cfg1 = integration_phone_config("1001", "test");
-    let cfg2 = integration_phone_config("1002", "test");
+    let cfg1 = integration_phone_config("1001", &asterisk_password());
+    let cfg2 = integration_phone_config("1002", &asterisk_password());
 
     let p1 = Phone::new(cfg1);
     let p2 = Phone::new(cfg2);
@@ -176,8 +200,8 @@ fn dial_between_extensions() {
 /// E3: p1 dials p2, p2 accepts, p1 sends BYE, p2 sees EndedByRemote.
 #[test]
 fn inbound_accept_and_remote_bye() {
-    let cfg1 = integration_phone_config("1001", "test");
-    let cfg2 = integration_phone_config("1002", "test");
+    let cfg1 = integration_phone_config("1001", &asterisk_password());
+    let cfg2 = integration_phone_config("1002", &asterisk_password());
 
     let p1 = Phone::new(cfg1);
     let p2 = Phone::new(cfg2);
@@ -220,8 +244,8 @@ fn inbound_accept_and_remote_bye() {
 /// E4: p1 dials p2, p2 accepts, p1 holds, p1 resumes, p1 ends.
 #[test]
 fn hold_resume() {
-    let cfg1 = integration_phone_config("1001", "test");
-    let cfg2 = integration_phone_config("1002", "test");
+    let cfg1 = integration_phone_config("1001", &asterisk_password());
+    let cfg2 = integration_phone_config("1002", &asterisk_password());
 
     let p1 = Phone::new(cfg1);
     let p2 = Phone::new(cfg2);
@@ -264,11 +288,60 @@ fn hold_resume() {
     p2.disconnect().unwrap();
 }
 
+/// E5: p1 dials p2, p2 sends DTMF "5", p1 receives it via OnDTMF.
 #[test]
-#[ignore = "requires RTP/DTMF pipeline"]
 fn dtmf_send_receive() {
-    // E5: establish call, send DTMF from p2, receive on p1.
-    todo!()
+    let cfg1 = integration_phone_config("1001", &asterisk_password());
+    let cfg2 = integration_phone_config("1002", &asterisk_password());
+
+    let p1 = Phone::new(cfg1);
+    let p2 = Phone::new(cfg2);
+
+    p1.connect().unwrap();
+    p2.connect().unwrap();
+
+    // Set up p2 to auto-accept incoming calls.
+    let (call_tx, call_rx) = crossbeam_channel::bounded(1);
+    p2.on_incoming(move |call| {
+        call.accept().unwrap();
+        let _ = call_tx.send(call);
+    });
+
+    // p1 dials p2.
+    let opts = xphone::config::DialOptions {
+        timeout: Duration::from_secs(10),
+        ..Default::default()
+    };
+    let call1 = p1.dial("1002", opts).unwrap();
+
+    // Wait for p2 to receive and accept the call.
+    let call2 = call_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+
+    assert_eq!(call1.state(), xphone::types::CallState::Active);
+    assert_eq!(call2.state(), xphone::types::CallState::Active);
+
+    // Register DTMF callback on p1's outbound call.
+    let (dtmf_tx, dtmf_rx) = crossbeam_channel::bounded(10);
+    call1.on_dtmf(move |digit| {
+        let _ = dtmf_tx.send(digit);
+    });
+
+    // Brief pause to let RTP media paths establish through Asterisk.
+    std::thread::sleep(Duration::from_millis(500));
+
+    // p2 sends DTMF digit "5".
+    call2.send_dtmf("5").unwrap();
+
+    // Wait for p1 to receive the DTMF.
+    let digit = dtmf_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("DTMF digit never received by p1");
+    assert_eq!(digit, "5");
+
+    call1.end().unwrap();
+
+    p1.disconnect().unwrap();
+    p2.disconnect().unwrap();
 }
 
 #[test]

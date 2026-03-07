@@ -121,6 +121,7 @@ struct CallInner {
     rtp_socket: Option<Arc<UdpSocket>>,
     media_handle: Option<MediaHandle>,
     media_channels: Option<Arc<MediaChannels>>,
+    media_shared: Option<Arc<media::MediaSharedState>>,
 
     on_ended_fn: Option<Arc<dyn Fn(EndReason) + Send + Sync>>,
     on_ended_internal: Option<Arc<dyn Fn(EndReason) + Send + Sync>>,
@@ -164,6 +165,7 @@ impl Call {
                 rtp_socket: None,
                 media_handle: None,
                 media_channels: None,
+                media_shared: None,
                 on_ended_fn: None,
                 on_ended_internal: None,
                 on_media_fn: None,
@@ -201,6 +203,7 @@ impl Call {
                 rtp_socket: None,
                 media_handle: None,
                 media_channels: None,
+                media_shared: None,
                 on_ended_fn: None,
                 on_ended_internal: None,
                 on_media_fn: None,
@@ -585,18 +588,33 @@ impl Call {
     }
 
     pub fn send_dtmf(&self, digit: &str) -> Result<()> {
-        {
+        let (rtp_socket, remote_ip, remote_port) = {
             let inner = self.inner.lock();
             if inner.state != CallState::Active {
                 return Err(Error::InvalidState);
             }
-        }
+            (
+                inner.rtp_socket.clone(),
+                inner.remote_ip.clone(),
+                inner.remote_port,
+            )
+        };
         if dtmf::digit_to_code(digit).is_none() {
             return Err(Error::InvalidDtmfDigit);
         }
-        let _pkts = dtmf::encode_dtmf(digit, 0, 0, 0)?;
-        // In production, packets would be sent via RTP socket.
-        // For now, encoding validates the digit and produces packets.
+        let pkts = dtmf::encode_dtmf(digit, 0, 0, 0)?;
+        // Send directly to UDP socket (like Go's SendDTMF).
+        if let Some(sock) = rtp_socket {
+            if !remote_ip.is_empty() && remote_port > 0 {
+                if let Ok(addr) =
+                    format!("{}:{}", remote_ip, remote_port).parse::<std::net::SocketAddr>()
+                {
+                    for pkt in &pkts {
+                        let _ = sock.send_to(&pkt.to_bytes(), addr);
+                    }
+                }
+            }
+        }
         Ok(())
     }
 
@@ -792,13 +810,23 @@ impl Call {
         ));
         let channels = Arc::new(MediaChannels::new());
         let shared = Arc::new(media::MediaSharedState::new(inner.state));
+        // Wire callbacks from Call into the media thread's shared state.
+        if let Some(ref f) = inner.on_dtmf_fn {
+            *shared.on_dtmf_fn.lock() = Some(Arc::clone(f));
+        }
         let config = MediaConfig {
             codec: inner.codec,
             ..MediaConfig::default()
         };
-        let handle = media::start_media(config, Arc::clone(&channels), shared, Some(transport));
+        let handle = media::start_media(
+            config,
+            Arc::clone(&channels),
+            Arc::clone(&shared),
+            Some(transport),
+        );
         inner.media_handle = Some(handle);
         inner.media_channels = Some(channels);
+        inner.media_shared = Some(shared);
     }
 
     /// Sends a SIP response via the dialog (e.g., 180 Ringing for inbound calls).
@@ -821,7 +849,13 @@ impl Call {
     }
 
     pub fn on_dtmf(&self, f: impl Fn(String) + Send + Sync + 'static) {
-        self.inner.lock().on_dtmf_fn = Some(Arc::new(f));
+        let cb: Arc<dyn Fn(String) + Send + Sync> = Arc::new(f);
+        let mut inner = self.inner.lock();
+        inner.on_dtmf_fn = Some(Arc::clone(&cb));
+        // Propagate to media thread's shared state if pipeline is running.
+        if let Some(ref shared) = inner.media_shared {
+            *shared.on_dtmf_fn.lock() = Some(cb);
+        }
     }
 
     pub fn on_hold(&self, f: impl Fn() + Send + Sync + 'static) {

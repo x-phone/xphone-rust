@@ -17,6 +17,8 @@ pub struct Config {
 
     pub nat_keepalive_interval: Option<Duration>,
 
+    /// Override the local IP advertised in SDP. If empty, auto-detected.
+    pub local_ip: String,
     pub rtp_port_min: u16,
     pub rtp_port_max: u16,
     pub codec_prefs: Vec<Codec>,
@@ -38,6 +40,7 @@ impl Default for Config {
             register_retry: Duration::from_secs(1),
             register_max_retry: 3,
             nat_keepalive_interval: None,
+            local_ip: String::new(),
             rtp_port_min: 0,
             rtp_port_max: 0,
             codec_prefs: Vec::new(),

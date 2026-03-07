@@ -17,8 +17,8 @@ services:
     tty: true
     stdin_open: true
     ports:
-      - "5060:5060/udp"
-      - "5060:5060/tcp"
+      - "5160:5060/udp"
+      - "5160:5060/tcp"
       - "10000-10099:10000-10099/udp"
       # xphone client-side RTP ports (host-only, not mapped into container).
       # These are forwarded so Docker Desktop on macOS can route RTP back
