@@ -516,41 +516,65 @@ No external SIP or RTP crate dependencies — the entire SIP stack is implemente
 
 ## Known Limitations
 
-This library is actively developed but not yet complete. The gaps below are worth understanding before committing to it for a production deployment.
+This library is actively developed but not yet feature-complete. The gaps below are worth understanding before committing to it for a production deployment.
 
 ### Security
 
-**SRTP is implemented but not yet hardened.** The `AES_CM_128_HMAC_SHA1_80` cipher suite is supported with SDES key exchange. However, replay protection, key material zeroization, and per-SSRC crypto state tracking are not yet implemented. Evaluate accordingly for high-security environments.
+**SRTP is implemented but not yet hardened.** The `AES_CM_128_HMAC_SHA1_80` cipher suite is supported with SDES key exchange. Replay protection, key material zeroization, SRTCP encryption, and per-SSRC crypto state tracking are not yet implemented. DTLS-SRTP key exchange is not supported (SDES only). Evaluate accordingly for high-security environments.
 
 ### Codec coverage
 
-**Opus is not yet supported.** G.711 (PCMU/PCMA) and G.722 are implemented. Some SIP trunk providers may require explicit codec configuration.
+**Opus is not yet supported.** G.711 (PCMU/PCMA) and G.722 are implemented. Opus is the dominant codec in WebRTC and modern VoIP — its absence limits interoperability with those platforms.
 
-**G.729 is not supported.** G.729 is widely deployed in enterprise PBX environments. If your SIP trunk or PBX requires G.729, xphone cannot currently interoperate with it.
+**G.729 is not supported.** G.729 remains widely deployed in enterprise PBX environments (Cisco, Avaya, Mitel). If your SIP trunk or PBX requires G.729, xphone cannot currently interoperate with it.
+
+**PCM sample rate is fixed at 8 kHz (narrowband) or 16 kHz (G.722 wideband).** There is no configurable sample rate — codec selection determines the rate.
 
 ### Call control
 
-**Attended (consultative) transfer is not implemented.** Only blind transfer via REFER is supported.
+**Attended (consultative) transfer is not implemented.** Only blind transfer via REFER is supported. Attended transfer requires coordinating two simultaneous call legs with a REFER/Replaces header.
 
-**DTMF is RFC 4733 (RTP telephone-events) only.** Some legacy PBXes use SIP INFO for DTMF instead. If your system requires SIP INFO DTMF, tones may not be received.
+**DTMF is RFC 4733 (RTP telephone-events) only.** Some legacy PBXes use SIP INFO (RFC 2976) for DTMF instead. If your system requires SIP INFO DTMF, tones may not be received.
+
+**No call forwarding (302).** Incoming 302 Moved Temporarily responses are not followed automatically.
+
+**No call parking.** Park/retrieve functionality (common in office deployments) is not implemented.
+
+### Enterprise features
+
+**No MWI (Message Waiting Indicator).** SIP SUBSCRIBE/NOTIFY for the `message-summary` event package (RFC 3842) is not implemented. Applications cannot detect voicemail presence.
+
+**No presence or BLF.** SIP SUBSCRIBE/NOTIFY for presence (RFC 3856) and dialog state (RFC 4235 — Busy Lamp Field) are not implemented.
+
+**No SIP MESSAGE (RFC 3428).** Instant messaging over SIP is not supported.
 
 ### Network & NAT
 
-**STUN is supported for NAT-mapped address discovery.** Configure `stun_server` to use a public STUN server (e.g. `stun.l.google.com:19302`) for discovering your external IP. TURN and full ICE are not implemented. In environments with symmetric NAT (common in cloud VMs), STUN alone may not be sufficient and RTP media may fail to flow.
+**STUN is supported for NAT-mapped address discovery.** Configure `stun_server` to use a public STUN server (e.g. `stun.l.google.com:19302`) for discovering your external IP. STUN should only be used when the SIP server is on the public internet — do not enable it when connecting via VPN or private network, as the STUN-mapped address will be unreachable from the server.
+
+**No TURN or ICE.** TURN relay (RFC 5766) and full ICE (RFC 5245) are not implemented. In environments with symmetric NAT (common in cloud VMs and corporate firewalls), STUN alone may not be sufficient and RTP media may fail to flow.
+
+### Media
+
+**No video.** Only audio media (single `m=audio` line in SDP) is supported. H.264, VP8, and other video codecs are not implemented.
+
+**No RTCP.** RTP Control Protocol feedback (jitter reports, packet loss, round-trip time) is not sent or processed.
 
 ### Project maturity
 
-This is an early-stage project. The API may change between releases. Evaluate accordingly for critical production workloads.
+This is an early-stage project (v0.1.x). The API may change between releases. Evaluate accordingly for critical production workloads.
 
 ---
 
 ## Roadmap
 
-- SRTP hardening — replay protection, key zeroization
+- SRTP hardening — replay protection, DTLS-SRTP, key zeroization
 - Opus codec
 - Attended (consultative) transfer
 - SIP INFO DTMF (RFC 2976) for legacy PBX compatibility
 - TURN relay and full ICE for symmetric NAT
+- RTCP support
+- MWI (voicemail notification)
 
 ---
 
