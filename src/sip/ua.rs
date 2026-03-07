@@ -6,20 +6,26 @@ use std::time::Duration;
 use parking_lot::Mutex;
 
 use super::client::{Client, ClientConfig};
+use super::dialog::{build_sip_response, SipDialogUAC, SipDialogUAS};
 use super::message::Message;
 use crate::config::Config;
+use crate::dialog::Dialog;
 use crate::error::{Error, Result};
 use crate::transport::SipTransport;
 
+#[allow(clippy::type_complexity)]
 struct Inner {
     drop_handler: Option<Arc<dyn Fn() + Send + Sync>>,
     incoming_handler: Option<Arc<dyn Fn(String, String) + Send + Sync>>,
+    dialog_invite_handler:
+        Option<Arc<dyn Fn(Arc<dyn Dialog>, String, String, String) + Send + Sync>>,
+    bye_handler: Option<Arc<dyn Fn(String) + Send + Sync>>,
 }
 
 /// Production SIP transport backed by `sip::client::Client`.
 /// Implements the `SipTransport` trait for real network communication.
 pub struct SipUA {
-    client: Client,
+    client: Arc<Client>,
     inner: Arc<Mutex<Inner>>,
 }
 
@@ -48,32 +54,93 @@ impl SipUA {
             domain: cfg.host.clone(),
         };
 
-        let client = Client::new(client_cfg)?;
+        let client = Arc::new(Client::new(client_cfg)?);
 
         let inner = Arc::new(Mutex::new(Inner {
             drop_handler: None,
             incoming_handler: None,
+            dialog_invite_handler: None,
+            bye_handler: None,
         }));
 
         // Wire up incoming SIP request handler.
         let inner_clone = Arc::clone(&inner);
-        client.on_incoming(move |msg, _addr| {
-            handle_incoming_request(&inner_clone, &msg);
+        let client_clone = Arc::clone(&client);
+        client.on_incoming(move |msg, addr| {
+            handle_incoming_request(&inner_clone, &client_clone, &msg, addr);
         });
 
         Ok(Self { client, inner })
     }
 }
 
-fn handle_incoming_request(inner: &Arc<Mutex<Inner>>, msg: &Message) {
-    if msg.method == "INVITE" {
-        let from = msg.header("From").to_string();
-        let to = msg.header("To").to_string();
-
-        let cb = inner.lock().incoming_handler.clone();
-        if let Some(f) = cb {
-            f(from, to);
+fn handle_incoming_request(
+    inner: &Arc<Mutex<Inner>>,
+    client: &Arc<Client>,
+    msg: &Message,
+    from_addr: SocketAddr,
+) {
+    match msg.method.as_str() {
+        "INVITE" => handle_invite(inner, client, msg, from_addr),
+        "BYE" => handle_bye(inner, client, msg, from_addr),
+        "ACK" => {} // ACK is handled implicitly
+        "OPTIONS" => {
+            // Respond 200 OK to OPTIONS keepalive probes.
+            let resp = build_sip_response(msg, 200, "OK");
+            let _ = client.send_raw_to(&resp.to_bytes(), from_addr);
         }
+        _ => {}
+    }
+}
+
+fn handle_invite(
+    inner: &Arc<Mutex<Inner>>,
+    client: &Arc<Client>,
+    msg: &Message,
+    from_addr: SocketAddr,
+) {
+    let from = msg.header("From").to_string();
+    let to = msg.header("To").to_string();
+    let remote_sdp = String::from_utf8_lossy(&msg.body).to_string();
+
+    // Send 100 Trying immediately to stop INVITE retransmissions.
+    let trying = build_sip_response(msg, 100, "Trying");
+    let _ = client.send_raw_to(&trying.to_bytes(), from_addr);
+
+    // Check for dialog-based handler first.
+    let dialog_handler = inner.lock().dialog_invite_handler.clone();
+    if let Some(handler) = dialog_handler {
+        let dlg = Arc::new(SipDialogUAS::new(
+            Arc::clone(client),
+            msg.clone(),
+            from_addr,
+        ));
+        handler(dlg as Arc<dyn Dialog>, from, to, remote_sdp);
+        return;
+    }
+
+    // Fall back to simple (from, to) handler for backward compatibility.
+    let cb = inner.lock().incoming_handler.clone();
+    if let Some(f) = cb {
+        f(from, to);
+    }
+}
+
+fn handle_bye(
+    inner: &Arc<Mutex<Inner>>,
+    client: &Arc<Client>,
+    msg: &Message,
+    from_addr: SocketAddr,
+) {
+    // Always respond 200 OK to BYE to stop retransmissions.
+    let resp = build_sip_response(msg, 200, "OK");
+    let _ = client.send_raw_to(&resp.to_bytes(), from_addr);
+
+    // Fire BYE handler with Call-ID.
+    let call_id = msg.header("Call-ID").to_string();
+    let cb = inner.lock().bye_handler.clone();
+    if let Some(f) = cb {
+        f(call_id);
     }
 }
 
@@ -90,10 +157,8 @@ impl SipTransport for SipUA {
             return Ok(msg);
         }
 
-        // INVITE and other methods will go through a dialog-based path
-        // once UAC/UAS dialogs are implemented.
         Err(Error::Other(format!(
-            "sip: method {} not yet supported via SipUA",
+            "sip: method {} not supported via send_request, use dial() for INVITE",
             method
         )))
     }
@@ -109,7 +174,7 @@ impl SipTransport for SipUA {
     }
 
     fn respond(&self, _code: u16, _reason: &str) {
-        // Inbound responses handled via dialog layer (future).
+        // Responses now handled via Dialog.respond() in production.
     }
 
     fn on_drop(&self, f: Box<dyn Fn() + Send + Sync>) {
@@ -118,6 +183,42 @@ impl SipTransport for SipUA {
 
     fn on_incoming(&self, f: Box<dyn Fn(String, String) + Send + Sync>) {
         self.inner.lock().incoming_handler = Some(Arc::from(f));
+    }
+
+    fn dial(
+        &self,
+        target: &str,
+        local_sdp: &[u8],
+        timeout: Duration,
+    ) -> Result<(Arc<dyn Dialog>, String)> {
+        // Normalize target to SIP URI.
+        let target_uri = if target.starts_with("sip:") {
+            target.to_string()
+        } else {
+            format!("sip:{}@{}", target, self.client.domain())
+        };
+
+        let result = self.client.send_invite(&target_uri, local_sdp, timeout)?;
+        let remote_sdp = String::from_utf8_lossy(&result.response.body).to_string();
+
+        let dlg = Arc::new(SipDialogUAC::new(
+            Arc::clone(&self.client),
+            result.invite,
+            result.response,
+        ));
+
+        Ok((dlg as Arc<dyn Dialog>, remote_sdp))
+    }
+
+    fn on_dialog_invite(
+        &self,
+        f: Box<dyn Fn(Arc<dyn Dialog>, String, String, String) + Send + Sync>,
+    ) {
+        self.inner.lock().dialog_invite_handler = Some(Arc::from(f));
+    }
+
+    fn on_bye(&self, f: Box<dyn Fn(String) + Send + Sync>) {
+        self.inner.lock().bye_handler = Some(Arc::from(f));
     }
 
     fn close(&self) -> Result<()> {
@@ -190,7 +291,6 @@ mod tests {
             ..Config::default()
         };
         let ua = SipUA::new(&cfg).unwrap();
-        // Keepalive sends to a non-listening port — should not error on UDP.
         let _ = ua.send_keepalive();
         ua.close().unwrap();
     }

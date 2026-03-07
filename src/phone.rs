@@ -85,10 +85,21 @@ impl Phone {
         // Perform registration.
         let reg_result = reg.start();
 
-        // Wire up incoming INVITE handling.
+        // Wire up incoming INVITE handling (dialog-based for production, simple for mock).
+        let inner_clone = Arc::clone(&self.inner);
+        tr.on_dialog_invite(Box::new(move |dlg, from, to, remote_sdp| {
+            handle_dialog_incoming(&inner_clone, dlg, &from, &to, &remote_sdp);
+        }));
+
         let inner_clone = Arc::clone(&self.inner);
         tr.on_incoming(Box::new(move |from, to| {
             handle_incoming(&inner_clone, &from, &to);
+        }));
+
+        // Wire up BYE handling.
+        let inner_clone = Arc::clone(&self.inner);
+        tr.on_bye(Box::new(move |call_id| {
+            handle_bye(&inner_clone, &call_id);
         }));
 
         let mut inner = self.inner.lock();
@@ -129,7 +140,7 @@ impl Phone {
     }
 
     /// Initiates an outbound call.
-    pub fn dial(&self, _target: &str, opts: DialOptions) -> Result<Arc<Call>> {
+    pub fn dial(&self, target: &str, opts: DialOptions) -> Result<Arc<Call>> {
         let tr = {
             let inner = self.inner.lock();
             if inner.state != PhoneState::Registered {
@@ -138,22 +149,35 @@ impl Phone {
             inner.tr.as_ref().cloned().ok_or(Error::NotConnected)?
         };
 
-        // Send INVITE.
-        let resp = tr.send_request("INVITE", None, opts.timeout)?;
+        // Try dialog-based dial (production SipUA path).
+        let dial_result = tr.dial(target, b"v=0\r\n", opts.timeout);
 
-        // Consume provisional responses.
-        let mut code = resp.status_code;
-        let mut responses = vec![(code, resp.reason.clone())];
+        let (call, responses) = match dial_result {
+            Ok((dlg, remote_sdp)) => {
+                // Production path: got a real dialog from SipUA.
+                let call = Call::new_outbound(dlg, opts);
+                if !remote_sdp.is_empty() {
+                    call.set_remote_sdp(&remote_sdp);
+                }
+                (call, Vec::new())
+            }
+            Err(_) => {
+                // Fallback path (MockTransport): use send_request + MockDialog.
+                let resp = tr.send_request("INVITE", None, opts.timeout)?;
+                let mut code = resp.status_code;
+                let mut responses = vec![(code, resp.reason.clone())];
 
-        while (100..200).contains(&code) {
-            let next = tr.read_response(opts.timeout)?;
-            code = next.status_code;
-            responses.push((code, next.reason.clone()));
-        }
+                while (100..200).contains(&code) {
+                    let next = tr.read_response(opts.timeout)?;
+                    code = next.status_code;
+                    responses.push((code, next.reason.clone()));
+                }
 
-        // Create the call with a stub dialog.
-        let dlg = Arc::new(MockDialog::new());
-        let call = Call::new_outbound(dlg as Arc<dyn Dialog>, opts);
+                let dlg = Arc::new(MockDialog::new());
+                let call = Call::new_outbound(dlg as Arc<dyn Dialog>, opts);
+                (call, responses)
+            }
+        };
 
         // Wire up call tracking cleanup.
         let inner_clone = Arc::clone(&self.inner);
@@ -162,7 +186,7 @@ impl Phone {
             inner_clone.lock().calls.remove(&call_id);
         });
 
-        // Replay provisional responses.
+        // Replay provisional responses (mock path only).
         for (c, r) in &responses {
             call.simulate_response(*c, r);
         }
@@ -271,6 +295,49 @@ fn handle_incoming(inner: &Arc<Mutex<Inner>>, from: &str, to: &str) {
     // Send 180 Ringing.
     if let Some(ref tr) = tr {
         tr.respond(180, "Ringing");
+    }
+}
+
+/// Handles an incoming INVITE with a real SIP dialog (production path).
+fn handle_dialog_incoming(
+    inner: &Arc<Mutex<Inner>>,
+    dlg: Arc<dyn Dialog>,
+    _from: &str,
+    _to: &str,
+    remote_sdp: &str,
+) {
+    let incoming_fn = inner.lock().incoming.clone();
+
+    // Create an inbound call with the real dialog.
+    let call = Call::new_inbound(dlg);
+    if !remote_sdp.is_empty() {
+        call.set_remote_sdp(remote_sdp);
+    }
+
+    // Wire up call tracking cleanup.
+    let inner_clone = Arc::clone(inner);
+    let call_id = call.call_id();
+    call.on_ended_internal(move |_| {
+        inner_clone.lock().calls.remove(&call_id);
+    });
+
+    // Track the call.
+    inner.lock().calls.insert(call.call_id(), Arc::clone(&call));
+
+    // Send 180 Ringing via dialog.
+    let _ = call.dlg_respond(180, "Ringing");
+
+    // Fire OnIncoming callback.
+    if let Some(f) = incoming_fn {
+        f(call);
+    }
+}
+
+/// Handles an incoming BYE — looks up the call by Call-ID and simulates BYE.
+fn handle_bye(inner: &Arc<Mutex<Inner>>, call_id: &str) {
+    let call = inner.lock().calls.get(call_id).cloned();
+    if let Some(call) = call {
+        call.simulate_bye();
     }
 }
 

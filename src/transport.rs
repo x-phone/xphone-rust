@@ -1,7 +1,9 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 use std::time::Duration;
 
-use crate::error::Result;
+use crate::dialog::Dialog;
+use crate::error::{Error, Result};
 use crate::sip::message::Message;
 
 /// Internal interface for SIP transport.
@@ -30,8 +32,32 @@ pub trait SipTransport: Send + Sync {
     /// Registers a callback that fires when the transport connection drops.
     fn on_drop(&self, f: Box<dyn Fn() + Send + Sync>);
 
-    /// Registers a callback for incoming SIP requests.
+    /// Registers a callback for incoming SIP requests (basic: from/to strings).
     fn on_incoming(&self, f: Box<dyn Fn(String, String) + Send + Sync>);
+
+    /// Dials a target with an SDP offer, creating an outbound dialog.
+    /// Returns the dialog and the remote SDP from the 200 OK.
+    fn dial(
+        &self,
+        _target: &str,
+        _local_sdp: &[u8],
+        _timeout: Duration,
+    ) -> Result<(Arc<dyn Dialog>, String)> {
+        Err(Error::Other("dial not supported on this transport".into()))
+    }
+
+    /// Registers a callback for incoming INVITEs with a full dialog.
+    /// Args: dialog, from, to, remote_sdp
+    #[allow(clippy::type_complexity)]
+    fn on_dialog_invite(
+        &self,
+        _f: Box<dyn Fn(Arc<dyn Dialog>, String, String, String) + Send + Sync>,
+    ) {
+    }
+
+    /// Registers a callback for incoming BYE requests.
+    /// Arg: Call-ID of the terminated dialog.
+    fn on_bye(&self, _f: Box<dyn Fn(String) + Send + Sync>) {}
 
     /// Closes the transport.
     fn close(&self) -> Result<()>;

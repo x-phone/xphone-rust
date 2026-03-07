@@ -731,6 +731,11 @@ impl Call {
         self.inner.lock().remote_sdp = sdp.to_string();
     }
 
+    /// Sends a SIP response via the dialog (e.g., 180 Ringing for inbound calls).
+    pub(crate) fn dlg_respond(&self, code: u16, reason: &str) -> Result<()> {
+        self.dlg.respond(code, reason, &[])
+    }
+
     // --- Callback setters ---
 
     pub fn on_state(&self, f: impl Fn(CallState) + Send + Sync + 'static) {
