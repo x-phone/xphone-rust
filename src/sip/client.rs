@@ -5,15 +5,20 @@ use std::time::Duration;
 
 use parking_lot::Mutex;
 
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use super::auth::{self, Credentials};
 use super::conn::{self, TlsConfig};
+use super::dialog::extract_uri;
 use super::message::Message;
 use super::transaction::{self, TransactionManager};
 use crate::error::{Error, Result};
 
+/// Maximum number of 3xx redirect hops before giving up.
+const MAX_REDIRECTS: u8 = 3;
+
 /// Result of a successful INVITE transaction.
+#[derive(Debug)]
 pub struct InviteResult {
     /// The INVITE request that was sent.
     pub invite: Message,
@@ -23,6 +28,12 @@ pub struct InviteResult {
     pub provisionals: Vec<(u16, String)>,
     /// SDP body from 183 Session Progress (early media), if any.
     pub early_sdp: Option<String>,
+}
+
+/// Internal result from consuming INVITE responses — either success or redirect.
+enum ConsumeResult {
+    Success(Box<InviteResult>),
+    Redirect(String),
 }
 
 /// Configuration for a SIP client.
@@ -272,14 +283,44 @@ impl Client {
     }
 
     /// Sends a SIP INVITE with SDP body.
-    /// Handles 401/407 auth challenges, consumes provisional responses,
-    /// sends ACK on 200 OK, and returns the full result.
+    /// Handles 401/407 auth challenges, 3xx redirects (up to 3 hops),
+    /// consumes provisional responses, sends ACK on 200 OK, and returns the full result.
     pub fn send_invite(
         &self,
         target_uri: &str,
         sdp: &[u8],
         timeout: Duration,
     ) -> Result<InviteResult> {
+        let mut current_target = target_uri.to_string();
+        let mut redirects: u8 = 0;
+
+        loop {
+            if redirects > 0 {
+                info!(hop = redirects, target = %current_target, "SIP >>> following 3xx redirect");
+            }
+            match self.send_invite_once(&current_target, sdp, timeout)? {
+                ConsumeResult::Success(result) => return Ok(*result),
+                ConsumeResult::Redirect(new_target) => {
+                    redirects += 1;
+                    if redirects > MAX_REDIRECTS {
+                        return Err(Error::Other(format!(
+                            "sip: too many redirects (max {})",
+                            MAX_REDIRECTS
+                        )));
+                    }
+                    current_target = new_target;
+                }
+            }
+        }
+    }
+
+    /// Sends a single INVITE attempt (with auth retry), returning Success or Redirect.
+    fn send_invite_once(
+        &self,
+        target_uri: &str,
+        sdp: &[u8],
+        timeout: Duration,
+    ) -> Result<ConsumeResult> {
         if *self.closed.lock() {
             return Err(Error::Other("sip: client closed".into()));
         }
@@ -327,14 +368,14 @@ impl Client {
         self.consume_invite_responses(invite, resp, &branch, timeout)
     }
 
-    /// Consumes provisional responses and sends ACK on 200 OK.
+    /// Consumes provisional responses and returns Success, Redirect, or error.
     fn consume_invite_responses(
         &self,
         invite: Message,
         first_resp: Message,
         branch: &str,
         timeout: Duration,
-    ) -> Result<InviteResult> {
+    ) -> Result<ConsumeResult> {
         let mut provisionals = Vec::new();
         let mut early_sdp = None;
         let mut resp = first_resp;
@@ -357,12 +398,32 @@ impl Client {
             let ack = self.build_ack(&invite, &resp);
             self.tm.remove_tx(branch);
             self.tm.send_raw(&ack.to_bytes(), self.cfg.server_addr)?;
-            Ok(InviteResult {
+            Ok(ConsumeResult::Success(Box::new(InviteResult {
                 invite,
                 response: resp,
                 provisionals,
                 early_sdp,
-            })
+            })))
+        } else if resp.status_code >= 300 && resp.status_code < 400 {
+            // 3xx redirect — extract target from Contact header.
+            // Send ACK for 3xx (required by RFC 3261 §17.1.1.3).
+            // Non-2xx ACK reuses the INVITE's Via branch (same transaction).
+            let ack = self.build_ack_non2xx(&invite, &resp, branch);
+            if let Err(e) = self.tm.send_raw(&ack.to_bytes(), self.cfg.server_addr) {
+                warn!(error = %e, "failed to send ACK for 3xx redirect");
+            }
+            self.tm.remove_tx(branch);
+
+            let contact = resp.header("Contact");
+            let new_target = extract_uri(contact);
+            if new_target.is_empty() {
+                return Err(Error::Other(format!(
+                    "sip: {} {} redirect with no Contact URI",
+                    resp.status_code, resp.reason
+                )));
+            }
+            info!(status = resp.status_code, target = %new_target, "SIP <<< redirect");
+            Ok(ConsumeResult::Redirect(new_target))
         } else {
             self.tm.remove_tx(branch);
             Err(Error::Other(format!(
@@ -471,7 +532,25 @@ impl Client {
     }
 
     /// Builds an ACK for a 2xx response to INVITE.
+    /// Per RFC 3261, 2xx ACK is a new transaction with its own branch.
     fn build_ack(&self, invite: &Message, response: &Message) -> Message {
+        let branch = transaction::generate_branch();
+        self.build_ack_inner(invite, response, &branch)
+    }
+
+    /// Builds an ACK for a non-2xx (3xx-6xx) response to INVITE.
+    /// Per RFC 3261 §17.1.1.3, the ACK reuses the INVITE's Via branch
+    /// because it belongs to the same transaction.
+    fn build_ack_non2xx(
+        &self,
+        invite: &Message,
+        response: &Message,
+        invite_branch: &str,
+    ) -> Message {
+        self.build_ack_inner(invite, response, invite_branch)
+    }
+
+    fn build_ack_inner(&self, invite: &Message, response: &Message, branch: &str) -> Message {
         let mut ack = Message::new_request("ACK", &invite.request_uri);
         ack.set_header("Call-ID", invite.header("Call-ID"));
         ack.set_header("From", invite.header("From"));
@@ -480,7 +559,6 @@ impl Client {
         ack.set_header("CSeq", &format!("{} ACK", cseq_num));
         ack.set_header("Max-Forwards", "70");
         ack.set_header("User-Agent", "xphone");
-        let branch = transaction::generate_branch();
         let via = format!(
             "SIP/2.0/{} {};branch={}",
             self.via_transport, self.advertised_addr, branch
@@ -642,5 +720,342 @@ mod tests {
 
         let result = client.send_register(Duration::from_secs(1));
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn send_invite_follows_302_redirect() {
+        let server = UdpConn::bind("127.0.0.1:0").unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        let cfg = ClientConfig {
+            local_addr: "127.0.0.1:0".into(),
+            server_addr,
+            username: "1001".into(),
+            password: "test".into(),
+            domain: "pbx.local".into(),
+            transport: "udp".into(),
+            tls_config: None,
+            stun_server: None,
+        };
+        let client = Client::new(cfg).unwrap();
+
+        let handle = std::thread::spawn(move || {
+            // First INVITE → 302 redirect.
+            let (data, from) = server.receive(Duration::from_secs(2)).unwrap();
+            let req = super::super::message::parse(&data).unwrap();
+            assert_eq!(req.method, "INVITE");
+            assert!(req.request_uri.contains("1002"));
+
+            let mut resp = Message::new_response(302, "Moved Temporarily");
+            resp.set_header("Via", req.header("Via"));
+            resp.set_header("Call-ID", req.header("Call-ID"));
+            resp.set_header("CSeq", req.header("CSeq"));
+            resp.set_header("From", req.header("From"));
+            resp.set_header("To", req.header("To"));
+            resp.set_header("Contact", "<sip:1003@redirect.local>");
+            server.send(&resp.to_bytes(), from).unwrap();
+
+            // Client should send ACK for 302.
+            let (data, _) = server.receive(Duration::from_secs(2)).unwrap();
+            let ack = super::super::message::parse(&data).unwrap();
+            assert_eq!(ack.method, "ACK");
+
+            // Second INVITE → to redirect target → 200 OK.
+            let (data, from) = server.receive(Duration::from_secs(2)).unwrap();
+            let req = super::super::message::parse(&data).unwrap();
+            assert_eq!(req.method, "INVITE");
+            assert_eq!(req.request_uri, "sip:1003@redirect.local");
+
+            let mut resp = Message::new_response(200, "OK");
+            resp.set_header("Via", req.header("Via"));
+            resp.set_header("Call-ID", req.header("Call-ID"));
+            resp.set_header("CSeq", req.header("CSeq"));
+            resp.set_header("From", req.header("From"));
+            resp.set_header("To", &format!("{};tag=abc123", req.header("To")));
+            resp.set_header("Contact", "<sip:1003@redirect.local>");
+            resp.body = b"v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 20000 RTP/AVP 0\r\n".to_vec();
+            server.send(&resp.to_bytes(), from).unwrap();
+
+            // ACK for 200.
+            let (data, _) = server.receive(Duration::from_secs(2)).unwrap();
+            let ack = super::super::message::parse(&data).unwrap();
+            assert_eq!(ack.method, "ACK");
+        });
+
+        let sdp = b"v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 10000 RTP/AVP 0\r\n";
+        let result = client
+            .send_invite("sip:1002@pbx.local", sdp, Duration::from_secs(5))
+            .unwrap();
+
+        // Should have followed redirect to 1003.
+        assert_eq!(result.response.status_code, 200);
+        assert!(result.invite.request_uri.contains("1003"));
+
+        client.close();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn send_invite_302_no_contact_returns_error() {
+        let server = UdpConn::bind("127.0.0.1:0").unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        let cfg = ClientConfig {
+            local_addr: "127.0.0.1:0".into(),
+            server_addr,
+            username: "1001".into(),
+            password: "test".into(),
+            domain: "pbx.local".into(),
+            transport: "udp".into(),
+            tls_config: None,
+            stun_server: None,
+        };
+        let client = Client::new(cfg).unwrap();
+
+        let handle = std::thread::spawn(move || {
+            let (data, from) = server.receive(Duration::from_secs(2)).unwrap();
+            let req = super::super::message::parse(&data).unwrap();
+
+            // 302 with no Contact header.
+            let mut resp = Message::new_response(302, "Moved Temporarily");
+            resp.set_header("Via", req.header("Via"));
+            resp.set_header("Call-ID", req.header("Call-ID"));
+            resp.set_header("CSeq", req.header("CSeq"));
+            resp.set_header("From", req.header("From"));
+            resp.set_header("To", req.header("To"));
+            server.send(&resp.to_bytes(), from).unwrap();
+
+            // Consume ACK.
+            let _ = server.receive(Duration::from_secs(2));
+        });
+
+        let sdp = b"v=0\r\n";
+        let result = client.send_invite("sip:1002@pbx.local", sdp, Duration::from_secs(5));
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("no Contact URI"));
+
+        client.close();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn send_invite_too_many_redirects() {
+        let server = UdpConn::bind("127.0.0.1:0").unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        let cfg = ClientConfig {
+            local_addr: "127.0.0.1:0".into(),
+            server_addr,
+            username: "1001".into(),
+            password: "test".into(),
+            domain: "pbx.local".into(),
+            transport: "udp".into(),
+            tls_config: None,
+            stun_server: None,
+        };
+        let client = Client::new(cfg).unwrap();
+
+        let handle = std::thread::spawn(move || {
+            // Respond with 302 for every INVITE (1 original + MAX_REDIRECTS redirects + 1 more).
+            for i in 0..=MAX_REDIRECTS {
+                let (data, from) = server.receive(Duration::from_secs(2)).unwrap();
+                let req = super::super::message::parse(&data).unwrap();
+                assert_eq!(req.method, "INVITE");
+
+                let mut resp = Message::new_response(302, "Moved Temporarily");
+                resp.set_header("Via", req.header("Via"));
+                resp.set_header("Call-ID", req.header("Call-ID"));
+                resp.set_header("CSeq", req.header("CSeq"));
+                resp.set_header("From", req.header("From"));
+                resp.set_header("To", req.header("To"));
+                resp.set_header("Contact", &format!("<sip:loop{}@pbx.local>", i));
+                server.send(&resp.to_bytes(), from).unwrap();
+
+                // Consume ACK.
+                let _ = server.receive(Duration::from_secs(2));
+            }
+        });
+
+        let sdp = b"v=0\r\n";
+        let result = client.send_invite("sip:1002@pbx.local", sdp, Duration::from_secs(5));
+        assert!(result.is_err());
+        assert!(result
+            .unwrap_err()
+            .to_string()
+            .contains("too many redirects"));
+
+        client.close();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn send_invite_302_then_auth_challenge() {
+        let server = UdpConn::bind("127.0.0.1:0").unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        let cfg = ClientConfig {
+            local_addr: "127.0.0.1:0".into(),
+            server_addr,
+            username: "1001".into(),
+            password: "test".into(),
+            domain: "pbx.local".into(),
+            transport: "udp".into(),
+            tls_config: None,
+            stun_server: None,
+        };
+        let client = Client::new(cfg).unwrap();
+
+        let handle = std::thread::spawn(move || {
+            // First INVITE → 302 redirect.
+            let (data, from) = server.receive(Duration::from_secs(2)).unwrap();
+            let req = super::super::message::parse(&data).unwrap();
+            assert_eq!(req.method, "INVITE");
+
+            let mut resp = Message::new_response(302, "Moved Temporarily");
+            resp.set_header("Via", req.header("Via"));
+            resp.set_header("Call-ID", req.header("Call-ID"));
+            resp.set_header("CSeq", req.header("CSeq"));
+            resp.set_header("From", req.header("From"));
+            resp.set_header("To", req.header("To"));
+            resp.set_header("Contact", "<sip:1003@redirect.local>");
+            server.send(&resp.to_bytes(), from).unwrap();
+
+            // ACK for 302.
+            let (data, _) = server.receive(Duration::from_secs(2)).unwrap();
+            let ack = super::super::message::parse(&data).unwrap();
+            assert_eq!(ack.method, "ACK");
+
+            // Second INVITE (to redirect target) → 401 auth challenge.
+            let (data, from) = server.receive(Duration::from_secs(2)).unwrap();
+            let req = super::super::message::parse(&data).unwrap();
+            assert_eq!(req.method, "INVITE");
+            assert_eq!(req.request_uri, "sip:1003@redirect.local");
+
+            let mut resp = Message::new_response(401, "Unauthorized");
+            resp.set_header("Via", req.header("Via"));
+            resp.set_header("Call-ID", req.header("Call-ID"));
+            resp.set_header("CSeq", req.header("CSeq"));
+            resp.set_header("From", req.header("From"));
+            resp.set_header("To", req.header("To"));
+            resp.set_header(
+                "WWW-Authenticate",
+                r#"Digest realm="asterisk",nonce="xyz789",algorithm=MD5"#,
+            );
+            server.send(&resp.to_bytes(), from).unwrap();
+
+            // Third INVITE (with auth) → 200 OK.
+            let (data, from) = server.receive(Duration::from_secs(2)).unwrap();
+            let req = super::super::message::parse(&data).unwrap();
+            assert_eq!(req.method, "INVITE");
+            let auth = req.header("Authorization");
+            assert!(auth.contains("Digest "), "expected Authorization header");
+
+            let mut resp = Message::new_response(200, "OK");
+            resp.set_header("Via", req.header("Via"));
+            resp.set_header("Call-ID", req.header("Call-ID"));
+            resp.set_header("CSeq", req.header("CSeq"));
+            resp.set_header("From", req.header("From"));
+            resp.set_header("To", &format!("{};tag=xyz789", req.header("To")));
+            resp.set_header("Contact", "<sip:1003@redirect.local>");
+            resp.body = b"v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 20000 RTP/AVP 0\r\n".to_vec();
+            server.send(&resp.to_bytes(), from).unwrap();
+
+            // ACK for 200.
+            let (data, _) = server.receive(Duration::from_secs(2)).unwrap();
+            let ack = super::super::message::parse(&data).unwrap();
+            assert_eq!(ack.method, "ACK");
+        });
+
+        let sdp = b"v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 10000 RTP/AVP 0\r\n";
+        let result = client
+            .send_invite("sip:1002@pbx.local", sdp, Duration::from_secs(5))
+            .unwrap();
+
+        assert_eq!(result.response.status_code, 200);
+        assert!(result.invite.request_uri.contains("1003"));
+
+        client.close();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn send_invite_provisional_then_302() {
+        let server = UdpConn::bind("127.0.0.1:0").unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        let cfg = ClientConfig {
+            local_addr: "127.0.0.1:0".into(),
+            server_addr,
+            username: "1001".into(),
+            password: "test".into(),
+            domain: "pbx.local".into(),
+            transport: "udp".into(),
+            tls_config: None,
+            stun_server: None,
+        };
+        let client = Client::new(cfg).unwrap();
+
+        let handle = std::thread::spawn(move || {
+            // First INVITE → 100 Trying → 302 redirect.
+            let (data, from) = server.receive(Duration::from_secs(2)).unwrap();
+            let req = super::super::message::parse(&data).unwrap();
+            assert_eq!(req.method, "INVITE");
+
+            // Send 100 Trying.
+            let mut trying = Message::new_response(100, "Trying");
+            trying.set_header("Via", req.header("Via"));
+            trying.set_header("Call-ID", req.header("Call-ID"));
+            trying.set_header("CSeq", req.header("CSeq"));
+            trying.set_header("From", req.header("From"));
+            trying.set_header("To", req.header("To"));
+            server.send(&trying.to_bytes(), from).unwrap();
+
+            // Then 302.
+            let mut resp = Message::new_response(302, "Moved Temporarily");
+            resp.set_header("Via", req.header("Via"));
+            resp.set_header("Call-ID", req.header("Call-ID"));
+            resp.set_header("CSeq", req.header("CSeq"));
+            resp.set_header("From", req.header("From"));
+            resp.set_header("To", req.header("To"));
+            resp.set_header("Contact", "<sip:1003@redirect.local>");
+            server.send(&resp.to_bytes(), from).unwrap();
+
+            // ACK for 302.
+            let (data, _) = server.receive(Duration::from_secs(2)).unwrap();
+            let ack = super::super::message::parse(&data).unwrap();
+            assert_eq!(ack.method, "ACK");
+
+            // Second INVITE → 200 OK.
+            let (data, from) = server.receive(Duration::from_secs(2)).unwrap();
+            let req = super::super::message::parse(&data).unwrap();
+            assert_eq!(req.method, "INVITE");
+            assert_eq!(req.request_uri, "sip:1003@redirect.local");
+
+            let mut resp = Message::new_response(200, "OK");
+            resp.set_header("Via", req.header("Via"));
+            resp.set_header("Call-ID", req.header("Call-ID"));
+            resp.set_header("CSeq", req.header("CSeq"));
+            resp.set_header("From", req.header("From"));
+            resp.set_header("To", &format!("{};tag=abc999", req.header("To")));
+            resp.set_header("Contact", "<sip:1003@redirect.local>");
+            resp.body = b"v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 20000 RTP/AVP 0\r\n".to_vec();
+            server.send(&resp.to_bytes(), from).unwrap();
+
+            // ACK for 200.
+            let (data, _) = server.receive(Duration::from_secs(2)).unwrap();
+            let ack = super::super::message::parse(&data).unwrap();
+            assert_eq!(ack.method, "ACK");
+        });
+
+        let sdp = b"v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 10000 RTP/AVP 0\r\n";
+        let result = client
+            .send_invite("sip:1002@pbx.local", sdp, Duration::from_secs(5))
+            .unwrap();
+
+        assert_eq!(result.response.status_code, 200);
+        assert!(result.invite.request_uri.contains("1003"));
+
+        client.close();
+        handle.join().unwrap();
     }
 }

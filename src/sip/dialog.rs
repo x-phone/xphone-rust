@@ -26,7 +26,7 @@ fn normalize_sip_uri(target: &str, domain: &str) -> String {
 
 /// Extracts the URI from a Contact/From/To header value.
 /// e.g. `<sip:1001@10.0.0.1:5060>` -> `sip:1001@10.0.0.1:5060`
-fn extract_uri(header_val: &str) -> String {
+pub(crate) fn extract_uri(header_val: &str) -> String {
     if let (Some(start), Some(end)) = (header_val.find('<'), header_val.find('>')) {
         if end > start {
             return header_val[start + 1..end].to_string();
