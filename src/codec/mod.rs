@@ -1,4 +1,6 @@
 pub mod g722;
+#[cfg(feature = "opus-codec")]
+pub mod opus_codec;
 pub mod pcma;
 pub mod pcmu;
 
@@ -23,6 +25,8 @@ pub fn new_codec_processor(payload_type: i32, pcm_rate: i32) -> Option<Box<dyn C
         0 => Some(Box::new(pcmu::PcmuProcessor::new())),
         8 => Some(Box::new(pcma::PcmaProcessor::new())),
         9 => Some(Box::new(g722::G722Processor::new(pcm_rate as u32))),
+        #[cfg(feature = "opus-codec")]
+        111 => opus_codec::OpusProcessor::new().map(|p| Box::new(p) as Box<dyn CodecProcessor>),
         _ => None,
     }
 }
@@ -58,6 +62,20 @@ mod tests {
     #[test]
     fn codec_processor_unknown_returns_none() {
         assert!(new_codec_processor(99, 8000).is_none());
+    }
+
+    #[cfg(not(feature = "opus-codec"))]
+    #[test]
+    fn codec_processor_opus_without_feature_returns_none() {
         assert!(new_codec_processor(111, 8000).is_none());
+    }
+
+    #[cfg(feature = "opus-codec")]
+    #[test]
+    fn codec_processor_opus_with_feature_returns_some() {
+        let cp = new_codec_processor(111, 8000).unwrap();
+        assert_eq!(cp.payload_type(), 111);
+        assert_eq!(cp.clock_rate(), 48000);
+        assert_eq!(cp.samples_per_frame(), 960);
     }
 }

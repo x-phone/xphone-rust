@@ -69,6 +69,11 @@ optional = true
 version = "0.15"
 optional = true
 
+[dependencies.opus]
+version = "0.3"
+optional = true
+
 [features]
 integration = []
+opus-codec = ["opus"]
 cli = ["ratatui", "crossterm", "clap", "serde", "serde_yaml", "dirs-next", "cpal"]
