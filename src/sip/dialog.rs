@@ -181,6 +181,14 @@ impl Dialog for SipDialogUAC {
         Ok(())
     }
 
+    fn send_info_dtmf(&self, digit: &str, duration_ms: u32) -> Result<()> {
+        let mut req = self.build_request("INFO");
+        req.set_header("Content-Type", "application/dtmf-relay");
+        req.body = format!("Signal={}\r\nDuration={}\r\n", digit, duration_ms).into_bytes();
+        let _ = self.client.send_dialog_request(&mut req, SIP_TIMEOUT)?;
+        Ok(())
+    }
+
     fn on_notify(&self, f: Box<dyn Fn(u16) + Send + Sync>) {
         *self.on_notify_fn.lock() = Some(Arc::from(f));
     }
@@ -393,6 +401,14 @@ impl Dialog for SipDialogUAS {
         let refer_to = normalize_sip_uri(target, self.client.domain());
         let mut req = self.build_request("REFER");
         req.set_header("Refer-To", &refer_to);
+        let _ = self.client.send_dialog_request(&mut req, SIP_TIMEOUT)?;
+        Ok(())
+    }
+
+    fn send_info_dtmf(&self, digit: &str, duration_ms: u32) -> Result<()> {
+        let mut req = self.build_request("INFO");
+        req.set_header("Content-Type", "application/dtmf-relay");
+        req.body = format!("Signal={}\r\nDuration={}\r\n", digit, duration_ms).into_bytes();
         let _ = self.client.send_dialog_request(&mut req, SIP_TIMEOUT)?;
         Ok(())
     }

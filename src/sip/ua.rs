@@ -22,6 +22,7 @@ struct Inner {
         Option<Arc<dyn Fn(Arc<dyn Dialog>, String, String, String) + Send + Sync>>,
     bye_handler: Option<Arc<dyn Fn(String) + Send + Sync>>,
     notify_handler: Option<Arc<dyn Fn(String, u16) + Send + Sync>>,
+    info_dtmf_handler: Option<Arc<dyn Fn(String, String) + Send + Sync>>,
 }
 
 /// Production SIP transport backed by `sip::client::Client`.
@@ -83,6 +84,7 @@ impl SipUA {
             dialog_invite_handler: None,
             bye_handler: None,
             notify_handler: None,
+            info_dtmf_handler: None,
         }));
 
         // Wire up incoming SIP request handler.
@@ -111,6 +113,7 @@ fn handle_incoming_request(
             debug!("SIP <<< ACK received");
         }
         "NOTIFY" => handle_notify(inner, client, msg, from_addr),
+        "INFO" => handle_info(inner, client, msg, from_addr),
         "OPTIONS" => {
             debug!("SIP <<< OPTIONS keepalive, responding 200 OK");
             let resp = build_sip_response(msg, 200, "OK");
@@ -236,6 +239,66 @@ fn handle_notify(
     }
 }
 
+fn handle_info(
+    inner: &Arc<Mutex<Inner>>,
+    client: &Arc<Client>,
+    msg: &Message,
+    from_addr: SocketAddr,
+) {
+    let call_id = msg.header("Call-ID").to_string();
+    debug!(call_id = %call_id, "SIP <<< INFO received");
+
+    // Always respond 200 OK to INFO.
+    let resp = build_sip_response(msg, 200, "OK");
+    debug!("SIP >>> 200 OK (INFO)");
+    let _ = client.send_raw_to(&resp.to_bytes(), from_addr);
+
+    // Only process application/dtmf-relay bodies.
+    let content_type = msg.header("Content-Type");
+    if !content_type
+        .to_ascii_lowercase()
+        .contains("application/dtmf-relay")
+    {
+        debug!(content_type = %content_type, "INFO: ignoring non-dtmf-relay body");
+        return;
+    }
+
+    let body = String::from_utf8_lossy(&msg.body);
+    if let Some(digit) = parse_dtmf_relay(&body) {
+        // Normalize lowercase a-d to uppercase for RFC 4733 compatibility.
+        let digit = digit.to_ascii_uppercase();
+        // Validate the digit before passing to callbacks.
+        if crate::dtmf::digit_to_code(&digit).is_none() {
+            debug!(digit = %digit, "INFO: ignoring invalid DTMF digit");
+            return;
+        }
+        info!(call_id = %call_id, digit = %digit, "SIP <<< INFO DTMF");
+        let cb = inner.lock().info_dtmf_handler.clone();
+        if let Some(f) = cb {
+            f(call_id, digit);
+        }
+    }
+}
+
+/// Parses the Signal value from an `application/dtmf-relay` body.
+/// Case-insensitive key matching for PBX interop.
+/// Example body: "Signal=5\r\nDuration=160\r\n" → Some("5")
+fn parse_dtmf_relay(body: &str) -> Option<String> {
+    for line in body.lines() {
+        let line = line.trim();
+        if let Some(eq_pos) = line.find('=') {
+            let key = line[..eq_pos].trim();
+            if key.eq_ignore_ascii_case("signal") {
+                let val = line[eq_pos + 1..].trim();
+                if !val.is_empty() {
+                    return Some(val.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
 /// Parses the status code from a message/sipfrag body.
 /// Example: "SIP/2.0 200 OK" → Some(200)
 fn parse_sipfrag_status(body: &str) -> Option<u16> {
@@ -337,6 +400,10 @@ impl SipTransport for SipUA {
 
     fn on_notify(&self, f: Box<dyn Fn(String, u16) + Send + Sync>) {
         self.inner.lock().notify_handler = Some(Arc::from(f));
+    }
+
+    fn on_info_dtmf(&self, f: Box<dyn Fn(String, String) + Send + Sync>) {
+        self.inner.lock().info_dtmf_handler = Some(Arc::from(f));
     }
 
     fn unregister(&self, timeout: Duration) -> Result<()> {
@@ -454,6 +521,44 @@ mod tests {
             "should not be unsupported transport error: {}",
             err
         );
+    }
+
+    #[test]
+    fn parse_dtmf_relay_signal_digit() {
+        assert_eq!(
+            parse_dtmf_relay("Signal=5\r\nDuration=160\r\n"),
+            Some("5".into())
+        );
+    }
+
+    #[test]
+    fn parse_dtmf_relay_star_and_hash() {
+        assert_eq!(parse_dtmf_relay("Signal=*\r\n"), Some("*".into()));
+        assert_eq!(parse_dtmf_relay("Signal=#\r\n"), Some("#".into()));
+    }
+
+    #[test]
+    fn parse_dtmf_relay_with_spaces() {
+        assert_eq!(
+            parse_dtmf_relay("Signal = 9\r\nDuration = 250\r\n"),
+            Some("9".into())
+        );
+    }
+
+    #[test]
+    fn parse_dtmf_relay_empty_body() {
+        assert_eq!(parse_dtmf_relay(""), None);
+    }
+
+    #[test]
+    fn parse_dtmf_relay_no_signal_line() {
+        assert_eq!(parse_dtmf_relay("Duration=160\r\n"), None);
+    }
+
+    #[test]
+    fn parse_dtmf_relay_case_insensitive() {
+        assert_eq!(parse_dtmf_relay("signal=3\r\n"), Some("3".into()));
+        assert_eq!(parse_dtmf_relay("SIGNAL=0\r\n"), Some("0".into()));
     }
 
     #[test]

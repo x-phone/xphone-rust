@@ -68,6 +68,10 @@ pub trait SipTransport: Send + Sync {
     /// Args: Call-ID, status code parsed from sipfrag body.
     fn on_notify(&self, _f: Box<dyn Fn(String, u16) + Send + Sync>) {}
 
+    /// Registers a callback for incoming SIP INFO DTMF requests.
+    /// Args: Call-ID, digit.
+    fn on_info_dtmf(&self, _f: Box<dyn Fn(String, String) + Send + Sync>) {}
+
     /// Sends REGISTER with Expires: 0 to unregister.
     fn unregister(&self, _timeout: Duration) -> Result<()> {
         Ok(())

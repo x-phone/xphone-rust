@@ -47,6 +47,7 @@ struct Inner {
     invite_func: Option<Arc<dyn Fn() + Send + Sync>>,
     drop_handler: Option<Arc<dyn Fn() + Send + Sync>>,
     incoming_handler: Option<Arc<dyn Fn(String, String) + Send + Sync>>,
+    info_dtmf_handler: Option<Arc<dyn Fn(String, String) + Send + Sync>>,
     response_watchers: HashMap<u16, Vec<Sender<bool>>>,
 }
 
@@ -75,6 +76,7 @@ impl MockTransport {
                 invite_func: None,
                 drop_handler: None,
                 incoming_handler: None,
+                info_dtmf_handler: None,
                 response_watchers: HashMap::new(),
             }),
             response_ready_tx: tx,
@@ -124,6 +126,14 @@ impl MockTransport {
         let handler = self.inner.lock().incoming_handler.clone();
         if let Some(h) = handler {
             h(from.into(), to.into());
+        }
+    }
+
+    /// Simulates an incoming SIP INFO DTMF.
+    pub fn simulate_info_dtmf(&self, call_id: &str, digit: &str) {
+        let handler = self.inner.lock().info_dtmf_handler.clone();
+        if let Some(h) = handler {
+            h(call_id.into(), digit.into());
         }
     }
 
@@ -281,6 +291,10 @@ impl SipTransport for MockTransport {
 
     fn on_incoming(&self, f: Box<dyn Fn(String, String) + Send + Sync>) {
         self.inner.lock().incoming_handler = Some(Arc::from(f));
+    }
+
+    fn on_info_dtmf(&self, f: Box<dyn Fn(String, String) + Send + Sync>) {
+        self.inner.lock().info_dtmf_handler = Some(Arc::from(f));
     }
 
     fn dial(

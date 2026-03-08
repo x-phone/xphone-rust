@@ -120,6 +120,8 @@ struct CallInner {
     codec: Codec,
 
     media_active: bool,
+    /// DTMF transport mode for this call.
+    dtmf_mode: crate::config::DtmfMode,
     /// Whether SRTP is enabled for this call.
     srtp_enabled: bool,
     /// Local SRTP keying material (base64 inline key).
@@ -176,6 +178,7 @@ impl Call {
                 remote_sdp: String::new(),
                 codec: Codec::PCMU,
                 media_active: false,
+                dtmf_mode: crate::config::DtmfMode::Rfc4733,
                 srtp_enabled: false,
                 srtp_local_key: String::new(),
                 srtp_remote_key: String::new(),
@@ -220,6 +223,7 @@ impl Call {
                 remote_sdp: String::new(),
                 codec: Codec::PCMU,
                 media_active: false,
+                dtmf_mode: crate::config::DtmfMode::Rfc4733,
                 srtp_enabled: false,
                 srtp_local_key: String::new(),
                 srtp_remote_key: String::new(),
@@ -675,9 +679,14 @@ impl Call {
         Ok(())
     }
 
-    /// Sends a DTMF digit (e.g., `"1"`, `"#"`, `"*"`) as RFC 2833 RTP events.
+    /// Sends a DTMF digit (e.g., `"1"`, `"#"`, `"*"`).
+    ///
+    /// The transport method depends on the configured [`DtmfMode`](crate::config::DtmfMode):
+    /// - `Rfc4733` — RTP telephone-event packets (default)
+    /// - `SipInfo` — SIP INFO with `application/dtmf-relay` body
+    /// - `Both` — sends via RFC 4733
     pub fn send_dtmf(&self, digit: &str) -> Result<()> {
-        let (rtp_socket, remote_ip, remote_port) = {
+        let (rtp_socket, remote_ip, remote_port, dtmf_mode) = {
             let inner = self.inner.lock();
             if inner.state != CallState::Active {
                 return Err(Error::InvalidState);
@@ -686,20 +695,27 @@ impl Call {
                 inner.rtp_socket.clone(),
                 inner.remote_ip.clone(),
                 inner.remote_port,
+                inner.dtmf_mode,
             )
         };
         if dtmf::digit_to_code(digit).is_none() {
             return Err(Error::InvalidDtmfDigit);
         }
-        let pkts = dtmf::encode_dtmf(digit, 0, 0, 0)?;
-        // Send directly to UDP socket (like Go's SendDTMF).
-        if let Some(sock) = rtp_socket {
-            if !remote_ip.is_empty() && remote_port > 0 {
-                if let Ok(addr) =
-                    format!("{}:{}", remote_ip, remote_port).parse::<std::net::SocketAddr>()
-                {
-                    for pkt in &pkts {
-                        let _ = sock.send_to(&pkt.to_bytes(), addr);
+        match dtmf_mode {
+            crate::config::DtmfMode::SipInfo => {
+                self.dlg.send_info_dtmf(digit, 160)?;
+            }
+            crate::config::DtmfMode::Rfc4733 | crate::config::DtmfMode::Both => {
+                let pkts = dtmf::encode_dtmf(digit, 0, 0, 0)?;
+                if let Some(sock) = rtp_socket {
+                    if !remote_ip.is_empty() && remote_port > 0 {
+                        if let Ok(addr) =
+                            format!("{}:{}", remote_ip, remote_port).parse::<std::net::SocketAddr>()
+                        {
+                            for pkt in &pkts {
+                                let _ = sock.send_to(&pkt.to_bytes(), addr);
+                            }
+                        }
                     }
                 }
             }
@@ -819,6 +835,23 @@ impl Call {
         self.dlg.fire_notify(code);
     }
 
+    /// Fires DTMF callbacks for a digit received via SIP INFO (signaling path).
+    pub fn fire_dtmf(&self, digit: &str) {
+        let (f_int, f_usr) = {
+            let inner = self.inner.lock();
+            (inner.on_dtmf_internal.clone(), inner.on_dtmf_fn.clone())
+        };
+        match (f_int, f_usr) {
+            (Some(a), Some(b)) => {
+                let d = digit.to_string();
+                a(d.clone());
+                b(d);
+            }
+            (Some(f), None) | (None, Some(f)) => f(digit.to_string()),
+            (None, None) => {}
+        }
+    }
+
     /// Simulates receiving a remote re-INVITE, handling hold/resume based on SDP direction.
     pub fn simulate_reinvite(&self, raw_sdp: &str) {
         let mut inner = self.inner.lock();
@@ -905,6 +938,11 @@ impl Call {
     /// Sets the RTP socket for this call (production path).
     pub(crate) fn set_rtp_socket(&self, socket: UdpSocket) {
         self.inner.lock().rtp_socket = Some(Arc::new(socket));
+    }
+
+    /// Sets the DTMF transport mode for this call.
+    pub(crate) fn set_dtmf_mode(&self, mode: crate::config::DtmfMode) {
+        self.inner.lock().dtmf_mode = mode;
     }
 
     /// Enables SRTP and stores the local inline key.
@@ -1700,6 +1738,71 @@ mod tests {
     fn send_dtmf_when_not_active_returns_error() {
         let call = Call::new_inbound(mock_dlg());
         assert!(call.send_dtmf("1").is_err());
+    }
+
+    #[test]
+    fn send_dtmf_sip_info_mode() {
+        let dlg = Arc::new(crate::mock::dialog::MockDialog::new());
+        let call = Call::new_inbound(Arc::clone(&dlg) as Arc<dyn Dialog>);
+        call.set_dtmf_mode(crate::config::DtmfMode::SipInfo);
+        call.accept().unwrap();
+        call.send_dtmf("5").unwrap();
+        let sent = dlg.info_dtmf_sent();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].0, "5");
+        assert_eq!(sent[0].1, 160);
+    }
+
+    #[test]
+    fn send_dtmf_both_mode_uses_rfc4733() {
+        // Both mode should use RFC 4733 (RTP), not SIP INFO.
+        let dlg = Arc::new(crate::mock::dialog::MockDialog::new());
+        let call = Call::new_inbound(Arc::clone(&dlg) as Arc<dyn Dialog>);
+        call.set_dtmf_mode(crate::config::DtmfMode::Both);
+        call.accept().unwrap();
+        // Without an RTP socket it will fail, but it should NOT use SIP INFO.
+        let _ = call.send_dtmf("1");
+        assert!(dlg.info_dtmf_sent().is_empty());
+    }
+
+    #[test]
+    fn fire_dtmf_triggers_callbacks() {
+        let call = Call::new_inbound(mock_dlg());
+        call.accept().unwrap();
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        call.on_dtmf(move |d| {
+            let _ = tx.send(d);
+        });
+        call.fire_dtmf("7");
+        let digit = rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
+        assert_eq!(digit, "7");
+    }
+
+    #[test]
+    fn fire_dtmf_triggers_internal_and_user_callbacks() {
+        let call = Call::new_inbound(mock_dlg());
+        call.accept().unwrap();
+        let (tx_int, rx_int) = crossbeam_channel::bounded(1);
+        let (tx_usr, rx_usr) = crossbeam_channel::bounded(1);
+        call.on_dtmf_internal(move |d| {
+            let _ = tx_int.send(d);
+        });
+        call.on_dtmf(move |d| {
+            let _ = tx_usr.send(d);
+        });
+        call.fire_dtmf("#");
+        assert_eq!(
+            rx_int
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap(),
+            "#"
+        );
+        assert_eq!(
+            rx_usr
+                .recv_timeout(std::time::Duration::from_secs(1))
+                .unwrap(),
+            "#"
+        );
     }
 
     // --- Session timers ---

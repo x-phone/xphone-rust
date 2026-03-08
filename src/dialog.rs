@@ -16,6 +16,8 @@ pub trait Dialog: Send + Sync {
     fn send_reinvite(&self, sdp: &[u8]) -> Result<()>;
     /// Sends a REFER for blind transfer.
     fn send_refer(&self, target: &str) -> Result<()>;
+    /// Sends a SIP INFO with `application/dtmf-relay` body.
+    fn send_info_dtmf(&self, digit: &str, duration_ms: u32) -> Result<()>;
     /// Registers a callback for NOTIFY events (REFER progress).
     fn on_notify(&self, f: Box<dyn Fn(u16) + Send + Sync>);
     /// Fires the on_notify callback with the given status code.
