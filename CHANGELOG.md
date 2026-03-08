@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.2.0] - 2026-03-08
+
+### Added
+
+- **302 redirect following** — INVITE automatically follows 3xx responses (up to 3 hops, RFC 3261 §17.1.1.3)
+- **SRTP replay protection** — 128-packet sliding window bitmask rejects duplicates and too-old packets before HMAC (RFC 3711 §3.3.2)
+- **RTCP sender/receiver reports** — periodic SR/RR packets every 5s with jitter, loss, NTP timestamps, and round-trip stats (RFC 3550)
+- **Opus codec** — optional `opus-codec` feature adds Opus support (PT 111) at 8kHz mono VoIP mode with 48kHz RTP clock (RFC 7587). Requires libopus.
+
+### Changed
+
+- Switched SRTP crypto from hand-rolled implementations to audited RustCrypto crates (`aes`, `sha1`, `hmac`)
+- SDP builders refactored: `build_offer`/`build_offer_srtp` now share a single `build_offer_inner` helper with `codec_fmtp()` lookup
+
 ## [0.1.1] - 2026-03-07
 
 ### Fixed
