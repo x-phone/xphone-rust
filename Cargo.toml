@@ -26,6 +26,9 @@ md5 = "0.7"
 rustls = { version = "0.23", features = ["ring"] }
 webpki-roots = "0.26"
 getrandom = "0.2"
+aes = "0.8"
+sha1 = "0.10"
+hmac = "0.12"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
