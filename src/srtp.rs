@@ -6,7 +6,6 @@
 //!
 //! ## Known limitations
 //!
-//! - TODO: Add replay protection with a sliding window bitmask (RFC 3711 §3.3.2).
 //! - TODO: Implement full ROC estimation per RFC 3711 Appendix A instead of the
 //!   simplified 0x1000/0xF000 threshold heuristic (fine for sequential telephony
 //!   traffic but not robust against large packet reordering).
@@ -38,6 +37,79 @@ const LABEL_CIPHER_KEY: u8 = 0x00;
 const LABEL_AUTH_KEY: u8 = 0x01;
 const LABEL_SALT: u8 = 0x02;
 
+/// Default replay window size (128 packets). Covers ~2.5 seconds of audio at 50 pps.
+const REPLAY_WINDOW_SIZE: u64 = 128;
+const _: () = assert!(
+    REPLAY_WINDOW_SIZE <= 128,
+    "REPLAY_WINDOW_SIZE cannot exceed 128 (bitmap is u128)"
+);
+
+/// Sliding-window replay protection per RFC 3711 §3.3.2.
+///
+/// Tracks the highest accepted packet index and a bitmask of which of the
+/// previous `REPLAY_WINDOW_SIZE` packets have been received. Rejects packets
+/// that have already been seen or are too old.
+struct ReplayWindow {
+    /// Highest accepted 48-bit packet index.
+    top: u64,
+    /// Bitmask: bit 0 = `top`, bit 1 = `top - 1`, etc.
+    bitmap: u128,
+    /// Whether we've accepted at least one packet.
+    initialized: bool,
+}
+
+impl ReplayWindow {
+    fn new() -> Self {
+        Self {
+            top: 0,
+            bitmap: 0,
+            initialized: false,
+        }
+    }
+
+    /// Returns `true` if the packet should be rejected (replay or too old).
+    fn is_replay(&self, index: u64) -> bool {
+        if !self.initialized {
+            return false;
+        }
+        if index > self.top {
+            // New packet ahead of window — not a replay.
+            return false;
+        }
+        let delta = self.top - index;
+        if delta >= REPLAY_WINDOW_SIZE {
+            // Too old — behind the window.
+            return true;
+        }
+        // Check if this exact index was already seen.
+        (self.bitmap >> delta) & 1 == 1
+    }
+
+    /// Marks a packet index as received. Call only after successful authentication.
+    fn accept(&mut self, index: u64) {
+        if !self.initialized {
+            self.top = index;
+            self.bitmap = 1;
+            self.initialized = true;
+            return;
+        }
+        if index > self.top {
+            let shift = index - self.top;
+            if shift >= REPLAY_WINDOW_SIZE {
+                self.bitmap = 1;
+            } else {
+                self.bitmap = (self.bitmap << shift) | 1;
+            }
+            self.top = index;
+        } else {
+            let delta = self.top - index;
+            if delta < REPLAY_WINDOW_SIZE {
+                self.bitmap |= 1u128 << delta;
+            }
+        }
+    }
+}
+
 /// SRTP crypto context for a single direction (send or receive).
 pub struct SrtpContext {
     /// AES-128 cipher key (16 bytes), derived from master key.
@@ -52,6 +124,8 @@ pub struct SrtpContext {
     last_seq: u16,
     /// Whether we've seen the first packet (for ROC init).
     seq_initialized: bool,
+    /// Replay protection window (used by unprotect only).
+    replay: ReplayWindow,
 }
 
 impl fmt::Debug for SrtpContext {
@@ -99,6 +173,7 @@ impl SrtpContext {
             roc: 0,
             last_seq: 0,
             seq_initialized: false,
+            replay: ReplayWindow::new(),
         })
     }
 
@@ -175,14 +250,20 @@ impl SrtpContext {
         let estimated_roc = self.estimate_roc(seq);
         let index = ((estimated_roc as u64) << 16) | seq as u64;
 
+        // Replay check (RFC 3711 §3.3.2) — cheap, before expensive HMAC.
+        if self.replay.is_replay(index) {
+            return Err(Error::Other("srtp: replay detected".into()));
+        }
+
         // Verify auth tag.
         let expected_tag = compute_auth_tag(&self.auth_key, authenticated_portion, estimated_roc);
         if !constant_time_eq(received_tag, &expected_tag) {
             return Err(Error::Other("srtp: authentication failed".into()));
         }
 
-        // Auth passed — update ROC.
+        // Auth passed — update ROC and replay window.
         self.update_roc_receiver(seq, estimated_roc);
+        self.replay.accept(index);
 
         // Decrypt payload.
         let payload_len = authenticated_len - header_len;
@@ -1070,5 +1151,155 @@ mod tests {
     fn invalid_master_salt_length() {
         assert!(SrtpContext::new(&[0; 16], &[0; 13]).is_err());
         assert!(SrtpContext::new(&[0; 16], &[0; 15]).is_err());
+    }
+
+    // --- Replay protection tests ---
+
+    fn make_rtp(seq: u16) -> Vec<u8> {
+        let mut rtp = vec![0x80, 0, (seq >> 8) as u8, seq as u8, 0, 0, 0, 0, 0, 0, 0, 0];
+        rtp.extend_from_slice(&[0xAA; 40]);
+        rtp
+    }
+
+    #[test]
+    fn replay_window_rejects_duplicate() {
+        let mut w = ReplayWindow::new();
+        assert!(!w.is_replay(100));
+        w.accept(100);
+        assert!(w.is_replay(100)); // exact duplicate
+    }
+
+    #[test]
+    fn replay_window_accepts_new_packets() {
+        let mut w = ReplayWindow::new();
+        for i in 0..200u64 {
+            assert!(!w.is_replay(i));
+            w.accept(i);
+        }
+    }
+
+    #[test]
+    fn replay_window_rejects_old_packets() {
+        let mut w = ReplayWindow::new();
+        // Accept packet 200.
+        w.accept(200);
+        // Packet 200 - REPLAY_WINDOW_SIZE = too old.
+        assert!(w.is_replay(200 - REPLAY_WINDOW_SIZE));
+        // Packet 0 is way too old.
+        assert!(w.is_replay(0));
+    }
+
+    #[test]
+    fn replay_window_accepts_out_of_order_within_window() {
+        let mut w = ReplayWindow::new();
+        // Accept packets 0..=50.
+        for i in 0..=50u64 {
+            w.accept(i);
+        }
+        // Accept packet 100 (jump ahead).
+        w.accept(100);
+        // Packets 51..100 are within window and not yet seen.
+        for i in 51..100u64 {
+            assert!(!w.is_replay(i), "packet {} should not be a replay", i);
+            w.accept(i);
+        }
+        // All explicitly accepted packets should now be replays.
+        for i in 0..=100u64 {
+            assert!(w.is_replay(i), "packet {} should be a replay", i);
+        }
+    }
+
+    #[test]
+    fn replay_window_boundary() {
+        let mut w = ReplayWindow::new();
+        w.accept(REPLAY_WINDOW_SIZE); // top = 128
+                                      // delta = REPLAY_WINDOW_SIZE - 1 → last valid position in window.
+        assert!(!w.is_replay(1)); // 128 - 1 = 127, within window
+                                  // delta = REPLAY_WINDOW_SIZE → just outside window.
+        assert!(w.is_replay(0)); // 128 - 0 = 128, too old
+    }
+
+    #[test]
+    fn replay_window_large_jump() {
+        let mut w = ReplayWindow::new();
+        w.accept(0);
+        // Jump far ahead — old bitmap should be cleared.
+        w.accept(1000);
+        assert!(w.is_replay(1000));
+        assert!(w.is_replay(0)); // way behind window
+        assert!(!w.is_replay(999)); // within window, not yet seen
+        assert!(!w.is_replay(1001)); // ahead of top
+    }
+
+    #[test]
+    fn srtp_replay_detected() {
+        let master_key = [0x09u8; 16];
+        let master_salt = [0x0Au8; 14];
+
+        let mut sender = SrtpContext::new(&master_key, &master_salt).unwrap();
+        let mut receiver = SrtpContext::new(&master_key, &master_salt).unwrap();
+
+        let rtp = make_rtp(1);
+        let protected = sender.protect(&rtp).unwrap();
+
+        // First unprotect succeeds.
+        let result = receiver.unprotect(&protected);
+        assert!(result.is_ok());
+
+        // Replay of the same packet is rejected.
+        let result = receiver.unprotect(&protected);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("replay"));
+    }
+
+    #[test]
+    fn srtp_out_of_order_within_window_ok() {
+        let master_key = [0x0Bu8; 16];
+        let master_salt = [0x0Cu8; 14];
+
+        let mut sender = SrtpContext::new(&master_key, &master_salt).unwrap();
+        let mut receiver = SrtpContext::new(&master_key, &master_salt).unwrap();
+
+        // Protect packets 1..=5.
+        let mut protected = Vec::new();
+        for seq in 1u16..=5 {
+            let rtp = make_rtp(seq);
+            protected.push(sender.protect(&rtp).unwrap());
+        }
+
+        // Receive out of order: 5, 3, 1, 2, 4.
+        for &idx in &[4, 2, 0, 1, 3] {
+            let result = receiver.unprotect(&protected[idx]);
+            assert!(result.is_ok(), "seq {} should succeed", idx + 1);
+        }
+
+        // All should now be replays.
+        for pkt in &protected {
+            let result = receiver.unprotect(pkt);
+            assert!(result.is_err());
+        }
+    }
+
+    #[test]
+    fn srtp_old_packet_rejected() {
+        let master_key = [0x0Du8; 16];
+        let master_salt = [0x0Eu8; 14];
+
+        let mut sender = SrtpContext::new(&master_key, &master_salt).unwrap();
+        let mut receiver = SrtpContext::new(&master_key, &master_salt).unwrap();
+
+        // Protect and save packet with seq=1.
+        let old_pkt = sender.protect(&make_rtp(1)).unwrap();
+
+        // Send 200 more packets to push seq=1 out of the window.
+        for seq in 2u16..202 {
+            let pkt = sender.protect(&make_rtp(seq)).unwrap();
+            receiver.unprotect(&pkt).unwrap();
+        }
+
+        // Old packet (seq=1) is now behind the window.
+        let result = receiver.unprotect(&old_pkt);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("replay"));
     }
 }
