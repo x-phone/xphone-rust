@@ -421,7 +421,11 @@ impl Phone {
 
 impl Drop for Phone {
     fn drop(&mut self) {
-        let _ = self.disconnect();
+        // Only disconnect if this is the last clone — dropping a clone must not
+        // tear down the shared registration/transport.
+        if Arc::strong_count(&self.inner) == 1 {
+            let _ = self.disconnect();
+        }
     }
 }
 
