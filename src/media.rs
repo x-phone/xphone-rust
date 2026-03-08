@@ -11,6 +11,7 @@ use crate::callback_pool::spawn_callback;
 use crate::codec::{self, CodecProcessor};
 use crate::dtmf;
 use crate::jitter::JitterBuffer;
+use crate::rtcp::{self, RtcpStats};
 use crate::srtp::SrtpContext;
 use crate::types::*;
 
@@ -51,6 +52,10 @@ pub struct MediaConfig {
     pub srtp_inbound: Option<SrtpContext>,
     /// SRTP context for outbound (encrypt). None = plain RTP.
     pub srtp_outbound: Option<SrtpContext>,
+    /// Optional RTCP socket (RTP port + 1). None = no RTCP.
+    pub rtcp_socket: Option<Arc<UdpSocket>>,
+    /// Remote RTCP address (remote RTP port + 1).
+    pub rtcp_remote_addr: Option<SocketAddr>,
 }
 
 impl Default for MediaConfig {
@@ -62,6 +67,8 @@ impl Default for MediaConfig {
             codec: Codec::PCMU,
             srtp_inbound: None,
             srtp_outbound: None,
+            rtcp_socket: None,
+            rtcp_remote_addr: None,
         }
     }
 }
@@ -200,6 +207,18 @@ pub fn listen_rtp_port(min: u16, max: u16) -> crate::error::Result<(UdpSocket, u
     )))
 }
 
+/// Binds a UDP socket for RTCP on the port adjacent to RTP (rtp_port + 1).
+/// Returns the socket or an error if the port is unavailable.
+pub fn listen_rtcp_port(rtp_port: u16) -> crate::error::Result<UdpSocket> {
+    let rtcp_port = rtp_port + 1;
+    let sock = UdpSocket::bind(format!("0.0.0.0:{}", rtcp_port)).map_err(|e| {
+        crate::error::Error::Other(format!("failed to bind RTCP port {}: {}", rtcp_port, e))
+    })?;
+    sock.set_read_timeout(Some(Duration::from_millis(10)))
+        .expect("set_read_timeout failed");
+    Ok(sock)
+}
+
 /// Handle to a running media pipeline. Drop to stop.
 pub struct MediaHandle {
     done_tx: Sender<()>,
@@ -290,17 +309,27 @@ pub fn start_media(
     let srtp_in = config.srtp_inbound.map(|ctx| Arc::new(Mutex::new(ctx)));
     let srtp_out = config.srtp_outbound.map(|ctx| Arc::new(Mutex::new(ctx)));
 
+    // RTCP socket and remote address.
+    let rtcp_socket = config.rtcp_socket;
+    let rtcp_remote_addr = config.rtcp_remote_addr;
+
     // Spawn an inbound UDP reader thread if transport is available.
     let (reader_done_tx, reader_done_rx) = bounded::<()>(1);
+    let rtcp_socket_for_reader = rtcp_socket.as_ref().map(Arc::clone);
+    // Channel for RTCP packets received by the reader thread.
+    let (rtcp_recv_tx, rtcp_recv_rx) = bounded::<Vec<u8>>(16);
     let reader_thread = transport.as_ref().map(|tr| {
         let socket = Arc::clone(&tr.socket);
         let inbound_tx = channels.rtp_inbound.tx.clone();
         let inbound_rx = channels.rtp_inbound.rx.clone();
         let done = reader_done_rx;
         let srtp_in_clone = srtp_in.clone();
+        let rtcp_sock = rtcp_socket_for_reader;
+        let rtcp_tx = rtcp_recv_tx;
         debug!("media: starting UDP reader thread");
         std::thread::spawn(move || {
             let mut buf = [0u8; 2048];
+            let mut rtcp_buf = [0u8; 512];
             let mut pkt_count: u64 = 0;
             loop {
                 if done.try_recv().is_ok() {
@@ -338,9 +367,19 @@ pub fn start_media(
                             send_drop_oldest(&inbound_tx, &inbound_rx, pkt);
                         }
                     }
-                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
-                    Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => continue,
+                    Err(ref e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                    Err(ref e) if e.kind() == std::io::ErrorKind::TimedOut => {}
                     Err(_) => return,
+                }
+
+                // Non-blocking read from RTCP socket.
+                if let Some(ref rsock) = rtcp_sock {
+                    match rsock.recv_from(&mut rtcp_buf) {
+                        Ok((n, _)) if n >= 8 => {
+                            let _ = rtcp_tx.try_send(rtcp_buf[..n].to_vec());
+                        }
+                        _ => {}
+                    }
                 }
             }
         })
@@ -348,6 +387,7 @@ pub fn start_media(
 
     let transport_for_thread = transport.clone();
     let srtp_out_for_thread = srtp_out;
+    let rtcp_socket_for_thread = rtcp_socket;
     let thread = std::thread::spawn(move || {
         let mut jb = JitterBuffer::new(jitter_depth);
         let mut out_seq: u16 = 0;
@@ -359,6 +399,10 @@ pub fn start_media(
 
         let mut last_rtp_time = Instant::now();
         let jitter_tick = crossbeam_channel::tick(Duration::from_millis(5));
+
+        // RTCP state.
+        let mut rtcp_stats = RtcpStats::new();
+        let rtcp_tick = crossbeam_channel::tick(Duration::from_secs(rtcp::RTCP_INTERVAL_SECS));
 
         loop {
             crossbeam_channel::select! {
@@ -411,6 +455,7 @@ pub fn start_media(
                         continue;
                     }
 
+                    rtcp_stats.record_rtp_received(&pkt, pcm_rate as u32);
                     jb.push(pkt);
                     last_rtp_time = Instant::now();
                     drain_jb_inline(&mut jb, &mut cp, &channels);
@@ -452,6 +497,7 @@ pub fn start_media(
                     if shared.muted.load(Ordering::Relaxed) {
                         continue;
                     }
+                    rtcp_stats.record_rtp_sent(pkt.payload.len(), pkt.header.timestamp);
                     if let Some(ref sent) = channels.sent_rtp {
                         send_drop_oldest(&sent.tx, &sent.rx, clone_packet(&pkt));
                     }
@@ -488,11 +534,29 @@ pub fn start_media(
                     };
                     out_seq = out_seq.wrapping_add(1);
                     out_timestamp = out_timestamp.wrapping_add(proc.samples_per_frame());
+                    rtcp_stats.record_rtp_sent(out_pkt.payload.len(), out_pkt.header.timestamp);
                     if let Some(ref sent) = channels.sent_rtp {
                         send_drop_oldest(&sent.tx, &sent.rx, clone_packet(&out_pkt));
                     }
                     if let Some(ref tr) = transport_for_thread {
                         send_rtp_to_transport(out_pkt.to_bytes(), &srtp_out_for_thread, tr);
+                    }
+                },
+
+                recv(rtcp_tick) -> _ => {
+                    if let Some(ref rsock) = rtcp_socket_for_thread {
+                        if let Some(addr) = rtcp_remote_addr {
+                            let sr = rtcp::build_sr(out_ssrc, &mut rtcp_stats);
+                            let _ = rsock.send_to(&sr, addr);
+                        }
+                    }
+                },
+
+                recv(rtcp_recv_rx) -> msg => {
+                    if let Ok(data) = msg {
+                        if let Some(rtcp::RtcpPacket::SenderReport { ntp_sec, ntp_frac, .. }) = rtcp::parse_rtcp(&data) {
+                            rtcp_stats.process_incoming_sr(ntp_sec, ntp_frac);
+                        }
                     }
                 },
             }
