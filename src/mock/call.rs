@@ -39,15 +39,15 @@ struct Inner {
 }
 
 fn mock_call_id() -> String {
-    use std::cell::Cell;
-    thread_local! {
-        static CTR: Cell<u64> = const { Cell::new(0) };
-    }
-    CTR.with(|c| {
-        let n = c.get();
-        c.set(n + 1);
-        format!("mock-{}", n)
-    })
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static CTR: AtomicU64 = AtomicU64::new(0);
+    format!("mock-{}", CTR.fetch_add(1, Ordering::Relaxed))
+}
+
+fn mock_call_call_id() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static CTR: AtomicU64 = AtomicU64::new(1);
+    format!("mock-call-{}", CTR.fetch_add(1, Ordering::Relaxed))
 }
 
 /// Mock call for testing consumer code that receives Call-like objects.
@@ -73,7 +73,7 @@ impl MockCall {
         Self {
             inner: Mutex::new(Inner {
                 id: mock_call_id(),
-                call_id: "mock-call-id".into(),
+                call_id: mock_call_call_id(),
                 state: CallState::Ringing,
                 direction: Direction::Inbound,
                 from: String::new(),
@@ -508,7 +508,7 @@ mod tests {
         let c = MockCall::new();
         assert_eq!(c.state(), CallState::Ringing);
         assert_eq!(c.direction(), Direction::Inbound);
-        assert_eq!(c.call_id(), "mock-call-id");
+        assert!(c.call_id().starts_with("mock-call-"));
     }
 
     #[test]

@@ -325,6 +325,8 @@ impl Phone {
     }
 
     /// Sets the callback for incoming calls.
+    /// The callback fires for every incoming INVITE, even during an active call (call waiting).
+    /// The application decides whether to accept, reject (486 Busy), or ignore the new call.
     pub fn on_incoming<F: Fn(Arc<Call>) + Send + Sync + 'static>(&self, f: F) {
         self.inner.lock().incoming = Some(Arc::new(f));
     }
@@ -409,11 +411,21 @@ impl Phone {
     pub fn find_call(&self, call_id: &str) -> Option<Arc<Call>> {
         self.inner.lock().calls.get(call_id).cloned()
     }
+
+    /// Returns all active calls.
+    /// Useful for call waiting UIs that need to display concurrent calls.
+    pub fn calls(&self) -> Vec<Arc<Call>> {
+        self.inner.lock().calls.values().cloned().collect()
+    }
 }
 
 impl Drop for Phone {
     fn drop(&mut self) {
-        let _ = self.disconnect();
+        // Only disconnect if this is the last clone — dropping a clone must not
+        // tear down the shared registration/transport.
+        if Arc::strong_count(&self.inner) == 1 {
+            let _ = self.disconnect();
+        }
     }
 }
 
@@ -470,8 +482,6 @@ fn handle_incoming(inner: &Arc<Mutex<Inner>>, from: &str, to: &str) {
     }
 }
 
-/// Handles an incoming INVITE with a real SIP dialog (production path).
-#[allow(clippy::too_many_arguments)]
 /// Wire phone-level call callbacks onto an individual call.
 fn wire_phone_call_callbacks(inner: &Arc<Mutex<Inner>>, call: &Arc<Call>) {
     // Copy callbacks and config out of Phone lock, then drop it before acquiring Call lock.
@@ -996,5 +1006,198 @@ mod tests {
         // Detailed MockDialog inspection is in call::tests::send_dtmf_sip_info_mode.
         // Here we just verify it doesn't error (SIP INFO path doesn't need RTP socket).
         call.send_dtmf("3").unwrap();
+    }
+
+    // --- Call waiting / multi-call ---
+
+    #[test]
+    fn two_concurrent_outbound_calls() {
+        let tr = Arc::new(MockTransport::new());
+        tr.respond_with(200, "OK"); // REGISTER
+
+        let phone = Phone::new(test_cfg());
+        phone.connect_with_transport(Arc::clone(&tr) as Arc<dyn SipTransport>);
+
+        tr.respond_with(200, "OK"); // INVITE 1
+        let call1 = phone
+            .dial("sip:1002@pbx.local", DialOptions::default())
+            .unwrap();
+
+        tr.respond_with(200, "OK"); // INVITE 2
+        let call2 = phone
+            .dial("sip:1003@pbx.local", DialOptions::default())
+            .unwrap();
+
+        assert_ne!(call1.call_id(), call2.call_id());
+        assert!(phone.find_call(&call1.call_id()).is_some());
+        assert!(phone.find_call(&call2.call_id()).is_some());
+        assert_eq!(phone.calls().len(), 2);
+    }
+
+    #[test]
+    fn incoming_during_active_call_fires_callback() {
+        let tr = Arc::new(MockTransport::new());
+        tr.respond_with(200, "OK"); // REGISTER
+
+        let phone = Phone::new(test_cfg());
+
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        phone.on_incoming(move |_call| {
+            let _ = tx.send(true);
+        });
+
+        phone.connect_with_transport(Arc::clone(&tr) as Arc<dyn SipTransport>);
+
+        // Create an active outbound call.
+        tr.respond_with(200, "OK"); // INVITE
+        let call1 = phone
+            .dial("sip:1002@pbx.local", DialOptions::default())
+            .unwrap();
+        assert_eq!(call1.state(), crate::types::CallState::Active);
+
+        // Simulate an incoming INVITE while the first call is active.
+        tr.simulate_invite("sip:1001@pbx.local", "sip:1003@pbx.local");
+
+        let fired = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(fired);
+        assert_eq!(phone.calls().len(), 2);
+    }
+
+    #[test]
+    fn bye_for_one_call_leaves_other_active() {
+        let tr = Arc::new(MockTransport::new());
+        tr.respond_with(200, "OK"); // REGISTER
+
+        let phone = Phone::new(test_cfg());
+        phone.connect_with_transport(Arc::clone(&tr) as Arc<dyn SipTransport>);
+
+        tr.respond_with(200, "OK");
+        let call1 = phone
+            .dial("sip:1002@pbx.local", DialOptions::default())
+            .unwrap();
+        tr.respond_with(200, "OK");
+        let call2 = phone
+            .dial("sip:1003@pbx.local", DialOptions::default())
+            .unwrap();
+
+        assert_eq!(phone.calls().len(), 2);
+
+        // End call1 — call2 should remain active.
+        call1.end().unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+
+        assert!(phone.find_call(&call1.call_id()).is_none());
+        assert!(phone.find_call(&call2.call_id()).is_some());
+        assert_eq!(call2.state(), crate::types::CallState::Active);
+        assert_eq!(phone.calls().len(), 1);
+    }
+
+    #[test]
+    fn disconnect_ends_all_calls() {
+        let tr = Arc::new(MockTransport::new());
+        tr.respond_with(200, "OK"); // REGISTER
+
+        let phone = Phone::new(test_cfg());
+        phone.connect_with_transport(Arc::clone(&tr) as Arc<dyn SipTransport>);
+
+        tr.respond_with(200, "OK");
+        let call1 = phone
+            .dial("sip:1002@pbx.local", DialOptions::default())
+            .unwrap();
+        tr.respond_with(200, "OK");
+        let call2 = phone
+            .dial("sip:1003@pbx.local", DialOptions::default())
+            .unwrap();
+
+        phone.disconnect().unwrap();
+
+        assert_eq!(call1.state(), crate::types::CallState::Ended);
+        assert_eq!(call2.state(), crate::types::CallState::Ended);
+        assert!(phone.calls().is_empty());
+    }
+
+    #[test]
+    fn calls_returns_all_active() {
+        let tr = Arc::new(MockTransport::new());
+        tr.respond_with(200, "OK"); // REGISTER
+
+        let phone = Phone::new(test_cfg());
+        phone.connect_with_transport(Arc::clone(&tr) as Arc<dyn SipTransport>);
+
+        assert!(phone.calls().is_empty());
+
+        tr.respond_with(200, "OK");
+        phone
+            .dial("sip:1002@pbx.local", DialOptions::default())
+            .unwrap();
+        assert_eq!(phone.calls().len(), 1);
+
+        tr.respond_with(200, "OK");
+        phone
+            .dial("sip:1003@pbx.local", DialOptions::default())
+            .unwrap();
+        assert_eq!(phone.calls().len(), 2);
+    }
+
+    #[test]
+    fn dialog_invite_during_active_call() {
+        let tr = Arc::new(MockTransport::new());
+        tr.respond_with(200, "OK"); // REGISTER
+
+        let phone = Phone::new(test_cfg());
+
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        phone.on_incoming(move |call| {
+            let _ = tx.send(call.call_id());
+        });
+
+        phone.connect_with_transport(Arc::clone(&tr) as Arc<dyn SipTransport>);
+
+        // Active outbound call.
+        tr.respond_with(200, "OK");
+        let call1 = phone
+            .dial("sip:1002@pbx.local", DialOptions::default())
+            .unwrap();
+
+        // Incoming via dialog path (production path).
+        let sdp = "v=0\r\no=- 0 0 IN IP4 10.0.0.1\r\ns=-\r\nc=IN IP4 10.0.0.1\r\nm=audio 20000 RTP/AVP 8\r\n";
+        tr.simulate_dialog_invite("sip:1001@pbx.local", "sip:1003@pbx.local", sdp);
+
+        let incoming_id = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_ne!(incoming_id, call1.call_id());
+        assert_eq!(phone.calls().len(), 2);
+    }
+
+    #[test]
+    fn call_arc_freed_after_end() {
+        // Verifies circular Arc references are broken when a call ends.
+        let tr = Arc::new(MockTransport::new());
+        tr.respond_with(200, "OK"); // REGISTER
+
+        let phone = Phone::new(test_cfg());
+        phone.on_call_state(|_call, _state| {});
+        phone.on_call_ended(|_call, _reason| {});
+        phone.on_call_dtmf(|_call, _digit| {});
+        phone.connect_with_transport(Arc::clone(&tr) as Arc<dyn SipTransport>);
+
+        tr.respond_with(200, "OK");
+        let call = phone
+            .dial("sip:1002@pbx.local", DialOptions::default())
+            .unwrap();
+        call.end().unwrap();
+
+        // Give callback threads time to complete.
+        std::thread::sleep(Duration::from_millis(200));
+
+        // After end, our local `call` + the on_ended spawn should be the only Arc holders.
+        // Phone's HashMap should have removed it. The circular callback references
+        // should have been cleared by fire_on_ended.
+        assert!(phone.find_call(&call.call_id()).is_none());
+        // The Arc strong count should be 1 (our local variable only).
+        assert_eq!(
+            Arc::strong_count(&call),
+            1,
+            "Call Arc should have no other holders after end + callback cleanup"
+        );
     }
 }
