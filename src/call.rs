@@ -966,10 +966,33 @@ impl Call {
         } else {
             (None, None)
         };
+        // Bind RTCP socket (RTP port + 1) if we have an RTP socket.
+        let (rtcp_socket, rtcp_remote_addr) = if let Some(ref s) = inner.rtp_socket {
+            let rtp_port = s.local_addr().map(|a| a.port()).unwrap_or(0);
+            let rsock = match media::listen_rtcp_port(rtp_port) {
+                Ok(s) => Some(Arc::new(s)),
+                Err(e) => {
+                    tracing::warn!(rtp_port, error = %e, "RTCP port bind failed, RTCP disabled");
+                    None
+                }
+            };
+            let raddr = if inner.remote_port > 0 {
+                format!("{}:{}", inner.remote_ip, inner.remote_port + 1)
+                    .parse()
+                    .ok()
+            } else {
+                None
+            };
+            (rsock, raddr)
+        } else {
+            (None, None)
+        };
         let config = MediaConfig {
             codec: inner.codec,
             srtp_inbound: srtp_in,
             srtp_outbound: srtp_out,
+            rtcp_socket,
+            rtcp_remote_addr,
             ..MediaConfig::default()
         };
         let handle = media::start_media(
