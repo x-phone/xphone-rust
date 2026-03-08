@@ -28,6 +28,9 @@ struct MockDialogInner {
 
 impl MockDialog {
     pub fn new() -> Self {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(1);
+        let id = format!("mock-dlg-{}", COUNTER.fetch_add(1, Ordering::Relaxed));
         MockDialog {
             inner: Mutex::new(MockDialogInner {
                 last_response_code: 0,
@@ -39,7 +42,7 @@ impl MockDialog {
                 refer_sent: false,
                 last_refer_target: String::new(),
                 info_dtmf_sent: Vec::new(),
-                call_id: "mock-call-id".into(),
+                call_id: id,
                 headers: HashMap::new(),
                 on_notify: None,
             }),

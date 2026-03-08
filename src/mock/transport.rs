@@ -47,6 +47,9 @@ struct Inner {
     invite_func: Option<Arc<dyn Fn() + Send + Sync>>,
     drop_handler: Option<Arc<dyn Fn() + Send + Sync>>,
     incoming_handler: Option<Arc<dyn Fn(String, String) + Send + Sync>>,
+    #[allow(clippy::type_complexity)]
+    dialog_invite_handler:
+        Option<Arc<dyn Fn(Arc<dyn crate::dialog::Dialog>, String, String, String) + Send + Sync>>,
     info_dtmf_handler: Option<Arc<dyn Fn(String, String) + Send + Sync>>,
     response_watchers: HashMap<u16, Vec<Sender<bool>>>,
 }
@@ -76,6 +79,7 @@ impl MockTransport {
                 invite_func: None,
                 drop_handler: None,
                 incoming_handler: None,
+                dialog_invite_handler: None,
                 info_dtmf_handler: None,
                 response_watchers: HashMap::new(),
             }),
@@ -126,6 +130,21 @@ impl MockTransport {
         let handler = self.inner.lock().incoming_handler.clone();
         if let Some(h) = handler {
             h(from.into(), to.into());
+        }
+    }
+
+    /// Simulates an incoming INVITE with a full dialog (production path).
+    /// Creates a MockDialog and dispatches through the `on_dialog_invite` handler.
+    pub fn simulate_dialog_invite(&self, from: &str, to: &str, remote_sdp: &str) {
+        let handler = self.inner.lock().dialog_invite_handler.clone();
+        if let Some(h) = handler {
+            let dlg = Arc::new(crate::mock::dialog::MockDialog::new());
+            h(
+                dlg as Arc<dyn crate::dialog::Dialog>,
+                from.into(),
+                to.into(),
+                remote_sdp.into(),
+            );
         }
     }
 
@@ -291,6 +310,14 @@ impl SipTransport for MockTransport {
 
     fn on_incoming(&self, f: Box<dyn Fn(String, String) + Send + Sync>) {
         self.inner.lock().incoming_handler = Some(Arc::from(f));
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn on_dialog_invite(
+        &self,
+        f: Box<dyn Fn(Arc<dyn crate::dialog::Dialog>, String, String, String) + Send + Sync>,
+    ) {
+        self.inner.lock().dialog_invite_handler = Some(Arc::from(f));
     }
 
     fn on_info_dtmf(&self, f: Box<dyn Fn(String, String) + Send + Sync>) {

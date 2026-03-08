@@ -477,8 +477,9 @@ impl Call {
         }
     }
 
-    fn fire_on_ended(inner: &CallInner, reason: EndReason) {
-        // Stop session timer.
+    fn fire_on_ended(inner: &mut CallInner, reason: EndReason) {
+        // Cancel session timer — thread will exit on next iteration.
+        // Cannot join here (holds inner lock, timer thread also locks inner).
         if let Some(ref cancel) = inner.session_timer_cancel {
             cancel.store(true, std::sync::atomic::Ordering::Relaxed);
         }
@@ -490,6 +491,19 @@ impl Call {
             let f = Arc::clone(f);
             spawn_callback(move || f(reason));
         }
+        // Clear all callbacks to break circular Arc references (Call → callback → Arc<Call>).
+        // Without this, the Call can never be dropped because the callbacks captured Arc<Call>.
+        inner.on_ended_internal = None;
+        inner.on_ended_fn = None;
+        inner.on_state_internal = None;
+        inner.on_state_fn = None;
+        inner.on_dtmf_internal = None;
+        inner.on_dtmf_fn = None;
+        inner.on_media_fn = None;
+        inner.on_hold_fn = None;
+        inner.on_resume_fn = None;
+        inner.on_mute_fn = None;
+        inner.on_unmute_fn = None;
     }
 
     // --- Session timer ---
@@ -581,7 +595,7 @@ impl Call {
         let _ = self.dlg.respond(code, reason, &[]);
         inner.state = CallState::Ended;
         Self::fire_on_state(&inner, CallState::Ended);
-        Self::fire_on_ended(&inner, EndReason::Rejected);
+        Self::fire_on_ended(&mut inner, EndReason::Rejected);
         Ok(())
     }
 
@@ -596,7 +610,7 @@ impl Call {
                 let _ = self.dlg.send_cancel();
                 inner.state = CallState::Ended;
                 Self::fire_on_state(&inner, CallState::Ended);
-                Self::fire_on_ended(&inner, EndReason::Cancelled);
+                Self::fire_on_ended(&mut inner, EndReason::Cancelled);
                 Ok(())
             }
             CallState::Active | CallState::OnHold => {
@@ -606,7 +620,7 @@ impl Call {
                     h.stop();
                 }
                 Self::fire_on_state(&inner, CallState::Ended);
-                Self::fire_on_ended(&inner, EndReason::Local);
+                Self::fire_on_ended(&mut inner, EndReason::Local);
                 Ok(())
             }
             _ => Err(Error::InvalidState),
@@ -743,7 +757,7 @@ impl Call {
                 }
                 inner.state = CallState::Ended;
                 Self::fire_on_state(&inner, CallState::Ended);
-                Self::fire_on_ended(&inner, EndReason::Transfer);
+                Self::fire_on_ended(&mut inner, EndReason::Transfer);
             }
         }));
         self.dlg.send_refer(target)?;
@@ -827,7 +841,7 @@ impl Call {
             h.stop();
         }
         Self::fire_on_state(&inner, CallState::Ended);
-        Self::fire_on_ended(&inner, reason);
+        Self::fire_on_ended(&mut inner, reason);
     }
 
     /// Fires the dialog's on_notify callback (REFER progress from the network).

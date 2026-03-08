@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -14,6 +15,7 @@ struct Inner {
     on_unregistered_fn: Option<Arc<dyn Fn() + Send + Sync>>,
     on_error_fn: Option<Arc<dyn Fn(Error) + Send + Sync>>,
     last_call: Option<Arc<MockCall>>,
+    calls: HashMap<String, Arc<MockCall>>,
 }
 
 /// Mock phone for testing consumer code without a real SIP transport.
@@ -42,6 +44,7 @@ impl MockPhone {
                 on_unregistered_fn: None,
                 on_error_fn: None,
                 last_call: None,
+                calls: HashMap::new(),
             }),
         }
     }
@@ -62,16 +65,22 @@ impl MockPhone {
         Ok(())
     }
 
-    /// Disconnects the phone. Fires the on_unregistered callback.
+    /// Disconnects the phone. Ends all active calls and fires the on_unregistered callback.
     pub fn disconnect(&self) -> Result<()> {
-        let cb = {
+        let (cb, active_calls) = {
             let mut inner = self.inner.lock();
             if inner.state == PhoneState::Disconnected {
                 return Err(Error::NotConnected);
             }
             inner.state = PhoneState::Disconnected;
-            inner.on_unregistered_fn.clone()
+            let calls: Vec<Arc<MockCall>> = inner.calls.drain().map(|(_, c)| c).collect();
+            (inner.on_unregistered_fn.clone(), calls)
         };
+        for call in active_calls {
+            if call.state() != crate::types::CallState::Ended {
+                call.end().ok();
+            }
+        }
         if let Some(f) = cb {
             f();
         }
@@ -90,6 +99,7 @@ impl MockPhone {
         call.set_direction(crate::types::Direction::Outbound);
         call.set_remote_uri(target);
         inner.last_call = Some(Arc::clone(&call));
+        inner.calls.insert(call.call_id(), Arc::clone(&call));
         Ok(call)
     }
 
@@ -128,6 +138,7 @@ impl MockPhone {
         let cb = {
             let mut inner = self.inner.lock();
             inner.last_call = Some(Arc::clone(&call));
+            inner.calls.insert(call.call_id(), Arc::clone(&call));
             inner.on_incoming_fn.clone()
         };
         if let Some(f) = cb {
@@ -146,6 +157,16 @@ impl MockPhone {
     /// Returns the most recent call (dialed or incoming).
     pub fn last_call(&self) -> Option<Arc<MockCall>> {
         self.inner.lock().last_call.clone()
+    }
+
+    /// Looks up a tracked call by ID.
+    pub fn find_call(&self, call_id: &str) -> Option<Arc<MockCall>> {
+        self.inner.lock().calls.get(call_id).cloned()
+    }
+
+    /// Returns all tracked calls.
+    pub fn calls(&self) -> Vec<Arc<MockCall>> {
+        self.inner.lock().calls.values().cloned().collect()
     }
 }
 
@@ -295,6 +316,35 @@ mod tests {
         p.simulate_incoming("sip:1001@pbx.local");
         let last = p.last_call().unwrap();
         assert_eq!(last.remote_uri(), "sip:1001@pbx.local");
+    }
+
+    #[test]
+    fn find_call_returns_tracked_call() {
+        let p = MockPhone::new();
+        p.connect().unwrap();
+        let call = p
+            .dial("sip:1002@pbx.local", DialOptions::default())
+            .unwrap();
+        let found = p.find_call(&call.call_id()).unwrap();
+        assert_eq!(found.call_id(), call.call_id());
+    }
+
+    #[test]
+    fn multiple_calls_tracked() {
+        let p = MockPhone::new();
+        p.connect().unwrap();
+        let c1 = p
+            .dial("sip:1002@pbx.local", DialOptions::default())
+            .unwrap();
+        let c2 = p
+            .dial("sip:1003@pbx.local", DialOptions::default())
+            .unwrap();
+        p.on_incoming(|_| {});
+        p.simulate_incoming("sip:1004@pbx.local");
+
+        assert_eq!(p.calls().len(), 3);
+        assert!(p.find_call(&c1.call_id()).is_some());
+        assert!(p.find_call(&c2.call_id()).is_some());
     }
 
     #[test]
