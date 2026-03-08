@@ -101,7 +101,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-xphone = "0.1"
+xphone = "0.2"
 ```
 
 Requires Rust 1.87+.
@@ -195,15 +195,18 @@ if let Some(pcm_rx) = call.pcm_reader() {
 | Mute / Unmute | Done |
 | G.711 u-law (PCMU), G.711 A-law (PCMA) | Done |
 | G.722 wideband codec | Done |
+| Opus codec (optional `opus-codec` feature) | Done |
 | PCM audio frames (`Vec<i16>`) and raw RTP access | Done |
 | Jitter buffer | Done |
 | SRTP (encrypted media, AES_CM_128_HMAC_SHA1_80) | Done |
+| SRTP replay protection (RFC 3711) | Done |
+| RTCP sender/receiver reports (RFC 3550) | Done |
 | TCP and TLS SIP transport | Done |
 | Early media (183 Session Progress) | Done |
 | STUN NAT traversal (RFC 5389) | Done |
+| 302 redirect following (RFC 3261) | Done |
 | MockPhone & MockCall for unit testing | Done |
 | Attended transfer | Planned |
-| Opus codec | Planned |
 
 ---
 
@@ -506,7 +509,7 @@ cargo run --example sipcli --features cli -- --server pbx.example.com --user 100
 |---|---|
 | SIP Signaling | Custom (message parsing, digest auth, transactions, UDP/TCP/TLS, STUN) |
 | RTP / SRTP | Custom (`std::net::UdpSocket`, AES_CM_128_HMAC_SHA1_80) |
-| G.711 / G.722 | Built-in (PCMU, PCMA, G.722) |
+| G.711 / G.722 / Opus | Built-in (PCMU, PCMA, G.722); Opus via optional `opus-codec` feature |
 | Jitter Buffer | Built-in |
 | TUI (sipcli) | [ratatui](https://github.com/ratatui/ratatui) + [cpal](https://github.com/RustAudio/cpal) |
 
@@ -520,11 +523,11 @@ This library is actively developed but not yet feature-complete. The gaps below 
 
 ### Security
 
-**SRTP is implemented but not yet hardened.** The `AES_CM_128_HMAC_SHA1_80` cipher suite is supported with SDES key exchange. Replay protection, key material zeroization, SRTCP encryption, and per-SSRC crypto state tracking are not yet implemented. DTLS-SRTP key exchange is not supported (SDES only). Evaluate accordingly for high-security environments.
+**SRTP is implemented with replay protection.** The `AES_CM_128_HMAC_SHA1_80` cipher suite is supported with SDES key exchange and a 128-packet sliding window for replay protection (RFC 3711). Crypto uses audited RustCrypto crates (`aes`, `sha1`, `hmac`). Key material zeroization, SRTCP encryption, and per-SSRC crypto state tracking are not yet implemented. DTLS-SRTP key exchange is not supported (SDES only). Evaluate accordingly for high-security environments.
 
 ### Codec coverage
 
-**Opus is not yet supported.** G.711 (PCMU/PCMA) and G.722 are implemented. Opus is the dominant codec in WebRTC and modern VoIP — its absence limits interoperability with those platforms.
+**Opus is supported as an optional feature.** Enable the `opus-codec` feature to add Opus codec support (PT 111). This requires `libopus` to be installed on the system. G.711 (PCMU/PCMA) and G.722 are always available with no external dependencies.
 
 **G.729 is not supported.** G.729 remains widely deployed in enterprise PBX environments (Cisco, Avaya, Mitel). If your SIP trunk or PBX requires G.729, xphone cannot currently interoperate with it.
 
@@ -535,8 +538,6 @@ This library is actively developed but not yet feature-complete. The gaps below 
 **Attended (consultative) transfer is not implemented.** Only blind transfer via REFER is supported. Attended transfer requires coordinating two simultaneous call legs with a REFER/Replaces header.
 
 **DTMF is RFC 4733 (RTP telephone-events) only.** Some legacy PBXes use SIP INFO (RFC 2976) for DTMF instead. If your system requires SIP INFO DTMF, tones may not be received.
-
-**No call forwarding (302).** Incoming 302 Moved Temporarily responses are not followed automatically.
 
 **No call parking.** Park/retrieve functionality (common in office deployments) is not implemented.
 
@@ -558,22 +559,20 @@ This library is actively developed but not yet feature-complete. The gaps below 
 
 **No video.** Only audio media (single `m=audio` line in SDP) is supported. H.264, VP8, and other video codecs are not implemented.
 
-**No RTCP.** RTP Control Protocol feedback (jitter reports, packet loss, round-trip time) is not sent or processed.
+**Basic RTCP only.** Sender/receiver reports (SR/RR) are sent periodically and incoming SR packets are processed for jitter and loss stats. Extended RTCP features (SDES, BYE, APP, RTCP-XR) are not implemented.
 
 ### Project maturity
 
-This is an early-stage project (v0.1.x). The API may change between releases. Evaluate accordingly for critical production workloads.
+This is an early-stage project. The API may change between releases. Evaluate accordingly for critical production workloads.
 
 ---
 
 ## Roadmap
 
-- SRTP hardening — replay protection, DTLS-SRTP, key zeroization
-- Opus codec
+- SRTP hardening — DTLS-SRTP, key zeroization, SRTCP encryption
 - Attended (consultative) transfer
 - SIP INFO DTMF (RFC 2976) for legacy PBX compatibility
 - TURN relay and full ICE for symmetric NAT
-- RTCP support
 - MWI (voicemail notification)
 
 ---
