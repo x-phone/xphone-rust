@@ -302,7 +302,7 @@ impl Client {
                 ConsumeResult::Success(result) => return Ok(*result),
                 ConsumeResult::Redirect(new_target) => {
                     redirects += 1;
-                    if redirects > MAX_REDIRECTS {
+                    if redirects >= MAX_REDIRECTS {
                         return Err(Error::Other(format!(
                             "sip: too many redirects (max {})",
                             MAX_REDIRECTS
@@ -415,7 +415,7 @@ impl Client {
             self.tm.remove_tx(branch);
 
             let contact = resp.header("Contact");
-            let new_target = extract_uri(contact);
+            let new_target = extract_uri(contact).trim().to_string();
             if new_target.is_empty() {
                 return Err(Error::Other(format!(
                     "sip: {} {} redirect with no Contact URI",
@@ -856,8 +856,8 @@ mod tests {
         let client = Client::new(cfg).unwrap();
 
         let handle = std::thread::spawn(move || {
-            // Respond with 302 for every INVITE (1 original + MAX_REDIRECTS redirects + 1 more).
-            for i in 0..=MAX_REDIRECTS {
+            // Respond with 302 for every INVITE (1 original + MAX_REDIRECTS - 1 followed redirects + 1 that triggers error).
+            for i in 0..MAX_REDIRECTS {
                 let (data, from) = server.receive(Duration::from_secs(2)).unwrap();
                 let req = super::super::message::parse(&data).unwrap();
                 assert_eq!(req.method, "INVITE");
