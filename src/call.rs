@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use parking_lot::Mutex;
 use tracing::info;
 
+use crate::callback_pool::spawn_callback;
 use crate::config::DialOptions;
 use crate::dialog::Dialog;
 use crate::dtmf;
@@ -464,11 +465,11 @@ impl Call {
     fn fire_on_state(inner: &CallInner, state: CallState) {
         if let Some(ref f) = inner.on_state_internal {
             let f = Arc::clone(f);
-            std::thread::spawn(move || f(state));
+            spawn_callback(move || f(state));
         }
         if let Some(ref f) = inner.on_state_fn {
             let f = Arc::clone(f);
-            std::thread::spawn(move || f(state));
+            spawn_callback(move || f(state));
         }
     }
 
@@ -479,11 +480,11 @@ impl Call {
         }
         if let Some(ref f) = inner.on_ended_internal {
             let f = Arc::clone(f);
-            std::thread::spawn(move || f(reason));
+            spawn_callback(move || f(reason));
         }
         if let Some(ref f) = inner.on_ended_fn {
             let f = Arc::clone(f);
-            std::thread::spawn(move || f(reason));
+            spawn_callback(move || f(reason));
         }
     }
 
@@ -562,7 +563,7 @@ impl Call {
         self.start_session_timer();
 
         if let Some(f) = on_media_fn {
-            std::thread::spawn(move || f());
+            spawn_callback(move || f());
         }
         Ok(())
     }
@@ -649,7 +650,7 @@ impl Call {
             on_mute = inner.on_mute_fn.clone();
         }
         if let Some(f) = on_mute {
-            std::thread::spawn(move || f());
+            spawn_callback(move || f());
         }
         Ok(())
     }
@@ -669,7 +670,7 @@ impl Call {
             on_unmute = inner.on_unmute_fn.clone();
         }
         if let Some(f) = on_unmute {
-            std::thread::spawn(move || f());
+            spawn_callback(move || f());
         }
         Ok(())
     }
@@ -714,9 +715,12 @@ impl Call {
                 return Err(Error::InvalidState);
             }
         }
-        let call = Arc::clone(self);
+        let weak = Arc::downgrade(self);
         self.dlg.on_notify(Box::new(move |code| {
             if code == 200 {
+                let Some(call) = weak.upgrade() else {
+                    return;
+                };
                 let mut inner = call.inner.lock();
                 if inner.state == CallState::Ended {
                     return;
@@ -756,7 +760,7 @@ impl Call {
                         Self::fire_on_state(&inner, CallState::EarlyMedia);
                         if let Some(ref f) = inner.on_media_fn {
                             let f = Arc::clone(f);
-                            std::thread::spawn(move || f());
+                            spawn_callback(move || f());
                         }
                     }
                     false
@@ -773,7 +777,7 @@ impl Call {
                         Self::fire_on_state(&inner, CallState::Active);
                         if let Some(ref f) = inner.on_media_fn {
                             let f = Arc::clone(f);
-                            std::thread::spawn(move || f());
+                            spawn_callback(move || f());
                         }
                         true
                     } else {
@@ -858,10 +862,10 @@ impl Call {
         drop(inner);
 
         if let Some(f) = hold_fn {
-            std::thread::spawn(move || f());
+            spawn_callback(move || f());
         }
         if let Some(f) = resume_fn {
-            std::thread::spawn(move || f());
+            spawn_callback(move || f());
         }
     }
 

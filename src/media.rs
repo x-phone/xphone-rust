@@ -7,6 +7,7 @@ use crossbeam_channel::{bounded, Receiver, Sender, TrySendError};
 use parking_lot::Mutex;
 use tracing::{debug, warn};
 
+use crate::callback_pool::spawn_callback;
 use crate::codec::{self, CodecProcessor};
 use crate::dtmf;
 use crate::jitter::JitterBuffer;
@@ -398,7 +399,7 @@ pub fn start_media(
                                 if let Some(f) = cb {
                                     debug!(digit = %ev.digit, "media: firing DTMF callback");
                                     let digit = ev.digit.clone();
-                                    std::thread::spawn(move || f(digit));
+                                    spawn_callback(move || f(digit));
                                 } else {
                                     warn!(digit = %ev.digit, "media: DTMF received but no callback registered");
                                 }
@@ -431,11 +432,11 @@ pub fn start_media(
                             drop(state);
                             let on_state = shared.on_state_fn.lock().clone();
                             if let Some(f) = on_state {
-                                std::thread::spawn(move || f(CallState::Ended));
+                                spawn_callback(move || f(CallState::Ended));
                             }
                             let on_ended = shared.on_ended_fn.lock().clone();
                             if let Some(f) = on_ended {
-                                std::thread::spawn(move || f(EndReason::Timeout));
+                                spawn_callback(move || f(EndReason::Timeout));
                             }
                             return;
                         }

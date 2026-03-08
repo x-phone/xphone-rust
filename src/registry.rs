@@ -4,6 +4,7 @@ use std::time::Duration;
 use parking_lot::Mutex;
 use tracing::{debug, info, warn};
 
+use crate::callback_pool::spawn_callback;
 use crate::config::Config;
 use crate::error::{Error, Result};
 use crate::transport::SipTransport;
@@ -130,7 +131,7 @@ impl Registry {
         drop(inner);
 
         if already {
-            std::thread::spawn(move || cb());
+            spawn_callback(move || cb());
         }
     }
 
@@ -178,7 +179,7 @@ impl Registry {
                     inner.on_registered.clone()
                 };
                 if let Some(f) = cb {
-                    std::thread::spawn(move || f());
+                    spawn_callback(move || f());
                 }
                 return Ok(());
             }
@@ -195,7 +196,7 @@ impl Registry {
             inner.on_error.clone()
         };
         if let Some(f) = cb {
-            std::thread::spawn(move || f(Error::RegistrationFailed));
+            spawn_callback(move || f(Error::RegistrationFailed));
         }
         Err(Error::RegistrationFailed)
     }
@@ -221,7 +222,7 @@ fn handle_drop(inner: &Arc<Mutex<Inner>>, tr: &Arc<dyn SipTransport>, cfg: &Conf
     };
 
     if let Some(f) = cb {
-        f();
+        spawn_callback(move || f());
     }
 
     if should_reregister {
@@ -262,7 +263,7 @@ fn reregister(inner: &Arc<Mutex<Inner>>, tr: &Arc<dyn SipTransport>, cfg: &Confi
                 guard.on_registered.clone()
             };
             if let Some(f) = cb {
-                std::thread::spawn(move || f());
+                spawn_callback(move || f());
             }
             return Ok(());
         }
@@ -274,7 +275,7 @@ fn reregister(inner: &Arc<Mutex<Inner>>, tr: &Arc<dyn SipTransport>, cfg: &Confi
         guard.on_error.clone()
     };
     if let Some(f) = cb {
-        std::thread::spawn(move || f(Error::RegistrationFailed));
+        spawn_callback(move || f(Error::RegistrationFailed));
     }
     Err(Error::RegistrationFailed)
 }

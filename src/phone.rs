@@ -158,10 +158,10 @@ impl Phone {
         }
     }
 
-    /// Disconnects the phone: stops registry and closes transport.
+    /// Disconnects the phone: ends all active calls, stops registry, and closes transport.
     pub fn disconnect(&self) -> Result<()> {
         info!("Phone disconnecting");
-        let (reg, tr, unreg_fn) = {
+        let (reg, tr, unreg_fn, active_calls) = {
             let mut inner = self.inner.lock();
             if inner.state == PhoneState::Disconnected {
                 return Err(Error::NotConnected);
@@ -169,9 +169,15 @@ impl Phone {
             let reg = inner.reg.take();
             let tr = inner.tr.take();
             let unreg_fn = inner.on_unregistered_fn.clone();
+            let active_calls: Vec<Arc<Call>> = inner.calls.drain().map(|(_, c)| c).collect();
             inner.state = PhoneState::Disconnected;
-            (reg, tr, unreg_fn)
+            (reg, tr, unreg_fn, active_calls)
         };
+
+        // End all active calls so their resources (media, sockets, SRTP) are released.
+        for call in active_calls {
+            let _ = call.end();
+        }
 
         if let Some(reg) = reg {
             reg.stop();
@@ -180,7 +186,7 @@ impl Phone {
             let _ = tr.close();
         }
         if let Some(f) = unreg_fn {
-            std::thread::spawn(move || f());
+            crate::callback_pool::spawn_callback(move || f());
         }
 
         Ok(())
@@ -391,6 +397,12 @@ impl Phone {
     /// Looks up an active call by dialog ID.
     pub fn find_call(&self, call_id: &str) -> Option<Arc<Call>> {
         self.inner.lock().calls.get(call_id).cloned()
+    }
+}
+
+impl Drop for Phone {
+    fn drop(&mut self) {
+        let _ = self.disconnect();
     }
 }
 

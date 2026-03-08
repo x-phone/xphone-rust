@@ -1054,7 +1054,7 @@ fn draw(f: &mut ratatui::Frame, state: &SharedState) {
             .border_set(border::ROUNDED)
             .border_style(Style::default().fg(ACCENT_DIM))
             .title(Span::styled(
-                " sipcli ",
+                " sipcli (rust) ",
                 Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
             ))
             .style(Style::default().bg(BAR_BG)),

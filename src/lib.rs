@@ -4,6 +4,7 @@
 //! and mock types for testing consumer code without a real SIP transport.
 
 pub mod call;
+pub(crate) mod callback_pool;
 pub mod codec;
 pub mod config;
 pub mod dialog;
