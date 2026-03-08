@@ -9,13 +9,16 @@
 //! - TODO: Implement full ROC estimation per RFC 3711 Appendix A instead of the
 //!   simplified 0x1000/0xF000 threshold heuristic (fine for sequential telephony
 //!   traffic but not robust against large packet reordering).
-//! - TODO: Replace inline AES-128/SHA-1/HMAC-SHA1 with audited crates (`aes`, `sha1`,
-//!   `hmac`) for constant-time guarantees and hardware acceleration (AES-NI).
 //! - TODO: Zeroize key material on drop (use `zeroize` crate on `SrtpContext` fields).
 //! - TODO: Track per-SSRC crypto state for inbound streams (RFC 3711 §3.2.3).
-//! - TODO: Cache AES expanded key schedule in `SrtpContext` instead of recomputing per block.
 
 use std::fmt;
+
+use aes::cipher::{BlockEncrypt, KeyInit};
+use aes::Aes128;
+use hmac::Mac;
+
+type HmacSha1 = hmac::Hmac<sha1::Sha1>;
 
 use crate::error::{Error, Result};
 
@@ -112,8 +115,8 @@ impl ReplayWindow {
 
 /// SRTP crypto context for a single direction (send or receive).
 pub struct SrtpContext {
-    /// AES-128 cipher key (16 bytes), derived from master key.
-    cipher_key: [u8; 16],
+    /// Cached AES-128 cipher (expanded key schedule), derived from master key.
+    cipher: Aes128,
     /// HMAC-SHA1 authentication key (20 bytes), derived from master key.
     auth_key: [u8; 20],
     /// Session salt (14 bytes), derived from master key.
@@ -155,19 +158,18 @@ impl SrtpContext {
             )));
         }
 
-        let cipher_key = derive_session_key(master_key, master_salt, LABEL_CIPHER_KEY, 16)?;
-        let auth_key = derive_session_key(master_key, master_salt, LABEL_AUTH_KEY, 20)?;
-        let salt_bytes = derive_session_key(master_key, master_salt, LABEL_SALT, 14)?;
+        let cipher_key = derive_session_key(master_key, master_salt, LABEL_CIPHER_KEY, 16);
+        let auth_key = derive_session_key(master_key, master_salt, LABEL_AUTH_KEY, 20);
+        let salt_bytes = derive_session_key(master_key, master_salt, LABEL_SALT, 14);
 
-        let mut ck = [0u8; 16];
-        ck.copy_from_slice(&cipher_key);
+        let cipher = Aes128::new(cipher_key[..16].into());
         let mut ak = [0u8; 20];
         ak.copy_from_slice(&auth_key);
         let mut ss = [0u8; 14];
         ss.copy_from_slice(&salt_bytes);
 
         Ok(Self {
-            cipher_key: ck,
+            cipher,
             auth_key: ak,
             session_salt: ss,
             roc: 0,
@@ -213,12 +215,12 @@ impl SrtpContext {
         // Encrypt the payload (header stays cleartext).
         let mut out = rtp.to_vec();
         let keystream = generate_keystream(
-            &self.cipher_key,
+            &self.cipher,
             &self.session_salt,
             ssrc,
             index,
             out.len() - header_len,
-        )?;
+        );
         for i in header_len..out.len() {
             out[i] ^= keystream[i - header_len];
         }
@@ -255,9 +257,13 @@ impl SrtpContext {
             return Err(Error::Other("srtp: replay detected".into()));
         }
 
-        // Verify auth tag.
-        let expected_tag = compute_auth_tag(&self.auth_key, authenticated_portion, estimated_roc);
-        if !constant_time_eq(received_tag, &expected_tag) {
+        // Verify auth tag (constant-time via `subtle` crate inside `hmac`).
+        if !verify_auth_tag(
+            &self.auth_key,
+            authenticated_portion,
+            estimated_roc,
+            received_tag,
+        ) {
             return Err(Error::Other("srtp: authentication failed".into()));
         }
 
@@ -267,13 +273,8 @@ impl SrtpContext {
 
         // Decrypt payload.
         let payload_len = authenticated_len - header_len;
-        let keystream = generate_keystream(
-            &self.cipher_key,
-            &self.session_salt,
-            ssrc,
-            index,
-            payload_len,
-        )?;
+        let keystream =
+            generate_keystream(&self.cipher, &self.session_salt, ssrc, index, payload_len);
 
         let mut out = authenticated_portion.to_vec();
         for i in header_len..out.len() {
@@ -328,12 +329,9 @@ impl SrtpContext {
 /// key_derivation_rate = 0 (default), so `r = index DIV key_derivation_rate = 0`.
 /// `x = label || r` (7 bytes of label padded to 14 bytes) XOR salt.
 /// Session key = AES-CM(master_key, x, 0) for required length.
-fn derive_session_key(
-    master_key: &[u8],
-    master_salt: &[u8],
-    label: u8,
-    out_len: usize,
-) -> Result<Vec<u8>> {
+fn derive_session_key(master_key: &[u8], master_salt: &[u8], label: u8, out_len: usize) -> Vec<u8> {
+    let cipher = Aes128::new(master_key.into());
+
     // Build the 14-byte x value: label at byte 7 (0-indexed), rest zero, XOR with salt.
     let mut x = [0u8; 14];
     x[7] = label;
@@ -346,30 +344,29 @@ fn derive_session_key(
     let mut result = Vec::with_capacity(blocks_needed * AES_BLOCK_SIZE);
 
     for block_counter in 0..blocks_needed {
-        let mut iv = [0u8; AES_BLOCK_SIZE];
+        let mut iv = aes::Block::default();
         iv[..14].copy_from_slice(&x);
-        // Last 2 bytes are the block counter (big-endian).
         iv[14] = (block_counter >> 8) as u8;
         iv[15] = block_counter as u8;
 
-        let encrypted = aes_ecb_encrypt(master_key, &iv)?;
-        result.extend_from_slice(&encrypted);
+        cipher.encrypt_block(&mut iv);
+        result.extend_from_slice(&iv);
     }
 
     result.truncate(out_len);
-    Ok(result)
+    result
 }
 
 /// Generates an AES-CM keystream for SRTP payload encryption.
 ///
 /// IV = (ssrc XOR salt) with packet index, per RFC 3711 §4.1.1.
 fn generate_keystream(
-    cipher_key: &[u8],
+    cipher: &Aes128,
     session_salt: &[u8],
     ssrc: u32,
     index: u64,
     len: usize,
-) -> Result<Vec<u8>> {
+) -> Vec<u8> {
     // Build the IV per RFC 3711 §4.1.1:
     // IV = (k_s * 2^16) XOR (SSRC * 2^64) XOR (i * 2^16)
     // In practice: 16-byte IV where:
@@ -405,43 +402,32 @@ fn generate_keystream(
         block_iv[14] ^= (bc >> 8) as u8;
         block_iv[15] ^= bc as u8;
 
-        let encrypted = aes_ecb_encrypt(cipher_key, &block_iv)?;
-        keystream.extend_from_slice(&encrypted);
+        let mut block = aes::Block::clone_from_slice(&block_iv);
+        cipher.encrypt_block(&mut block);
+        keystream.extend_from_slice(&block);
     }
 
     keystream.truncate(len);
-    Ok(keystream)
+    keystream
 }
 
-/// AES-128 ECB encrypt a single block using inline implementation.
-fn aes_ecb_encrypt(key: &[u8], block: &[u8; 16]) -> Result<[u8; 16]> {
-    if key.len() != 16 {
-        return Err(Error::Other("srtp: AES key must be 16 bytes".into()));
-    }
-    Ok(aes128_encrypt_block(key, block))
-}
-
-/// Computes the HMAC-SHA1-80 auth tag over the authenticated portion + ROC.
+/// Computes the HMAC-SHA1-80 auth tag over the authenticated portion + ROC (for protect).
 fn compute_auth_tag(auth_key: &[u8], authenticated: &[u8], roc: u32) -> [u8; AUTH_TAG_LEN] {
-    let mut data = Vec::with_capacity(authenticated.len() + 4);
-    data.extend_from_slice(authenticated);
-    data.extend_from_slice(&roc.to_be_bytes());
-    let full_mac = hmac_sha1(auth_key, &data);
+    let mut mac = <HmacSha1 as Mac>::new_from_slice(auth_key).expect("HMAC accepts any key length");
+    mac.update(authenticated);
+    mac.update(&roc.to_be_bytes());
+    let full_mac = mac.finalize().into_bytes();
     let mut result = [0u8; AUTH_TAG_LEN];
     result.copy_from_slice(&full_mac[..AUTH_TAG_LEN]);
     result
 }
 
-/// Constant-time comparison of two byte slices.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    let mut diff = 0u8;
-    for (x, y) in a.iter().zip(b.iter()) {
-        diff |= x ^ y;
-    }
-    diff == 0
+/// Verifies auth tag using HMAC's built-in constant-time comparison (via `subtle` crate).
+fn verify_auth_tag(auth_key: &[u8], authenticated: &[u8], roc: u32, received_tag: &[u8]) -> bool {
+    let mut mac = <HmacSha1 as Mac>::new_from_slice(auth_key).expect("HMAC accepts any key length");
+    mac.update(authenticated);
+    mac.update(&roc.to_be_bytes());
+    mac.verify_truncated_left(received_tag).is_ok()
 }
 
 /// Calculates the actual RTP header length including CSRC and extensions.
@@ -465,258 +451,6 @@ fn rtp_header_len(rtp: &[u8]) -> Result<usize> {
         return Err(Error::Other("srtp: header exceeds packet length".into()));
     }
     Ok(len)
-}
-
-// --- SHA-1 + HMAC-SHA1 implementation ---
-
-/// SHA-1 hash (FIPS 180-4). Returns 20-byte digest.
-fn sha1(data: &[u8]) -> [u8; 20] {
-    let mut h0: u32 = 0x67452301;
-    let mut h1: u32 = 0xEFCDAB89;
-    let mut h2: u32 = 0x98BADCFE;
-    let mut h3: u32 = 0x10325476;
-    let mut h4: u32 = 0xC3D2E1F0;
-
-    let bit_len = (data.len() as u64) * 8;
-    // Pad message: append 0x80, then zeros, then 64-bit length.
-    let mut padded = data.to_vec();
-    padded.push(0x80);
-    while padded.len() % 64 != 56 {
-        padded.push(0);
-    }
-    padded.extend_from_slice(&bit_len.to_be_bytes());
-
-    for chunk in padded.chunks_exact(64) {
-        let mut w = [0u32; 80];
-        for i in 0..16 {
-            w[i] = u32::from_be_bytes([
-                chunk[i * 4],
-                chunk[i * 4 + 1],
-                chunk[i * 4 + 2],
-                chunk[i * 4 + 3],
-            ]);
-        }
-        for i in 16..80 {
-            w[i] = (w[i - 3] ^ w[i - 8] ^ w[i - 14] ^ w[i - 16]).rotate_left(1);
-        }
-
-        let (mut a, mut b, mut c, mut d, mut e) = (h0, h1, h2, h3, h4);
-
-        #[allow(clippy::needless_range_loop)]
-        for i in 0..80 {
-            let (f, k) = match i {
-                0..=19 => ((b & c) | ((!b) & d), 0x5A827999u32),
-                20..=39 => (b ^ c ^ d, 0x6ED9EBA1u32),
-                40..=59 => ((b & c) | (b & d) | (c & d), 0x8F1BBCDCu32),
-                _ => (b ^ c ^ d, 0xCA62C1D6u32),
-            };
-            let temp = a
-                .rotate_left(5)
-                .wrapping_add(f)
-                .wrapping_add(e)
-                .wrapping_add(k)
-                .wrapping_add(w[i]);
-            e = d;
-            d = c;
-            c = b.rotate_left(30);
-            b = a;
-            a = temp;
-        }
-
-        h0 = h0.wrapping_add(a);
-        h1 = h1.wrapping_add(b);
-        h2 = h2.wrapping_add(c);
-        h3 = h3.wrapping_add(d);
-        h4 = h4.wrapping_add(e);
-    }
-
-    let mut result = [0u8; 20];
-    result[0..4].copy_from_slice(&h0.to_be_bytes());
-    result[4..8].copy_from_slice(&h1.to_be_bytes());
-    result[8..12].copy_from_slice(&h2.to_be_bytes());
-    result[12..16].copy_from_slice(&h3.to_be_bytes());
-    result[16..20].copy_from_slice(&h4.to_be_bytes());
-    result
-}
-
-/// HMAC-SHA1 (RFC 2104). Returns 20-byte MAC.
-fn hmac_sha1(key: &[u8], data: &[u8]) -> [u8; 20] {
-    const BLOCK_SIZE: usize = 64;
-
-    // If key > block size, hash it first.
-    let key_block = if key.len() > BLOCK_SIZE {
-        let h = sha1(key);
-        let mut kb = [0u8; BLOCK_SIZE];
-        kb[..20].copy_from_slice(&h);
-        kb
-    } else {
-        let mut kb = [0u8; BLOCK_SIZE];
-        kb[..key.len()].copy_from_slice(key);
-        kb
-    };
-
-    // Inner: SHA1(key XOR ipad || data)
-    let mut inner = Vec::with_capacity(BLOCK_SIZE + data.len());
-    for &b in &key_block {
-        inner.push(b ^ 0x36);
-    }
-    inner.extend_from_slice(data);
-    let inner_hash = sha1(&inner);
-
-    // Outer: SHA1(key XOR opad || inner_hash)
-    let mut outer = Vec::with_capacity(BLOCK_SIZE + 20);
-    for &b in &key_block {
-        outer.push(b ^ 0x5C);
-    }
-    outer.extend_from_slice(&inner_hash);
-    sha1(&outer)
-}
-
-// --- AES-128 implementation (lookup table based) ---
-
-/// AES S-Box.
-#[rustfmt::skip]
-const SBOX: [u8; 256] = [
-    0x63, 0x7c, 0x77, 0x7b, 0xf2, 0x6b, 0x6f, 0xc5, 0x30, 0x01, 0x67, 0x2b, 0xfe, 0xd7, 0xab, 0x76,
-    0xca, 0x82, 0xc9, 0x7d, 0xfa, 0x59, 0x47, 0xf0, 0xad, 0xd4, 0xa2, 0xaf, 0x9c, 0xa4, 0x72, 0xc0,
-    0xb7, 0xfd, 0x93, 0x26, 0x36, 0x3f, 0xf7, 0xcc, 0x34, 0xa5, 0xe5, 0xf1, 0x71, 0xd8, 0x31, 0x15,
-    0x04, 0xc7, 0x23, 0xc3, 0x18, 0x96, 0x05, 0x9a, 0x07, 0x12, 0x80, 0xe2, 0xeb, 0x27, 0xb2, 0x75,
-    0x09, 0x83, 0x2c, 0x1a, 0x1b, 0x6e, 0x5a, 0xa0, 0x52, 0x3b, 0xd6, 0xb3, 0x29, 0xe3, 0x2f, 0x84,
-    0x53, 0xd1, 0x00, 0xed, 0x20, 0xfc, 0xb1, 0x5b, 0x6a, 0xcb, 0xbe, 0x39, 0x4a, 0x4c, 0x58, 0xcf,
-    0xd0, 0xef, 0xaa, 0xfb, 0x43, 0x4d, 0x33, 0x85, 0x45, 0xf9, 0x02, 0x7f, 0x50, 0x3c, 0x9f, 0xa8,
-    0x51, 0xa3, 0x40, 0x8f, 0x92, 0x9d, 0x38, 0xf5, 0xbc, 0xb6, 0xda, 0x21, 0x10, 0xff, 0xf3, 0xd2,
-    0xcd, 0x0c, 0x13, 0xec, 0x5f, 0x97, 0x44, 0x17, 0xc4, 0xa7, 0x7e, 0x3d, 0x64, 0x5d, 0x19, 0x73,
-    0x60, 0x81, 0x4f, 0xdc, 0x22, 0x2a, 0x90, 0x88, 0x46, 0xee, 0xb8, 0x14, 0xde, 0x5e, 0x0b, 0xdb,
-    0xe0, 0x32, 0x3a, 0x0a, 0x49, 0x06, 0x24, 0x5c, 0xc2, 0xd3, 0xac, 0x62, 0x91, 0x95, 0xe4, 0x79,
-    0xe7, 0xc8, 0x37, 0x6d, 0x8d, 0xd5, 0x4e, 0xa9, 0x6c, 0x56, 0xf4, 0xea, 0x65, 0x7a, 0xae, 0x08,
-    0xba, 0x78, 0x25, 0x2e, 0x1c, 0xa6, 0xb4, 0xc6, 0xe8, 0xdd, 0x74, 0x1f, 0x4b, 0xbd, 0x8b, 0x8a,
-    0x70, 0x3e, 0xb5, 0x66, 0x48, 0x03, 0xf6, 0x0e, 0x61, 0x35, 0x57, 0xb9, 0x86, 0xc1, 0x1d, 0x9e,
-    0xe1, 0xf8, 0x98, 0x11, 0x69, 0xd9, 0x8e, 0x94, 0x9b, 0x1e, 0x87, 0xe9, 0xce, 0x55, 0x28, 0xdf,
-    0x8c, 0xa1, 0x89, 0x0d, 0xbf, 0xe6, 0x42, 0x68, 0x41, 0x99, 0x2d, 0x0f, 0xb0, 0x54, 0xbb, 0x16,
-];
-
-/// AES round constants.
-const RCON: [u8; 10] = [0x01, 0x02, 0x04, 0x08, 0x10, 0x20, 0x40, 0x80, 0x1b, 0x36];
-
-/// Expand AES-128 key to 11 round keys (176 bytes).
-fn aes128_expand_key(key: &[u8]) -> [u8; 176] {
-    let mut w = [0u8; 176];
-    w[..16].copy_from_slice(&key[..16]);
-
-    for i in 1..11 {
-        let prev = i * 16 - 16;
-        let curr = i * 16;
-
-        // RotWord + SubWord + Rcon
-        let mut temp = [
-            SBOX[w[prev + 13] as usize] ^ RCON[i - 1],
-            SBOX[w[prev + 14] as usize],
-            SBOX[w[prev + 15] as usize],
-            SBOX[w[prev + 12] as usize],
-        ];
-
-        for j in 0..4 {
-            let base = curr + j * 4;
-            let prev_base = prev + j * 4;
-            w[base] = w[prev_base] ^ temp[0];
-            w[base + 1] = w[prev_base + 1] ^ temp[1];
-            w[base + 2] = w[prev_base + 2] ^ temp[2];
-            w[base + 3] = w[prev_base + 3] ^ temp[3];
-            temp = [w[base], w[base + 1], w[base + 2], w[base + 3]];
-        }
-    }
-    w
-}
-
-/// GF(2^8) multiplication by 2 in AES's field.
-#[inline]
-fn xtime(a: u8) -> u8 {
-    if a & 0x80 != 0 {
-        (a << 1) ^ 0x1b
-    } else {
-        a << 1
-    }
-}
-
-/// Encrypt a single 16-byte block with AES-128.
-fn aes128_encrypt_block(key: &[u8], block: &[u8; 16]) -> [u8; 16] {
-    let rk = aes128_expand_key(key);
-    let mut state = *block;
-
-    // Initial AddRoundKey.
-    for i in 0..16 {
-        state[i] ^= rk[i];
-    }
-
-    // Rounds 1-9: SubBytes, ShiftRows, MixColumns, AddRoundKey.
-    for round in 1..10 {
-        // SubBytes
-        for b in &mut state {
-            *b = SBOX[*b as usize];
-        }
-
-        // ShiftRows
-        shift_rows(&mut state);
-
-        // MixColumns
-        mix_columns(&mut state);
-
-        // AddRoundKey
-        let offset = round * 16;
-        for i in 0..16 {
-            state[i] ^= rk[offset + i];
-        }
-    }
-
-    // Round 10: SubBytes, ShiftRows, AddRoundKey (no MixColumns).
-    for b in &mut state {
-        *b = SBOX[*b as usize];
-    }
-    shift_rows(&mut state);
-    let offset = 10 * 16;
-    for i in 0..16 {
-        state[i] ^= rk[offset + i];
-    }
-
-    state
-}
-
-fn shift_rows(state: &mut [u8; 16]) {
-    // Row 0: no shift
-    // Row 1: shift left by 1
-    let t = state[1];
-    state[1] = state[5];
-    state[5] = state[9];
-    state[9] = state[13];
-    state[13] = t;
-    // Row 2: shift left by 2
-    let t0 = state[2];
-    let t1 = state[6];
-    state[2] = state[10];
-    state[6] = state[14];
-    state[10] = t0;
-    state[14] = t1;
-    // Row 3: shift left by 3 (= right by 1)
-    let t = state[15];
-    state[15] = state[11];
-    state[11] = state[7];
-    state[7] = state[3];
-    state[3] = t;
-}
-
-fn mix_columns(state: &mut [u8; 16]) {
-    for c in 0..4 {
-        let i = c * 4;
-        let a0 = state[i];
-        let a1 = state[i + 1];
-        let a2 = state[i + 2];
-        let a3 = state[i + 3];
-        let x = a0 ^ a1 ^ a2 ^ a3;
-        state[i] = a0 ^ xtime(a0 ^ a1) ^ x;
-        state[i + 1] = a1 ^ xtime(a1 ^ a2) ^ x;
-        state[i + 2] = a2 ^ xtime(a2 ^ a3) ^ x;
-        state[i + 3] = a3 ^ xtime(a3 ^ a0) ^ x;
-    }
 }
 
 // --- Base64 (minimal, for SDES inline keying material) ---
@@ -834,84 +568,6 @@ pub fn parse_crypto_attr(line: &str) -> Option<(u32, String, String)> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn aes128_known_vector() {
-        // NIST AES-128 test vector (FIPS 197 Appendix B).
-        let key: [u8; 16] = [
-            0x2b, 0x7e, 0x15, 0x16, 0x28, 0xae, 0xd2, 0xa6, 0xab, 0xf7, 0x15, 0x88, 0x09, 0xcf,
-            0x4f, 0x3c,
-        ];
-        let input: [u8; 16] = [
-            0x32, 0x43, 0xf6, 0xa8, 0x88, 0x5a, 0x30, 0x8d, 0x31, 0x31, 0x98, 0xa2, 0xe0, 0x37,
-            0x07, 0x34,
-        ];
-        let expected: [u8; 16] = [
-            0x39, 0x25, 0x84, 0x1d, 0x02, 0xdc, 0x09, 0xfb, 0xdc, 0x11, 0x85, 0x97, 0x19, 0x6a,
-            0x0b, 0x32,
-        ];
-        let output = aes128_encrypt_block(&key, &input);
-        assert_eq!(output, expected);
-    }
-
-    #[test]
-    fn sha1_known_vector() {
-        // NIST SHA-1 test: SHA1("abc") = a9993e36 4706816a ba3e2571 7850c26c 9cd0d89d
-        let digest = sha1(b"abc");
-        assert_eq!(
-            digest,
-            [
-                0xa9, 0x99, 0x3e, 0x36, 0x47, 0x06, 0x81, 0x6a, 0xba, 0x3e, 0x25, 0x71, 0x78, 0x50,
-                0xc2, 0x6c, 0x9c, 0xd0, 0xd8, 0x9d
-            ]
-        );
-    }
-
-    #[test]
-    fn sha1_empty() {
-        // SHA1("") = da39a3ee 5e6b4b0d 3255bfef 95601890 afd80709
-        let digest = sha1(b"");
-        assert_eq!(
-            digest,
-            [
-                0xda, 0x39, 0xa3, 0xee, 0x5e, 0x6b, 0x4b, 0x0d, 0x32, 0x55, 0xbf, 0xef, 0x95, 0x60,
-                0x18, 0x90, 0xaf, 0xd8, 0x07, 0x09
-            ]
-        );
-    }
-
-    #[test]
-    fn hmac_sha1_rfc2202_test1() {
-        // RFC 2202 Test Case 1:
-        // Key = 0x0b repeated 20 times
-        // Data = "Hi There"
-        // HMAC-SHA-1 = b617318655057264e28bc0b6fb378c8ef146be00
-        let key = [0x0bu8; 20];
-        let mac = hmac_sha1(&key, b"Hi There");
-        assert_eq!(
-            mac,
-            [
-                0xb6, 0x17, 0x31, 0x86, 0x55, 0x05, 0x72, 0x64, 0xe2, 0x8b, 0xc0, 0xb6, 0xfb, 0x37,
-                0x8c, 0x8e, 0xf1, 0x46, 0xbe, 0x00
-            ]
-        );
-    }
-
-    #[test]
-    fn hmac_sha1_rfc2202_test2() {
-        // RFC 2202 Test Case 2:
-        // Key = "Jefe"
-        // Data = "what do ya want for nothing?"
-        // HMAC-SHA-1 = effcdf6ae5eb2fa2d27416d5f184df9c259a7c79
-        let mac = hmac_sha1(b"Jefe", b"what do ya want for nothing?");
-        assert_eq!(
-            mac,
-            [
-                0xef, 0xfc, 0xdf, 0x6a, 0xe5, 0xeb, 0x2f, 0xa2, 0xd2, 0x74, 0x16, 0xd5, 0xf1, 0x84,
-                0xdf, 0x9c, 0x25, 0x9a, 0x7c, 0x79
-            ]
-        );
-    }
 
     #[test]
     fn base64_round_trip() {
@@ -1069,9 +725,9 @@ mod tests {
         let master_key = [0x0Au8; 16];
         let master_salt = [0x0Bu8; 14];
 
-        let cipher = derive_session_key(&master_key, &master_salt, LABEL_CIPHER_KEY, 16).unwrap();
-        let auth = derive_session_key(&master_key, &master_salt, LABEL_AUTH_KEY, 20).unwrap();
-        let salt = derive_session_key(&master_key, &master_salt, LABEL_SALT, 14).unwrap();
+        let cipher = derive_session_key(&master_key, &master_salt, LABEL_CIPHER_KEY, 16);
+        let auth = derive_session_key(&master_key, &master_salt, LABEL_AUTH_KEY, 20);
+        let salt = derive_session_key(&master_key, &master_salt, LABEL_SALT, 14);
 
         // All three should be different.
         assert_ne!(cipher, auth[..16]);
@@ -1099,13 +755,6 @@ mod tests {
         let mut rtp = vec![0; 28];
         rtp[0] = 0x82; // V=2, CC=2
         assert_eq!(rtp_header_len(&rtp).unwrap(), 20);
-    }
-
-    #[test]
-    fn constant_time_eq_works() {
-        assert!(constant_time_eq(b"hello", b"hello"));
-        assert!(!constant_time_eq(b"hello", b"world"));
-        assert!(!constant_time_eq(b"hi", b"hello"));
     }
 
     #[test]
