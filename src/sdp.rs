@@ -96,6 +96,14 @@ fn codec_name(pt: i32) -> Option<&'static str> {
     }
 }
 
+fn codec_fmtp(pt: i32) -> Option<&'static str> {
+    match pt {
+        101 => Some("0-16"),
+        111 => Some("minptime=20;useinbandfec=0"),
+        _ => None,
+    }
+}
+
 /// Parses a raw SDP string into a [`Session`].
 pub fn parse(raw: &str) -> crate::error::Result<Session> {
     let mut session = Session {
@@ -169,8 +177,14 @@ pub fn parse(raw: &str) -> crate::error::Result<Session> {
     Ok(session)
 }
 
-/// Creates an SDP offer string.
-pub fn build_offer(ip: &str, port: i32, codecs: &[i32], direction: &str) -> String {
+fn build_offer_inner(
+    ip: &str,
+    port: i32,
+    codecs: &[i32],
+    direction: &str,
+    profile: &str,
+    crypto_inline_key: Option<&str>,
+) -> String {
     let mut b = String::new();
     b.push_str("v=0\r\n");
     b.push_str("o=xphone 0 0 IN IP4 ");
@@ -181,7 +195,7 @@ pub fn build_offer(ip: &str, port: i32, codecs: &[i32], direction: &str) -> Stri
     b.push_str(ip);
     b.push_str("\r\n");
     b.push_str("t=0 0\r\n");
-    b.push_str(&format!("m=audio {} RTP/AVP", port));
+    b.push_str(&format!("m=audio {} {}", port, profile));
     for c in codecs {
         b.push_str(&format!(" {}", c));
     }
@@ -189,15 +203,26 @@ pub fn build_offer(ip: &str, port: i32, codecs: &[i32], direction: &str) -> Stri
     for &c in codecs {
         if let Some(name) = codec_name(c) {
             b.push_str(&format!("a=rtpmap:{} {}\r\n", c, name));
-            if c == 101 {
-                b.push_str("a=fmtp:101 0-16\r\n");
+            if let Some(fmtp) = codec_fmtp(c) {
+                b.push_str(&format!("a=fmtp:{} {}\r\n", c, fmtp));
             }
         }
+    }
+    if let Some(key) = crypto_inline_key {
+        b.push_str(&format!(
+            "a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{}\r\n",
+            key
+        ));
     }
     b.push_str("a=");
     b.push_str(direction);
     b.push_str("\r\n");
     b
+}
+
+/// Creates an SDP offer string.
+pub fn build_offer(ip: &str, port: i32, codecs: &[i32], direction: &str) -> String {
+    build_offer_inner(ip, port, codecs, direction, "RTP/AVP", None)
 }
 
 /// Creates an SDP answer that only includes codecs present in both
@@ -231,37 +256,14 @@ pub fn build_offer_srtp(
     direction: &str,
     crypto_inline_key: &str,
 ) -> String {
-    let mut b = String::new();
-    b.push_str("v=0\r\n");
-    b.push_str("o=xphone 0 0 IN IP4 ");
-    b.push_str(ip);
-    b.push_str("\r\n");
-    b.push_str("s=xphone\r\n");
-    b.push_str("c=IN IP4 ");
-    b.push_str(ip);
-    b.push_str("\r\n");
-    b.push_str("t=0 0\r\n");
-    b.push_str(&format!("m=audio {} RTP/SAVP", port));
-    for c in codecs {
-        b.push_str(&format!(" {}", c));
-    }
-    b.push_str("\r\n");
-    for &c in codecs {
-        if let Some(name) = codec_name(c) {
-            b.push_str(&format!("a=rtpmap:{} {}\r\n", c, name));
-            if c == 101 {
-                b.push_str("a=fmtp:101 0-16\r\n");
-            }
-        }
-    }
-    b.push_str(&format!(
-        "a=crypto:1 AES_CM_128_HMAC_SHA1_80 inline:{}\r\n",
-        crypto_inline_key
-    ));
-    b.push_str("a=");
-    b.push_str(direction);
-    b.push_str("\r\n");
-    b
+    build_offer_inner(
+        ip,
+        port,
+        codecs,
+        direction,
+        "RTP/SAVP",
+        Some(crypto_inline_key),
+    )
 }
 
 /// Creates an SDP answer with SRTP support.
