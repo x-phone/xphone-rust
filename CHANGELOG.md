@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.1.1] - 2026-03-07
+
+### Fixed
+
+- Phone-level callbacks (on_state, on_ended, on_dtmf) no longer get overwritten when users set per-call callbacks — internal fields pattern keeps both independent
+- Remote hold/resume (re-INVITE) now fires both phone-level and user-level on_state callbacks
+- Lock ordering fix in wire_phone_call_callbacks to prevent potential deadlock
+
 ## [0.1.0] - 2025-03-07
 
 ### Added
