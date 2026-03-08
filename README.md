@@ -8,9 +8,9 @@
 **A Rust library for embedding real phone calls into any application.**
 No PBX. No Twilio. No per-minute fees. Just clean PCM audio, in and out.
 
-xphone handles SIP signaling, RTP media, codecs, and call state so you can focus on what your application actually does with the audio — whether that's feeding frames to a speech model, recording to disk, or building a full softphone.
+> **xphone** is also available in [Go](https://github.com/x-phone/xphone-go).
 
-Rust port of [xphone-go](https://github.com/x-phone/xphone-go), with the same event-driven API design.
+xphone handles SIP signaling, RTP media, codecs, and call state so you can focus on what your application actually does with the audio — whether that's feeding frames to a speech model, recording to disk, or building a full softphone.
 
 ---
 
