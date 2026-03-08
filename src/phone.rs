@@ -32,6 +32,9 @@ struct Inner {
     on_call_state_fn: Option<CallStateCb>,
     on_call_ended_fn: Option<CallEndedCb>,
     on_call_dtmf_fn: Option<CallDtmfCb>,
+
+    /// DTMF mode from config, applied to every new call.
+    dtmf_mode: crate::config::DtmfMode,
 }
 
 /// Phone orchestrates SIP registration, call tracking, and incoming/outgoing calls.
@@ -44,6 +47,7 @@ pub struct Phone {
 impl Phone {
     /// Creates a new `Phone` with the given configuration, initially in the `Disconnected` state.
     pub fn new(cfg: Config) -> Self {
+        let dtmf_mode = cfg.dtmf_mode;
         Self {
             cfg,
             inner: Arc::new(Mutex::new(Inner {
@@ -58,6 +62,7 @@ impl Phone {
                 on_call_state_fn: None,
                 on_call_ended_fn: None,
                 on_call_dtmf_fn: None,
+                dtmf_mode,
             })),
         }
     }
@@ -146,6 +151,12 @@ impl Phone {
         let inner_clone = Arc::clone(&self.inner);
         tr.on_notify(Box::new(move |call_id, code| {
             handle_notify(&inner_clone, &call_id, code);
+        }));
+
+        // Wire up SIP INFO DTMF handling.
+        let inner_clone = Arc::clone(&self.inner);
+        tr.on_info_dtmf(Box::new(move |call_id, digit| {
+            handle_info_dtmf(&inner_clone, &call_id, &digit);
         }));
 
         let mut inner = self.inner.lock();
@@ -262,7 +273,7 @@ impl Phone {
                     call.set_rtp_socket(sock);
                 }
 
-                // Wire phone-level callbacks BEFORE simulate_response fires on_state.
+                // Wire phone-level callbacks (incl. dtmf_mode) BEFORE simulate_response fires on_state.
                 wire_phone_call_callbacks(&self.inner, &call);
 
                 // Handle early media: if we got a 183 with SDP, set up media before
@@ -292,7 +303,7 @@ impl Phone {
 
                 let dlg = Arc::new(MockDialog::new());
                 let call = Call::new_outbound(dlg as Arc<dyn Dialog>, opts);
-                // Wire phone-level callbacks BEFORE replay.
+                // Wire phone-level callbacks (incl. dtmf_mode) BEFORE replay.
                 wire_phone_call_callbacks(&self.inner, &call);
                 (call, responses)
             }
@@ -463,15 +474,18 @@ fn handle_incoming(inner: &Arc<Mutex<Inner>>, from: &str, to: &str) {
 #[allow(clippy::too_many_arguments)]
 /// Wire phone-level call callbacks onto an individual call.
 fn wire_phone_call_callbacks(inner: &Arc<Mutex<Inner>>, call: &Arc<Call>) {
-    // Copy callbacks out of Phone lock, then drop it before acquiring Call lock.
-    let (state_fn, ended_fn, dtmf_fn) = {
+    // Copy callbacks and config out of Phone lock, then drop it before acquiring Call lock.
+    let (state_fn, ended_fn, dtmf_fn, dtmf_mode) = {
         let locked = inner.lock();
         (
             locked.on_call_state_fn.clone(),
             locked.on_call_ended_fn.clone(),
             locked.on_call_dtmf_fn.clone(),
+            locked.dtmf_mode,
         )
     };
+
+    call.set_dtmf_mode(dtmf_mode);
 
     if let Some(f) = state_fn {
         let c = Arc::clone(call);
@@ -583,6 +597,17 @@ fn handle_bye(inner: &Arc<Mutex<Inner>>, call_id: &str) {
         call.simulate_bye();
     } else {
         debug!(call_id = %call_id, "Phone BYE for unknown call (already ended)");
+    }
+}
+
+/// Handles an incoming SIP INFO DTMF — looks up the call by Call-ID and fires its DTMF callback.
+fn handle_info_dtmf(inner: &Arc<Mutex<Inner>>, call_id: &str, digit: &str) {
+    info!(call_id = %call_id, digit = %digit, "Phone handling INFO DTMF");
+    let call = inner.lock().calls.get(call_id).cloned();
+    if let Some(call) = call {
+        call.fire_dtmf(digit);
+    } else {
+        debug!(call_id = %call_id, "Phone INFO DTMF for unknown call");
     }
 }
 
@@ -921,5 +946,55 @@ mod tests {
         call.end().unwrap();
         let got_user = user_rx.recv_timeout(Duration::from_secs(2)).is_ok();
         assert!(got_user, "user-level on_state should have fired");
+    }
+
+    #[test]
+    fn info_dtmf_fires_call_dtmf_callback() {
+        let tr = Arc::new(MockTransport::new());
+        tr.respond_with(200, "OK"); // REGISTER
+
+        let phone = Phone::new(test_cfg());
+
+        let (dtmf_tx, dtmf_rx) = crossbeam_channel::bounded(1);
+        phone.on_call_dtmf(move |_call, digit| {
+            let _ = dtmf_tx.send(digit);
+        });
+
+        phone.connect_with_transport(Arc::clone(&tr) as Arc<dyn SipTransport>);
+
+        // Dial to create a call.
+        tr.respond_with(200, "OK"); // INVITE
+        let call = phone
+            .dial("sip:1002@pbx.local", DialOptions::default())
+            .unwrap();
+        let call_id = call.call_id();
+
+        // Simulate incoming SIP INFO DTMF.
+        tr.simulate_info_dtmf(&call_id, "5");
+
+        let digit = dtmf_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(digit, "5");
+    }
+
+    #[test]
+    fn dtmf_mode_propagated_to_calls() {
+        let tr = Arc::new(MockTransport::new());
+        tr.respond_with(200, "OK"); // REGISTER
+
+        let mut cfg = test_cfg();
+        cfg.dtmf_mode = crate::config::DtmfMode::SipInfo;
+        let phone = Phone::new(cfg);
+        phone.connect_with_transport(Arc::clone(&tr) as Arc<dyn SipTransport>);
+
+        // Dial to create a call.
+        tr.respond_with(200, "OK"); // INVITE
+        let call = phone
+            .dial("sip:1002@pbx.local", DialOptions::default())
+            .unwrap();
+
+        // Verify dtmf_mode was propagated: send_dtmf("3") should use SIP INFO.
+        // Detailed MockDialog inspection is in call::tests::send_dtmf_sip_info_mode.
+        // Here we just verify it doesn't error (SIP INFO path doesn't need RTP socket).
+        call.send_dtmf("3").unwrap();
     }
 }

@@ -20,6 +20,7 @@ struct MockDialogInner {
     last_reinvite_sdp: Vec<u8>,
     refer_sent: bool,
     last_refer_target: String,
+    info_dtmf_sent: Vec<(String, u32)>,
     call_id: String,
     headers: HashMap<String, Vec<String>>,
     on_notify: Option<Arc<dyn Fn(u16) + Send + Sync>>,
@@ -37,6 +38,7 @@ impl MockDialog {
                 last_reinvite_sdp: Vec::new(),
                 refer_sent: false,
                 last_refer_target: String::new(),
+                info_dtmf_sent: Vec::new(),
                 call_id: "mock-call-id".into(),
                 headers: HashMap::new(),
                 on_notify: None,
@@ -97,6 +99,10 @@ impl MockDialog {
         String::from_utf8_lossy(&inner.last_reinvite_sdp).to_string()
     }
 
+    pub fn info_dtmf_sent(&self) -> Vec<(String, u32)> {
+        self.inner.lock().info_dtmf_sent.clone()
+    }
+
     pub fn simulate_notify(&self, code: u16) {
         let f = self.inner.lock().on_notify.clone();
         if let Some(f) = f {
@@ -139,6 +145,14 @@ impl Dialog for MockDialog {
         let mut inner = self.inner.lock();
         inner.refer_sent = true;
         inner.last_refer_target = target.into();
+        Ok(())
+    }
+
+    fn send_info_dtmf(&self, digit: &str, duration_ms: u32) -> Result<()> {
+        self.inner
+            .lock()
+            .info_dtmf_sent
+            .push((digit.into(), duration_ms));
         Ok(())
     }
 

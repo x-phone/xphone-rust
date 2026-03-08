@@ -3,6 +3,17 @@ use std::time::Duration;
 use crate::sip::conn::TlsConfig;
 use crate::types::Codec;
 
+/// Selects how DTMF digits are sent and received.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DtmfMode {
+    /// RFC 4733 RTP telephone-event packets (default).
+    Rfc4733,
+    /// SIP INFO with `application/dtmf-relay` body (RFC 2976).
+    SipInfo,
+    /// Send via RFC 4733; also accept incoming SIP INFO.
+    Both,
+}
+
 /// Configuration for a [`Phone`](crate::phone::Phone) instance.
 ///
 /// Use [`PhoneBuilder`] for ergonomic construction with defaults.
@@ -54,6 +65,8 @@ pub struct Config {
     /// When set, a STUN Binding Request is used to discover the
     /// NAT-mapped address for SIP and RTP instead of the local-IP heuristic.
     pub stun_server: Option<String>,
+    /// DTMF transport mode (default: RFC 4733 RTP telephone-events).
+    pub dtmf_mode: DtmfMode,
 }
 
 impl Default for Config {
@@ -79,6 +92,7 @@ impl Default for Config {
             pcm_rate: 8000,
             srtp: false,
             stun_server: None,
+            dtmf_mode: DtmfMode::Rfc4733,
         }
     }
 }
@@ -186,6 +200,12 @@ impl PhoneBuilder {
     /// Sets the STUN server for NAT-mapped address discovery.
     pub fn stun_server(mut self, server: &str) -> Self {
         self.config.stun_server = Some(server.into());
+        self
+    }
+
+    /// Sets the DTMF transport mode.
+    pub fn dtmf_mode(mut self, mode: DtmfMode) -> Self {
+        self.config.dtmf_mode = mode;
         self
     }
 
@@ -338,6 +358,27 @@ mod tests {
         assert!(opts.caller_id.is_none());
         assert!(opts.custom_headers.is_empty());
         assert!(opts.codec_override.is_empty());
+    }
+
+    #[test]
+    fn dtmf_mode_default_is_rfc4733() {
+        let cfg = Config::default();
+        assert_eq!(cfg.dtmf_mode, DtmfMode::Rfc4733);
+    }
+
+    #[test]
+    fn phone_builder_dtmf_mode() {
+        let cfg = PhoneBuilder::new()
+            .credentials("alice", "secret", "sip.example.com")
+            .dtmf_mode(DtmfMode::SipInfo)
+            .build();
+        assert_eq!(cfg.dtmf_mode, DtmfMode::SipInfo);
+
+        let cfg2 = PhoneBuilder::new()
+            .credentials("alice", "secret", "sip.example.com")
+            .dtmf_mode(DtmfMode::Both)
+            .build();
+        assert_eq!(cfg2.dtmf_mode, DtmfMode::Both);
     }
 
     #[test]
