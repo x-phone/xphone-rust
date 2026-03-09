@@ -12,7 +12,7 @@ use crate::mock::dialog::MockDialog;
 use crate::mwi::MwiSubscriber;
 use crate::registry::Registry;
 use crate::transport::SipTransport;
-use crate::types::{CallState, Direction, EndReason, PhoneState, VoicemailStatus};
+use crate::types::{CallState, Direction, EndReason, PhoneState, SipMessage, VoicemailStatus};
 
 type CallStateCb = Arc<dyn Fn(Arc<Call>, crate::types::CallState) + Send + Sync>;
 type CallEndedCb = Arc<dyn Fn(Arc<Call>, crate::types::EndReason) + Send + Sync>;
@@ -30,6 +30,7 @@ struct Inner {
     on_unregistered_fn: Option<Arc<dyn Fn() + Send + Sync>>,
     on_error_fn: Option<Arc<dyn Fn(Error) + Send + Sync>>,
     on_voicemail_fn: Option<Arc<dyn Fn(VoicemailStatus) + Send + Sync>>,
+    on_message_fn: Option<Arc<dyn Fn(SipMessage) + Send + Sync>>,
 
     // Phone-level call callbacks — auto-wired to every new call.
     on_call_state_fn: Option<CallStateCb>,
@@ -64,6 +65,7 @@ impl Phone {
                 on_unregistered_fn: None,
                 on_error_fn: None,
                 on_voicemail_fn: None,
+                on_message_fn: None,
                 on_call_state_fn: None,
                 on_call_ended_fn: None,
                 on_call_dtmf_fn: None,
@@ -162,6 +164,12 @@ impl Phone {
         let inner_clone = Arc::clone(&self.inner);
         tr.on_info_dtmf(Box::new(move |call_id, digit| {
             handle_info_dtmf(&inner_clone, &call_id, &digit);
+        }));
+
+        // Wire up SIP MESSAGE handling.
+        let inner_clone = Arc::clone(&self.inner);
+        tr.on_message(Box::new(move |from, content_type, body| {
+            handle_message(&inner_clone, &from, &content_type, &body);
         }));
 
         // Start MWI subscriber if voicemail URI is configured and registration succeeded.
@@ -414,6 +422,50 @@ impl Phone {
             let cb = Arc::clone(&cb);
             mwi.on_voicemail(move |s| cb(s));
         }
+    }
+
+    /// Sets the callback for incoming SIP MESSAGE (instant messages, RFC 3428).
+    pub fn on_message<F: Fn(SipMessage) + Send + Sync + 'static>(&self, f: F) {
+        self.inner.lock().on_message_fn = Some(Arc::new(f));
+    }
+
+    /// Sends a SIP MESSAGE with `text/plain` content type.
+    pub fn send_message(&self, target: &str, body: &str) -> Result<()> {
+        let tr = {
+            let inner = self.inner.lock();
+            if inner.state != PhoneState::Registered {
+                return Err(Error::NotRegistered);
+            }
+            inner.tr.as_ref().cloned().ok_or(Error::NotConnected)?
+        };
+        tr.send_message(
+            target,
+            "text/plain",
+            body.as_bytes(),
+            std::time::Duration::from_secs(10),
+        )
+    }
+
+    /// Sends a SIP MESSAGE with a custom content type.
+    pub fn send_message_with_type(
+        &self,
+        target: &str,
+        content_type: &str,
+        body: &str,
+    ) -> Result<()> {
+        let tr = {
+            let inner = self.inner.lock();
+            if inner.state != PhoneState::Registered {
+                return Err(Error::NotRegistered);
+            }
+            inner.tr.as_ref().cloned().ok_or(Error::NotConnected)?
+        };
+        tr.send_message(
+            target,
+            content_type,
+            body.as_bytes(),
+            std::time::Duration::from_secs(10),
+        )
     }
 
     /// Returns the current phone state.
@@ -773,6 +825,21 @@ fn handle_notify(inner: &Arc<Mutex<Inner>>, call_id: &str, code: u16) {
         call.fire_notify(code);
     } else {
         warn!(call_id = %call_id, "Phone NOTIFY for unknown call");
+    }
+}
+
+/// Handles an incoming SIP MESSAGE — fires the on_message callback.
+fn handle_message(inner: &Arc<Mutex<Inner>>, from: &str, content_type: &str, body: &str) {
+    info!(from = %from, "Phone handling MESSAGE");
+    let cb = inner.lock().on_message_fn.clone();
+    if let Some(f) = cb {
+        let msg = SipMessage {
+            from: from.to_string(),
+            to: String::new(),
+            content_type: content_type.to_string(),
+            body: body.to_string(),
+        };
+        crate::callback_pool::spawn_callback(move || f(msg));
     }
 }
 
@@ -1593,6 +1660,53 @@ mod tests {
 
         std::thread::sleep(Duration::from_millis(200));
         assert_eq!(tr.count_sent("SUBSCRIBE"), 0);
+
+        phone.disconnect().unwrap();
+    }
+
+    #[test]
+    fn send_message_before_connect_returns_error() {
+        let phone = Phone::new(test_cfg());
+        let result = phone.send_message("sip:1002@pbx.local", "Hello");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn send_message_sends_via_transport() {
+        let tr = Arc::new(MockTransport::new());
+        tr.respond_with(200, "OK"); // REGISTER
+        tr.respond_with(200, "OK"); // MESSAGE
+
+        let phone = Phone::new(test_cfg());
+        phone.connect_with_transport(Arc::clone(&tr) as Arc<dyn SipTransport>);
+
+        phone.send_message("sip:1002@pbx.local", "Hello!").unwrap();
+        assert_eq!(tr.count_sent("MESSAGE"), 1);
+
+        phone.disconnect().unwrap();
+    }
+
+    #[test]
+    fn on_message_fires_on_incoming() {
+        let tr = Arc::new(MockTransport::new());
+        tr.respond_with(200, "OK"); // REGISTER
+
+        let phone = Phone::new(test_cfg());
+        let received = Arc::new(Mutex::new(None));
+        let received_clone = Arc::clone(&received);
+        phone.on_message(move |msg| {
+            *received_clone.lock() = Some(msg);
+        });
+        phone.connect_with_transport(Arc::clone(&tr) as Arc<dyn SipTransport>);
+
+        tr.simulate_message("sip:1001@pbx.local", "text/plain", "Hi there");
+        // spawn_callback is async — give it a moment.
+        std::thread::sleep(Duration::from_millis(100));
+
+        let msg = received.lock().clone().unwrap();
+        assert_eq!(msg.from, "sip:1001@pbx.local");
+        assert_eq!(msg.body, "Hi there");
+        assert_eq!(msg.content_type, "text/plain");
 
         phone.disconnect().unwrap();
     }

@@ -24,6 +24,7 @@ struct Inner {
     notify_handler: Option<Arc<dyn Fn(String, u16) + Send + Sync>>,
     info_dtmf_handler: Option<Arc<dyn Fn(String, String) + Send + Sync>>,
     mwi_notify_handler: Option<Arc<dyn Fn(String) + Send + Sync>>,
+    message_handler: Option<Arc<dyn Fn(String, String, String) + Send + Sync>>,
 }
 
 /// Production SIP transport backed by `sip::client::Client`.
@@ -87,6 +88,7 @@ impl SipUA {
             notify_handler: None,
             info_dtmf_handler: None,
             mwi_notify_handler: None,
+            message_handler: None,
         }));
 
         // Wire up incoming SIP request handler.
@@ -116,6 +118,7 @@ fn handle_incoming_request(
         }
         "NOTIFY" => handle_notify(inner, client, msg, from_addr),
         "INFO" => handle_info(inner, client, msg, from_addr),
+        "MESSAGE" => handle_message(inner, client, msg, from_addr),
         "OPTIONS" => {
             debug!("SIP <<< OPTIONS keepalive, responding 200 OK");
             let resp = build_sip_response(msg, 200, "OK");
@@ -295,6 +298,29 @@ fn handle_info(
     }
 }
 
+fn handle_message(
+    inner: &Arc<Mutex<Inner>>,
+    client: &Arc<Client>,
+    msg: &Message,
+    from_addr: SocketAddr,
+) {
+    info!("SIP <<< MESSAGE received");
+
+    // Always respond 200 OK to MESSAGE.
+    let resp = build_sip_response(msg, 200, "OK");
+    debug!("SIP >>> 200 OK (MESSAGE)");
+    let _ = client.send_raw_to(&resp.to_bytes(), from_addr);
+
+    let from = msg.header("From").to_string();
+    let content_type = msg.header("Content-Type").to_string();
+    let body = String::from_utf8_lossy(&msg.body).to_string();
+
+    let cb = inner.lock().message_handler.clone();
+    if let Some(f) = cb {
+        f(from, content_type, body);
+    }
+}
+
 /// Parses the Signal value from an `application/dtmf-relay` body.
 /// Case-insensitive key matching for PBX interop.
 /// Example body: "Signal=5\r\nDuration=160\r\n" → Some("5")
@@ -434,6 +460,37 @@ impl SipTransport for SipUA {
 
     fn on_mwi_notify(&self, f: Box<dyn Fn(String) + Send + Sync>) {
         self.inner.lock().mwi_notify_handler = Some(Arc::from(f));
+    }
+
+    fn send_message(
+        &self,
+        target: &str,
+        content_type: &str,
+        body: &[u8],
+        timeout: Duration,
+    ) -> Result<()> {
+        // Normalize target to SIP URI.
+        let target_uri = if target.starts_with("sip:") {
+            target.to_string()
+        } else {
+            format!("sip:{}@{}", target, self.client.domain())
+        };
+
+        let (code, reason) = self
+            .client
+            .send_message(&target_uri, content_type, body, timeout)?;
+        if (200..300).contains(&code) {
+            Ok(())
+        } else {
+            Err(Error::Other(format!(
+                "MESSAGE rejected: {} {}",
+                code, reason
+            )))
+        }
+    }
+
+    fn on_message(&self, f: Box<dyn Fn(String, String, String) + Send + Sync>) {
+        self.inner.lock().message_handler = Some(Arc::from(f));
     }
 
     fn unregister(&self, timeout: Duration) -> Result<()> {

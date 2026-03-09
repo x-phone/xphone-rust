@@ -32,4 +32,4 @@ pub use config::{Config, DialOptions, DtmfMode, PhoneBuilder};
 pub use error::{Error, Result};
 pub use phone::Phone;
 pub use sip::conn::TlsConfig;
-pub use types::{CallState, Codec, Direction, EndReason, PhoneState, VoicemailStatus};
+pub use types::{CallState, Codec, Direction, EndReason, PhoneState, SipMessage, VoicemailStatus};

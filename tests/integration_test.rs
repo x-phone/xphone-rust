@@ -106,9 +106,8 @@ fn register_wrong_password() {
     let client = Client::new(cfg).unwrap();
 
     let result = client.send_register(Duration::from_secs(5));
-    match result {
-        Ok((code, _)) => assert_ne!(code, 200, "should not get 200 with wrong password"),
-        Err(_) => {} // transport error is also acceptable
+    if let Ok((code, _)) = result {
+        assert_ne!(code, 200, "should not get 200 with wrong password");
     }
 
     client.close();
@@ -400,4 +399,40 @@ fn echo_test() {
 
     call.end().unwrap();
     p.disconnect().unwrap();
+}
+
+/// E7: p1 sends a SIP MESSAGE to p2, p2 receives it via on_message callback.
+#[test]
+fn sip_message_between_extensions() {
+    let cfg1 = integration_phone_config("1001", &asterisk_password());
+    let cfg2 = integration_phone_config("1002", &asterisk_password());
+
+    let p1 = Phone::new(cfg1);
+    let p2 = Phone::new(cfg2);
+
+    let (msg_tx, msg_rx) = crossbeam_channel::bounded(1);
+    p2.on_message(move |msg| {
+        let _ = msg_tx.send(msg);
+    });
+
+    p1.connect().unwrap();
+    p2.connect().unwrap();
+
+    // p1 sends MESSAGE to 1002.
+    p1.send_message("1002", "Hello from 1001").unwrap();
+
+    // p2 should receive it.
+    let msg = msg_rx
+        .recv_timeout(Duration::from_secs(5))
+        .expect("MESSAGE not received by p2");
+    assert_eq!(msg.body, "Hello from 1001");
+    assert_eq!(msg.content_type, "text/plain");
+    assert!(
+        msg.from.contains("1001"),
+        "from should contain sender: {}",
+        msg.from
+    );
+
+    p1.disconnect().unwrap();
+    p2.disconnect().unwrap();
 }

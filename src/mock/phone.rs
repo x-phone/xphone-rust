@@ -6,7 +6,7 @@ use parking_lot::Mutex;
 use crate::config::DialOptions;
 use crate::error::{Error, Result};
 use crate::mock::call::MockCall;
-use crate::types::{PhoneState, VoicemailStatus};
+use crate::types::{PhoneState, SipMessage, VoicemailStatus};
 
 struct Inner {
     state: PhoneState,
@@ -15,8 +15,10 @@ struct Inner {
     on_unregistered_fn: Option<Arc<dyn Fn() + Send + Sync>>,
     on_error_fn: Option<Arc<dyn Fn(Error) + Send + Sync>>,
     on_voicemail_fn: Option<Arc<dyn Fn(VoicemailStatus) + Send + Sync>>,
+    on_message_fn: Option<Arc<dyn Fn(SipMessage) + Send + Sync>>,
     last_call: Option<Arc<MockCall>>,
     calls: HashMap<String, Arc<MockCall>>,
+    sent_messages: Vec<SipMessage>,
 }
 
 /// Mock phone for testing consumer code without a real SIP transport.
@@ -45,8 +47,10 @@ impl MockPhone {
                 on_unregistered_fn: None,
                 on_error_fn: None,
                 on_voicemail_fn: None,
+                on_message_fn: None,
                 last_call: None,
                 calls: HashMap::new(),
+                sent_messages: Vec::new(),
             }),
         }
     }
@@ -130,6 +134,31 @@ impl MockPhone {
         self.inner.lock().on_voicemail_fn = Some(Arc::new(f));
     }
 
+    /// Registers a callback fired on incoming SIP MESSAGE.
+    pub fn on_message<F: Fn(SipMessage) + Send + Sync + 'static>(&self, f: F) {
+        self.inner.lock().on_message_fn = Some(Arc::new(f));
+    }
+
+    /// Sends a SIP MESSAGE (mock: records the message for inspection).
+    pub fn send_message(&self, target: &str, body: &str) -> Result<()> {
+        let mut inner = self.inner.lock();
+        if inner.state != PhoneState::Registered {
+            return Err(Error::NotRegistered);
+        }
+        inner.sent_messages.push(SipMessage {
+            from: String::new(),
+            to: target.to_string(),
+            content_type: "text/plain".to_string(),
+            body: body.to_string(),
+        });
+        Ok(())
+    }
+
+    /// Returns all sent messages (for test assertions).
+    pub fn sent_messages(&self) -> Vec<SipMessage> {
+        self.inner.lock().sent_messages.clone()
+    }
+
     /// Returns the current phone state.
     pub fn state(&self) -> PhoneState {
         self.inner.lock().state
@@ -158,6 +187,19 @@ impl MockPhone {
         let cb = self.inner.lock().on_error_fn.clone();
         if let Some(f) = cb {
             f(err);
+        }
+    }
+
+    /// Simulates an incoming SIP MESSAGE and fires the on_message callback.
+    pub fn simulate_message(&self, from: &str, body: &str) {
+        let cb = self.inner.lock().on_message_fn.clone();
+        if let Some(f) = cb {
+            f(SipMessage {
+                from: from.to_string(),
+                to: String::new(),
+                content_type: "text/plain".to_string(),
+                body: body.to_string(),
+            });
         }
     }
 
@@ -444,5 +486,45 @@ mod tests {
         let p = MockPhone::new();
         // Should not panic.
         p.simulate_mwi(VoicemailStatus::default());
+    }
+
+    #[test]
+    fn send_message_before_connect_errors() {
+        let p = MockPhone::new();
+        let err = p.send_message("sip:1002@pbx.local", "Hello").unwrap_err();
+        assert!(matches!(err, Error::NotRegistered));
+    }
+
+    #[test]
+    fn send_message_records_message() {
+        let p = MockPhone::new();
+        p.connect().unwrap();
+        p.send_message("sip:1002@pbx.local", "Hello!").unwrap();
+        let msgs = p.sent_messages();
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].to, "sip:1002@pbx.local");
+        assert_eq!(msgs[0].body, "Hello!");
+        assert_eq!(msgs[0].content_type, "text/plain");
+    }
+
+    #[test]
+    fn simulate_message_fires_callback() {
+        let p = MockPhone::new();
+        let received = Arc::new(Mutex::new(None));
+        let received_clone = Arc::clone(&received);
+        p.on_message(move |msg| {
+            *received_clone.lock() = Some(msg);
+        });
+        p.simulate_message("sip:1001@pbx.local", "Hi there");
+        let msg = received.lock().clone().unwrap();
+        assert_eq!(msg.from, "sip:1001@pbx.local");
+        assert_eq!(msg.body, "Hi there");
+    }
+
+    #[test]
+    fn simulate_message_without_callback() {
+        let p = MockPhone::new();
+        // Should not panic.
+        p.simulate_message("sip:1001@pbx.local", "Hello");
     }
 }

@@ -381,6 +381,14 @@ fn wire_phone_events(phone: &Phone, state: &SharedState) {
     });
 
     let s = Arc::clone(state);
+    phone.on_message(move |msg| {
+        // Extract user-friendly sender from raw SIP From header.
+        let sender = extract_sip_user(&msg.from);
+        let mut st = s.lock().unwrap();
+        st.push_event(format!("MSG from {}: {}", sender, msg.body));
+    });
+
+    let s = Arc::clone(state);
     phone.on_incoming(move |call| {
         let from = call.from();
         let from_name = call.from_name();
@@ -684,6 +692,37 @@ fn end_reason_name(r: EndReason) -> String {
 // ---------------------------------------------------------------------------
 
 /// Parse an optional call number from the argument.
+/// Extracts a user-friendly name from a raw SIP From header.
+/// `"Alice" <sip:1001@server>;tag=xxx` → `Alice (1001)`
+/// `<sip:1001@server>;tag=xxx` → `1001`
+fn extract_sip_user(from: &str) -> String {
+    // Try to get display name (quoted portion before '<').
+    let display = if let Some(lt) = from.find('<') {
+        let name = from[..lt].trim().trim_matches('"').trim();
+        if name.is_empty() {
+            None
+        } else {
+            Some(name.to_string())
+        }
+    } else {
+        None
+    };
+    // Try to get user part from sip:user@host.
+    let user = from
+        .find("sip:")
+        .map(|i| &from[i + 4..])
+        .and_then(|s| s.split('@').next())
+        .filter(|u| !u.is_empty())
+        .map(|u| u.to_string());
+
+    match (display, user) {
+        (Some(d), Some(u)) => format!("{} ({})", d, u),
+        (Some(d), None) => d,
+        (None, Some(u)) => u,
+        (None, None) => from.to_string(),
+    }
+}
+
 /// "a 2" → Some(2), "a" → None, "accept" → None.
 fn parse_call_num(arg: &str) -> Option<usize> {
     arg.trim().parse::<usize>().ok()
@@ -901,6 +940,28 @@ fn exec_command(state: &SharedState, phone: &Phone, input: &str) {
             if !prev {
                 st.push_event("echo: OFF (mic takes priority)".into());
             }
+        }
+
+        "message" | "msg" => {
+            // msg <target> <text...>
+            if parts.len() < 3 {
+                state.lock().unwrap().error = "usage: msg <target> <text>".into();
+                return;
+            }
+            let target = parts[1].to_string();
+            let body = parts[2..].join(" ");
+            let phone = phone.clone();
+            let s = Arc::clone(state);
+            std::thread::spawn(move || match phone.send_message(&target, &body) {
+                Ok(()) => {
+                    s.lock()
+                        .unwrap()
+                        .push_event(format!("MSG to {}: {}", target, body));
+                }
+                Err(e) => {
+                    s.lock().unwrap().error = format!("message error: {}", e);
+                }
+            });
         }
 
         // Select a call by number: "1", "2", "3", etc.
@@ -1202,7 +1263,7 @@ fn draw(f: &mut ratatui::Frame, state: &SharedState) {
     };
 
     let help_text =
-        "dial(d) accept(a) reject hangup(h) hold resume mute unmute dtmf transfer(xfer) echo speaker mic 1/2/3 quit(q)";
+        "dial(d) accept(a) reject hangup(h) hold resume mute unmute dtmf transfer(xfer) msg echo speaker mic 1/2/3 quit(q)";
 
     let cmd_lines = vec![
         Line::from(vec![

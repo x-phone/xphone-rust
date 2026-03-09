@@ -489,6 +489,65 @@ impl Client {
         Ok((resp.status_code, resp.reason.clone()))
     }
 
+    /// Sends an out-of-dialog SIP MESSAGE (RFC 3428).
+    /// Handles 401/407 auth challenges automatically.
+    pub fn send_message(
+        &self,
+        target_uri: &str,
+        content_type: &str,
+        body: &[u8],
+        timeout: Duration,
+    ) -> Result<(u16, String)> {
+        if *self.closed.lock() {
+            return Err(Error::Other("sip: client closed".into()));
+        }
+
+        let extra: HashMap<String, String> = [("Content-Type".into(), content_type.into())].into();
+        let mut req = self.build_request("MESSAGE", target_uri, Some(&extra));
+        req.set_header("To", &format!("<{}>", target_uri));
+        req.body = body.to_vec();
+
+        debug!(method = "MESSAGE", uri = %target_uri, "SIP >>> sending");
+        let resp = self.tm.send(&mut req, self.cfg.server_addr, timeout)?;
+        debug!(method = "MESSAGE", status = resp.status_code, reason = %resp.reason, "SIP <<< response");
+        let branch = req.via_branch().to_string();
+
+        // Handle 401/407 auth challenge.
+        if resp.status_code == 401 || resp.status_code == 407 {
+            self.tm.remove_tx(&branch);
+            let (auth_hdr_name, auth_resp_hdr) = if resp.status_code == 401 {
+                ("WWW-Authenticate", "Authorization")
+            } else {
+                ("Proxy-Authenticate", "Proxy-Authorization")
+            };
+            let auth_hdr = resp.header(auth_hdr_name);
+            let ch = match auth::parse_challenge(auth_hdr) {
+                Ok(ch) => ch,
+                Err(_) => return Ok((resp.status_code, auth_hdr.to_string())),
+            };
+            let creds = Credentials {
+                username: self.cfg.username.clone(),
+                password: self.cfg.password.clone(),
+            };
+            let auth_val = auth::build_authorization(&ch, &creds, "MESSAGE", target_uri);
+
+            let mut extra_auth = extra.clone();
+            extra_auth.insert(auth_resp_hdr.to_string(), auth_val);
+            let mut retry = self.build_request("MESSAGE", target_uri, Some(&extra_auth));
+            retry.set_header("To", &format!("<{}>", target_uri));
+            retry.body = body.to_vec();
+            debug!(method = "MESSAGE", "SIP >>> re-sending with auth");
+            let resp = self.tm.send(&mut retry, self.cfg.server_addr, timeout)?;
+            info!(method = "MESSAGE", status = resp.status_code, reason = %resp.reason, "SIP <<< auth response");
+            let retry_branch = retry.via_branch().to_string();
+            self.tm.remove_tx(&retry_branch);
+            return Ok((resp.status_code, resp.reason.clone()));
+        }
+
+        self.tm.remove_tx(&branch);
+        Ok((resp.status_code, resp.reason.clone()))
+    }
+
     /// Sends an in-dialog SIP request (BYE, REFER) and waits for response.
     pub fn send_dialog_request(&self, req: &mut Message, timeout: Duration) -> Result<Message> {
         if *self.closed.lock() {

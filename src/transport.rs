@@ -88,6 +88,23 @@ pub trait SipTransport: Send + Sync {
     /// Registers a callback for incoming MWI NOTIFY (message-summary body).
     fn on_mwi_notify(&self, _f: Box<dyn Fn(String) + Send + Sync>) {}
 
+    /// Sends an out-of-dialog SIP MESSAGE to the given URI.
+    fn send_message(
+        &self,
+        _target: &str,
+        _content_type: &str,
+        _body: &[u8],
+        _timeout: Duration,
+    ) -> Result<()> {
+        Err(Error::Other(
+            "message not supported on this transport".into(),
+        ))
+    }
+
+    /// Registers a callback for incoming SIP MESSAGE requests.
+    /// Args: from, content_type, body.
+    fn on_message(&self, _f: Box<dyn Fn(String, String, String) + Send + Sync>) {}
+
     /// Sends REGISTER with Expires: 0 to unregister.
     fn unregister(&self, _timeout: Duration) -> Result<()> {
         Ok(())
