@@ -19,6 +19,7 @@ use std::time::Duration;
 
 use xphone::config::Config;
 use xphone::sip::client::{Client, ClientConfig};
+use xphone::types::ExtensionState;
 use xphone::Phone;
 
 fn asterisk_host() -> String {
@@ -433,6 +434,87 @@ fn sip_message_between_extensions() {
         msg.from
     );
 
+    p1.disconnect().unwrap();
+    p2.disconnect().unwrap();
+}
+
+/// E8: p1 watches p2 via BLF, p2 dials p1, p1 sees state changes.
+#[test]
+fn blf_watch_state_changes() {
+    let cfg1 = integration_phone_config("1001", &asterisk_password());
+    let cfg2 = integration_phone_config("1002", &asterisk_password());
+
+    let p1 = Phone::new(cfg1);
+    let p2 = Phone::new(cfg2);
+
+    p1.connect().unwrap();
+    p2.connect().unwrap();
+
+    // p1 watches extension 1002.
+    let (blf_tx, blf_rx) = crossbeam_channel::bounded(10);
+    p1.watch("1002", move |status, _prev| {
+        let _ = blf_tx.send(status.state);
+    })
+    .unwrap();
+
+    // Wait for initial NOTIFY (Available since 1002 is registered with no calls).
+    let initial = blf_rx.recv_timeout(Duration::from_secs(5));
+    if let Ok(state) = initial {
+        assert_eq!(state, ExtensionState::Available);
+    }
+
+    // Set up p1 to auto-accept incoming calls.
+    let (call_tx, call_rx) = crossbeam_channel::bounded(1);
+    p1.on_incoming(move |call| {
+        call.accept().unwrap();
+        let _ = call_tx.send(call);
+    });
+
+    // p2 dials p1 — p1's BLF watcher should see 1002 go to Ringing or OnThePhone.
+    let opts = xphone::config::DialOptions {
+        timeout: Duration::from_secs(10),
+        ..Default::default()
+    };
+    let call2 = p2.dial("1001", opts).unwrap();
+
+    // Wait for p1 to accept the call.
+    let _call1 = call_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+
+    // Collect BLF state changes — expect at least one non-Available state.
+    let mut saw_busy = false;
+    for _ in 0..10 {
+        match blf_rx.recv_timeout(Duration::from_secs(2)) {
+            Ok(ExtensionState::OnThePhone) | Ok(ExtensionState::Ringing) => {
+                saw_busy = true;
+                break;
+            }
+            Ok(_) => continue,
+            Err(_) => break,
+        }
+    }
+    assert!(saw_busy, "expected BLF to show Ringing or OnThePhone");
+
+    // End call — BLF should return to Available.
+    call2.end().unwrap();
+    std::thread::sleep(Duration::from_millis(500));
+
+    let mut saw_available = false;
+    for _ in 0..10 {
+        match blf_rx.recv_timeout(Duration::from_secs(2)) {
+            Ok(ExtensionState::Available) => {
+                saw_available = true;
+                break;
+            }
+            Ok(_) => continue,
+            Err(_) => break,
+        }
+    }
+    assert!(
+        saw_available,
+        "expected BLF to return to Available after hangup"
+    );
+
+    p1.unwatch("1002").unwrap();
     p1.disconnect().unwrap();
     p2.disconnect().unwrap();
 }
