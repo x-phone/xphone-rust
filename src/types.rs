@@ -232,6 +232,131 @@ impl fmt::Display for SipMessage {
     }
 }
 
+/// State of a monitored extension (BLF / dialog event package).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum ExtensionState {
+    /// Extension is idle and available.
+    Available,
+    /// Extension is ringing (incoming call).
+    Ringing,
+    /// Extension is on an active call.
+    OnThePhone,
+    /// Extension is not registered / unreachable.
+    Offline,
+    /// State cannot be determined.
+    #[default]
+    Unknown,
+}
+
+impl fmt::Display for ExtensionState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ExtensionState::Available => write!(f, "Available"),
+            ExtensionState::Ringing => write!(f, "Ringing"),
+            ExtensionState::OnThePhone => write!(f, "OnThePhone"),
+            ExtensionState::Offline => write!(f, "Offline"),
+            ExtensionState::Unknown => write!(f, "Unknown"),
+        }
+    }
+}
+
+/// Status of a watched extension, passed to BLF callbacks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExtensionStatus {
+    /// The extension identifier (e.g. "1001").
+    pub extension: String,
+    /// Current state of the extension.
+    pub state: ExtensionState,
+}
+
+impl fmt::Display for ExtensionStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}: {}", self.extension, self.state)
+    }
+}
+
+/// Raw NOTIFY event for generic subscription callbacks.
+#[derive(Debug, Clone)]
+pub struct NotifyEvent {
+    /// SIP Event header value (e.g. "dialog", "presence").
+    pub event: String,
+    /// Content-Type of the NOTIFY body.
+    pub content_type: String,
+    /// Body of the NOTIFY.
+    pub body: String,
+    /// Parsed Subscription-State header.
+    pub subscription_state: SubState,
+}
+
+/// Subscription-State from a NOTIFY (RFC 6665 section 4.1.3).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SubState {
+    /// Subscription is pending authorization.
+    Pending,
+    /// Subscription is active with a remaining lifetime.
+    Active {
+        /// Server-granted remaining seconds.
+        expires: u32,
+    },
+    /// Subscription has been terminated.
+    Terminated {
+        /// Reason for termination (e.g. "deactivated", "timeout", "rejected").
+        reason: String,
+    },
+}
+
+impl fmt::Display for SubState {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            SubState::Pending => write!(f, "pending"),
+            SubState::Active { expires } => write!(f, "active;expires={}", expires),
+            SubState::Terminated { reason } => write!(f, "terminated;reason={}", reason),
+        }
+    }
+}
+
+/// Parses a Subscription-State header value (RFC 6665).
+///
+/// Examples: `"active;expires=600"`, `"terminated;reason=deactivated"`, `"pending"`
+pub fn parse_subscription_state(header: &str) -> SubState {
+    let header = header.trim();
+    let (state, params) = match header.find(';') {
+        Some(pos) => (header[..pos].trim(), &header[pos + 1..]),
+        None => (header, ""),
+    };
+
+    match state.to_lowercase().as_str() {
+        "pending" => SubState::Pending,
+        "active" => {
+            let expires = parse_param(params, "expires")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(3600);
+            SubState::Active { expires }
+        }
+        "terminated" => {
+            let reason = parse_param(params, "reason").unwrap_or_default();
+            SubState::Terminated { reason }
+        }
+        _ => SubState::Terminated {
+            reason: "unknown".into(),
+        },
+    }
+}
+
+/// Extracts a named parameter value from a semicolon-separated param string.
+fn parse_param(params: &str, name: &str) -> Option<String> {
+    for part in params.split(';') {
+        let part = part.trim();
+        if let Some(eq) = part.find('=') {
+            let key = part[..eq].trim();
+            if key.eq_ignore_ascii_case(name) {
+                return Some(part[eq + 1..].trim().to_string());
+            }
+        }
+    }
+    None
+}
+
 /// Audio codec identified by RTP payload type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Codec {
@@ -404,6 +529,94 @@ mod tests {
         let s = msg.to_string();
         assert!(s.contains("1001@pbx.local"));
         assert!(s.contains("Hello"));
+    }
+
+    #[test]
+    fn extension_state_default_is_unknown() {
+        assert_eq!(ExtensionState::default(), ExtensionState::Unknown);
+    }
+
+    #[test]
+    fn extension_state_display() {
+        assert_eq!(ExtensionState::Available.to_string(), "Available");
+        assert_eq!(ExtensionState::OnThePhone.to_string(), "OnThePhone");
+        assert_eq!(ExtensionState::Offline.to_string(), "Offline");
+    }
+
+    #[test]
+    fn extension_status_display() {
+        let s = ExtensionStatus {
+            extension: "1001".into(),
+            state: ExtensionState::OnThePhone,
+        };
+        assert_eq!(s.to_string(), "1001: OnThePhone");
+    }
+
+    #[test]
+    fn parse_subscription_state_active_with_expires() {
+        let s = parse_subscription_state("active;expires=600");
+        assert_eq!(s, SubState::Active { expires: 600 });
+    }
+
+    #[test]
+    fn parse_subscription_state_active_no_expires() {
+        let s = parse_subscription_state("active");
+        assert_eq!(s, SubState::Active { expires: 3600 });
+    }
+
+    #[test]
+    fn parse_subscription_state_terminated_deactivated() {
+        let s = parse_subscription_state("terminated;reason=deactivated");
+        assert_eq!(
+            s,
+            SubState::Terminated {
+                reason: "deactivated".into()
+            }
+        );
+    }
+
+    #[test]
+    fn parse_subscription_state_terminated_rejected() {
+        let s = parse_subscription_state("terminated;reason=rejected");
+        assert_eq!(
+            s,
+            SubState::Terminated {
+                reason: "rejected".into()
+            }
+        );
+    }
+
+    #[test]
+    fn parse_subscription_state_pending() {
+        assert_eq!(parse_subscription_state("pending"), SubState::Pending);
+    }
+
+    #[test]
+    fn parse_subscription_state_case_insensitive() {
+        let s = parse_subscription_state("Active;Expires=300");
+        assert_eq!(s, SubState::Active { expires: 300 });
+    }
+
+    #[test]
+    fn parse_subscription_state_whitespace() {
+        let s = parse_subscription_state("  active ; expires = 120  ");
+        assert_eq!(s, SubState::Active { expires: 120 });
+    }
+
+    #[test]
+    fn sub_state_display() {
+        assert_eq!(SubState::Pending.to_string(), "pending");
+        assert_eq!(
+            SubState::Active { expires: 600 }.to_string(),
+            "active;expires=600"
+        );
+        assert_eq!(
+            SubState::Terminated {
+                reason: "timeout".into()
+            }
+            .to_string(),
+            "terminated;reason=timeout"
+        );
     }
 
     #[test]

@@ -6,7 +6,12 @@ use parking_lot::Mutex;
 use crate::config::DialOptions;
 use crate::error::{Error, Result};
 use crate::mock::call::MockCall;
-use crate::types::{PhoneState, SipMessage, VoicemailStatus};
+use crate::subscription::SubId;
+use crate::types::{
+    ExtensionState, ExtensionStatus, NotifyEvent, PhoneState, SipMessage, VoicemailStatus,
+};
+
+type BlfCallback = Arc<dyn Fn(ExtensionStatus, Option<ExtensionState>) + Send + Sync>;
 
 struct Inner {
     state: PhoneState,
@@ -16,9 +21,13 @@ struct Inner {
     on_error_fn: Option<Arc<dyn Fn(Error) + Send + Sync>>,
     on_voicemail_fn: Option<Arc<dyn Fn(VoicemailStatus) + Send + Sync>>,
     on_message_fn: Option<Arc<dyn Fn(SipMessage) + Send + Sync>>,
+    on_subscription_error_fn: Option<Arc<dyn Fn(String, Error) + Send + Sync>>,
     last_call: Option<Arc<MockCall>>,
     calls: HashMap<String, Arc<MockCall>>,
     sent_messages: Vec<SipMessage>,
+    blf_watchers: HashMap<String, (ExtensionState, BlfCallback)>,
+    event_subscriptions: HashMap<SubId, Arc<dyn Fn(NotifyEvent) + Send + Sync>>,
+    next_sub_id: u64,
 }
 
 /// Mock phone for testing consumer code without a real SIP transport.
@@ -48,9 +57,13 @@ impl MockPhone {
                 on_error_fn: None,
                 on_voicemail_fn: None,
                 on_message_fn: None,
+                on_subscription_error_fn: None,
                 last_call: None,
                 calls: HashMap::new(),
                 sent_messages: Vec::new(),
+                blf_watchers: HashMap::new(),
+                event_subscriptions: HashMap::new(),
+                next_sub_id: 1,
             }),
         }
     }
@@ -79,6 +92,8 @@ impl MockPhone {
                 return Err(Error::NotConnected);
             }
             inner.state = PhoneState::Disconnected;
+            inner.blf_watchers.clear();
+            inner.event_subscriptions.clear();
             let calls: Vec<Arc<MockCall>> = inner.calls.drain().map(|(_, c)| c).collect();
             (inner.on_unregistered_fn.clone(), calls)
         };
@@ -159,6 +174,66 @@ impl MockPhone {
         self.inner.lock().sent_messages.clone()
     }
 
+    /// Watches an extension's state (BLF). The callback receives the new status
+    /// and the previous state (if any).
+    pub fn watch<F>(&self, extension: &str, f: F) -> Result<()>
+    where
+        F: Fn(ExtensionStatus, Option<ExtensionState>) + Send + Sync + 'static,
+    {
+        let mut inner = self.inner.lock();
+        if inner.state != PhoneState::Registered {
+            return Err(Error::NotRegistered);
+        }
+        inner.blf_watchers.insert(
+            extension.to_string(),
+            (ExtensionState::Unknown, Arc::new(f)),
+        );
+        Ok(())
+    }
+
+    /// Stops watching an extension's state.
+    pub fn unwatch(&self, extension: &str) -> Result<()> {
+        let mut inner = self.inner.lock();
+        if inner.state != PhoneState::Registered {
+            return Err(Error::NotRegistered);
+        }
+        inner.blf_watchers.remove(extension);
+        Ok(())
+    }
+
+    /// Subscribes to a generic SIP event. Returns a subscription ID.
+    pub fn subscribe_event<F>(&self, _uri: &str, _event: &str, _accept: &str, f: F) -> Result<SubId>
+    where
+        F: Fn(NotifyEvent) + Send + Sync + 'static,
+    {
+        let mut inner = self.inner.lock();
+        if inner.state != PhoneState::Registered {
+            return Err(Error::NotRegistered);
+        }
+        let id = inner.next_sub_id;
+        inner.next_sub_id += 1;
+        inner.event_subscriptions.insert(id, Arc::new(f));
+        Ok(id)
+    }
+
+    /// Unsubscribes from a generic SIP event by subscription ID.
+    pub fn unsubscribe_event(&self, sub_id: SubId) -> Result<()> {
+        let mut inner = self.inner.lock();
+        if inner.state != PhoneState::Registered {
+            return Err(Error::NotRegistered);
+        }
+        inner.event_subscriptions.remove(&sub_id);
+        Ok(())
+    }
+
+    /// Registers a callback fired when a subscription encounters a permanent failure.
+    pub fn on_subscription_error<F>(&self, f: F)
+    where
+        F: Fn(String, Error) + Send + Sync + 'static,
+    {
+        self.inner.lock().on_subscription_error_fn = Some(Arc::new(f));
+    }
+
     /// Returns the current phone state.
     pub fn state(&self) -> PhoneState {
         self.inner.lock().state
@@ -201,6 +276,55 @@ impl MockPhone {
                 body: body.to_string(),
             });
         }
+    }
+
+    /// Simulates an extension state change and fires the watch callback.
+    /// Implements duplicate suppression (same as Phone).
+    pub fn simulate_extension_state(&self, extension: &str, state: ExtensionState) {
+        let cb = {
+            let mut inner = self.inner.lock();
+            if let Some((prev, f)) = inner.blf_watchers.get_mut(extension) {
+                if *prev == state {
+                    return; // duplicate suppression
+                }
+                let old = *prev;
+                *prev = state;
+                let status = ExtensionStatus {
+                    extension: extension.to_string(),
+                    state,
+                };
+                Some((f.clone(), status, Some(old)))
+            } else {
+                None
+            }
+        };
+        if let Some((f, status, prev)) = cb {
+            f(status, prev);
+        }
+    }
+
+    /// Simulates a generic event notification for a subscription.
+    pub fn simulate_notify(&self, sub_id: SubId, event: NotifyEvent) {
+        let cb = {
+            let inner = self.inner.lock();
+            inner.event_subscriptions.get(&sub_id).cloned()
+        };
+        if let Some(f) = cb {
+            f(event);
+        }
+    }
+
+    /// Simulates a subscription error.
+    pub fn simulate_subscription_error(&self, uri: &str, err: Error) {
+        let cb = self.inner.lock().on_subscription_error_fn.clone();
+        if let Some(f) = cb {
+            f(uri.to_string(), err);
+        }
+    }
+
+    /// Returns the list of currently watched extensions.
+    pub fn watched_extensions(&self) -> Vec<String> {
+        self.inner.lock().blf_watchers.keys().cloned().collect()
     }
 
     /// Fires the OnVoicemail callback with the given status.
@@ -256,6 +380,7 @@ impl Default for MockPhone {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::SubState;
     use std::sync::atomic::{AtomicBool, Ordering};
 
     #[test]
@@ -526,5 +651,157 @@ mod tests {
         let p = MockPhone::new();
         // Should not panic.
         p.simulate_message("sip:1001@pbx.local", "Hello");
+    }
+
+    #[test]
+    fn watch_before_connect_errors() {
+        let p = MockPhone::new();
+        let err = p.watch("1002", |_, _| {}).unwrap_err();
+        assert!(matches!(err, Error::NotRegistered));
+    }
+
+    #[test]
+    fn watch_fires_callback_on_state_change() {
+        let p = MockPhone::new();
+        p.connect().unwrap();
+
+        let received = Arc::new(Mutex::new(None));
+        let received_clone = Arc::clone(&received);
+        p.watch("1002", move |status, prev| {
+            *received_clone.lock() = Some((status, prev));
+        })
+        .unwrap();
+
+        p.simulate_extension_state("1002", ExtensionState::OnThePhone);
+
+        let (status, prev) = received.lock().clone().unwrap();
+        assert_eq!(status.extension, "1002");
+        assert_eq!(status.state, ExtensionState::OnThePhone);
+        assert_eq!(prev, Some(ExtensionState::Unknown));
+    }
+
+    #[test]
+    fn watch_duplicate_suppression() {
+        let p = MockPhone::new();
+        p.connect().unwrap();
+
+        let count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let count_clone = Arc::clone(&count);
+        p.watch("1002", move |_, _| {
+            count_clone.fetch_add(1, Ordering::Relaxed);
+        })
+        .unwrap();
+
+        p.simulate_extension_state("1002", ExtensionState::Available);
+        p.simulate_extension_state("1002", ExtensionState::Available); // duplicate
+        p.simulate_extension_state("1002", ExtensionState::OnThePhone);
+
+        assert_eq!(count.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn unwatch_removes_subscription() {
+        let p = MockPhone::new();
+        p.connect().unwrap();
+        p.watch("1002", |_, _| {}).unwrap();
+        assert_eq!(p.watched_extensions().len(), 1);
+        p.unwatch("1002").unwrap();
+        assert!(p.watched_extensions().is_empty());
+    }
+
+    #[test]
+    fn subscribe_event_returns_id() {
+        let p = MockPhone::new();
+        p.connect().unwrap();
+        let id = p
+            .subscribe_event(
+                "sip:1002@pbx.local",
+                "presence",
+                "application/pidf+xml",
+                |_| {},
+            )
+            .unwrap();
+        assert!(id > 0);
+    }
+
+    #[test]
+    fn simulate_notify_fires_callback() {
+        let p = MockPhone::new();
+        p.connect().unwrap();
+
+        let received = Arc::new(Mutex::new(None));
+        let received_clone = Arc::clone(&received);
+        let id = p
+            .subscribe_event(
+                "sip:1002@pbx.local",
+                "dialog",
+                "application/dialog-info+xml",
+                move |ev| {
+                    *received_clone.lock() = Some(ev);
+                },
+            )
+            .unwrap();
+
+        p.simulate_notify(
+            id,
+            NotifyEvent {
+                event: "dialog".to_string(),
+                content_type: "application/dialog-info+xml".to_string(),
+                body: "<dialog-info/>".to_string(),
+                subscription_state: SubState::Active { expires: 3600 },
+            },
+        );
+
+        let ev = received.lock().clone().unwrap();
+        assert_eq!(ev.event, "dialog");
+    }
+
+    #[test]
+    fn unsubscribe_event_removes() {
+        let p = MockPhone::new();
+        p.connect().unwrap();
+        let id = p
+            .subscribe_event(
+                "sip:1002@pbx.local",
+                "presence",
+                "application/pidf+xml",
+                |_| {},
+            )
+            .unwrap();
+        p.unsubscribe_event(id).unwrap();
+
+        // simulate_notify should not panic (callback removed)
+        p.simulate_notify(
+            id,
+            NotifyEvent {
+                event: "presence".to_string(),
+                content_type: "application/pidf+xml".to_string(),
+                body: String::new(),
+                subscription_state: SubState::Terminated {
+                    reason: "noresource".to_string(),
+                },
+            },
+        );
+    }
+
+    #[test]
+    fn simulate_subscription_error_fires_callback() {
+        let p = MockPhone::new();
+        let received = Arc::new(Mutex::new(None));
+        let received_clone = Arc::clone(&received);
+        p.on_subscription_error(move |uri, _err| {
+            *received_clone.lock() = Some(uri);
+        });
+        p.simulate_subscription_error("sip:1002@pbx.local", Error::NotConnected);
+        assert_eq!(*received.lock(), Some("sip:1002@pbx.local".to_string()));
+    }
+
+    #[test]
+    fn disconnect_clears_watchers() {
+        let p = MockPhone::new();
+        p.connect().unwrap();
+        p.watch("1002", |_, _| {}).unwrap();
+        p.disconnect().unwrap();
+        assert!(p.watched_extensions().is_empty());
     }
 }

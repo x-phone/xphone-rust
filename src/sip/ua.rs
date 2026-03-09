@@ -25,6 +25,10 @@ struct Inner {
     info_dtmf_handler: Option<Arc<dyn Fn(String, String) + Send + Sync>>,
     mwi_notify_handler: Option<Arc<dyn Fn(String) + Send + Sync>>,
     message_handler: Option<Arc<dyn Fn(String, String, String) + Send + Sync>>,
+    #[allow(clippy::type_complexity)]
+    #[allow(clippy::type_complexity)]
+    subscription_notify_handler:
+        Option<Arc<dyn Fn(String, String, String, String, String) + Send + Sync>>,
 }
 
 /// Production SIP transport backed by `sip::client::Client`.
@@ -89,6 +93,7 @@ impl SipUA {
             info_dtmf_handler: None,
             mwi_notify_handler: None,
             message_handler: None,
+            subscription_notify_handler: None,
         }));
 
         // Wire up incoming SIP request handler.
@@ -225,30 +230,50 @@ fn handle_notify(
     from_addr: SocketAddr,
 ) {
     let call_id = msg.header("Call-ID").to_string();
-    info!(call_id = %call_id, "SIP <<< NOTIFY received");
+    let event = msg.header("Event").to_string();
+    info!(call_id = %call_id, event = %event, "SIP <<< NOTIFY received");
 
     // Always respond 200 OK to NOTIFY.
     let resp = build_sip_response(msg, 200, "OK");
     debug!("SIP >>> 200 OK (NOTIFY)");
     let _ = client.send_raw_to(&resp.to_bytes(), from_addr);
 
-    let content_type = msg.header("Content-Type");
-    let body = String::from_utf8_lossy(&msg.body);
+    let content_type = msg.header("Content-Type").to_string();
+    let body = String::from_utf8_lossy(&msg.body).to_string();
+    let sub_state = msg.header("Subscription-State").to_string();
 
-    // Dispatch based on Content-Type (strip parameters before comparing).
-    let media_type = content_type.split(';').next().unwrap_or("").trim();
-    if media_type.eq_ignore_ascii_case("application/simple-message-summary") {
+    // Dispatch by Event header (RFC 6665).
+    let event_base = event.split(';').next().unwrap_or("").trim();
+    if event_base.eq_ignore_ascii_case("message-summary") {
         // MWI NOTIFY (RFC 3842).
         let cb = inner.lock().mwi_notify_handler.clone();
         if let Some(f) = cb {
-            f(body.to_string());
+            f(body);
         }
         return;
     }
 
-    // Default: parse status code from sipfrag body (REFER progress).
-    let status_code = parse_sipfrag_status(&body);
+    // Subscription NOTIFYs (dialog, presence, etc.) — dispatch to subscription manager.
+    if !event_base.is_empty() && !event_base.eq_ignore_ascii_case("refer") {
+        let from_uri = msg.header("From").to_string();
+        let cb = inner.lock().subscription_notify_handler.clone();
+        if let Some(f) = cb {
+            f(event, content_type, body, sub_state, from_uri);
+        }
+        return;
+    }
 
+    // Fallback: REFER progress (sipfrag body) or legacy Content-Type based dispatch.
+    let media_type = content_type.split(';').next().unwrap_or("").trim();
+    if media_type.eq_ignore_ascii_case("application/simple-message-summary") {
+        let cb = inner.lock().mwi_notify_handler.clone();
+        if let Some(f) = cb {
+            f(body);
+        }
+        return;
+    }
+
+    let status_code = parse_sipfrag_status(&body);
     if let Some(code) = status_code {
         let cb = inner.lock().notify_handler.clone();
         if let Some(f) = cb {
@@ -491,6 +516,13 @@ impl SipTransport for SipUA {
 
     fn on_message(&self, f: Box<dyn Fn(String, String, String) + Send + Sync>) {
         self.inner.lock().message_handler = Some(Arc::from(f));
+    }
+
+    fn on_subscription_notify(
+        &self,
+        f: Box<dyn Fn(String, String, String, String, String) + Send + Sync>,
+    ) {
+        self.inner.lock().subscription_notify_handler = Some(Arc::from(f));
     }
 
     fn unregister(&self, timeout: Duration) -> Result<()> {

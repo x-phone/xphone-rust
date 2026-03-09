@@ -30,7 +30,7 @@ use serde::Deserialize;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::util::SubscriberInitExt;
 
-use xphone::{Call, CallState, EndReason, Phone};
+use xphone::{Call, CallState, EndReason, ExtensionState, Phone};
 
 // -- Accent colors ----------------------------------------------------------
 
@@ -183,6 +183,8 @@ struct AppState {
     history_pos: Option<usize>,
     /// Saved input when user starts browsing history.
     history_draft: String,
+    /// BLF watched extensions and their current state.
+    blf: Vec<(String, ExtensionState)>,
 }
 
 impl AppState {
@@ -202,6 +204,7 @@ impl AppState {
             history: Vec::new(),
             history_pos: None,
             history_draft: String::new(),
+            blf: Vec::new(),
         }
     }
 
@@ -386,6 +389,12 @@ fn wire_phone_events(phone: &Phone, state: &SharedState) {
         let sender = extract_sip_user(&msg.from);
         let mut st = s.lock().unwrap();
         st.push_event(format!("MSG from {}: {}", sender, msg.body));
+    });
+
+    let s = Arc::clone(state);
+    phone.on_subscription_error(move |uri, err| {
+        let mut st = s.lock().unwrap();
+        st.push_event(format!("BLF ERROR {}: {}", uri, err));
     });
 
     let s = Arc::clone(state);
@@ -964,6 +973,53 @@ fn exec_command(state: &SharedState, phone: &Phone, input: &str) {
             });
         }
 
+        "watch" | "w" => {
+            if arg.is_empty() {
+                state.lock().unwrap().error = "usage: watch <extension>".into();
+                return;
+            }
+            let ext = arg.clone();
+            let s = Arc::clone(state);
+            let s2 = Arc::clone(state);
+            match phone.watch(&ext, move |status, _prev| {
+                let mut st = s2.lock().unwrap();
+                // Update BLF state.
+                if let Some(entry) = st.blf.iter_mut().find(|(e, _)| *e == status.extension) {
+                    entry.1 = status.state;
+                }
+                st.push_event(format!("BLF {} → {}", status.extension, status.state));
+            }) {
+                Ok(()) => {
+                    let mut st = s.lock().unwrap();
+                    // Avoid duplicates.
+                    if !st.blf.iter().any(|(e, _)| *e == ext) {
+                        st.blf.push((ext.clone(), ExtensionState::Unknown));
+                    }
+                    st.push_event(format!("watching {}", ext));
+                }
+                Err(e) => {
+                    s.lock().unwrap().error = format!("watch error: {}", e);
+                }
+            }
+        }
+
+        "unwatch" | "uw" => {
+            if arg.is_empty() {
+                state.lock().unwrap().error = "usage: unwatch <extension>".into();
+                return;
+            }
+            match phone.unwatch(&arg) {
+                Ok(()) => {
+                    let mut st = state.lock().unwrap();
+                    st.blf.retain(|(e, _)| *e != arg);
+                    st.push_event(format!("unwatched {}", arg));
+                }
+                Err(e) => {
+                    state.lock().unwrap().error = format!("unwatch error: {}", e);
+                }
+            }
+        }
+
         // Select a call by number: "1", "2", "3", etc.
         other if other.parse::<usize>().is_ok() => {
             let n: usize = other.parse().unwrap();
@@ -1041,6 +1097,16 @@ fn call_status_indicator(status: &str) -> &str {
         "ringing" | "ringing remote" | "dialing" | "early media" => "◌",
         "on hold" => "◊",
         _ => "○",
+    }
+}
+
+fn blf_indicator(state: ExtensionState) -> (&'static str, Color) {
+    match state {
+        ExtensionState::Available => ("●", GREEN),
+        ExtensionState::Ringing => ("◌", YELLOW),
+        ExtensionState::OnThePhone => ("●", RED),
+        ExtensionState::Offline => ("○", DIM),
+        ExtensionState::Unknown => ("○", DIM),
     }
 }
 
@@ -1128,11 +1194,25 @@ fn draw(f: &mut ratatui::Frame, state: &SharedState) {
         .constraints([Constraint::Percentage(40), Constraint::Percentage(60)])
         .split(outer[1]);
 
-    // Left side: Calls panel (top) + Events panel (bottom)
+    // Left side: Calls panel (top) + BLF panel (middle, if watching) + Events panel (bottom)
     let calls_height = (st.calls.len() as u16 + 2).clamp(3, 8); // 2 for borders, min 3, max 8
+    let blf_height = if st.blf.is_empty() {
+        0
+    } else {
+        (st.blf.len() as u16 + 2).clamp(3, 6)
+    };
+    let left_constraints: Vec<Constraint> = if blf_height > 0 {
+        vec![
+            Constraint::Length(calls_height),
+            Constraint::Length(blf_height),
+            Constraint::Min(4),
+        ]
+    } else {
+        vec![Constraint::Length(calls_height), Constraint::Min(4)]
+    };
     let left_chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(calls_height), Constraint::Min(4)])
+        .constraints(left_constraints)
         .split(panel_chunks[0]);
 
     // --- Calls panel ---
@@ -1191,6 +1271,38 @@ fn draw(f: &mut ratatui::Frame, state: &SharedState) {
     );
     f.render_widget(calls_panel, left_chunks[0]);
 
+    // --- BLF panel (only if watching) ---
+    let events_idx = if !st.blf.is_empty() {
+        let blf_lines: Vec<Line> = st
+            .blf
+            .iter()
+            .map(|(ext, state)| {
+                let (indicator, color) = blf_indicator(*state);
+                Line::from(vec![
+                    Span::styled(format!("  {} ", indicator), Style::default().fg(color)),
+                    Span::styled(ext.as_str(), Style::default().fg(Color::White)),
+                    Span::styled(format!("  {}", state), Style::default().fg(color)),
+                ])
+            })
+            .collect();
+
+        let blf_panel = Paragraph::new(blf_lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_set(border::ROUNDED)
+                .border_style(Style::default().fg(ACCENT_DIM))
+                .title(Span::styled(
+                    " BLF ",
+                    Style::default().fg(ACCENT).add_modifier(Modifier::BOLD),
+                ))
+                .style(Style::default().bg(SURFACE)),
+        );
+        f.render_widget(blf_panel, left_chunks[1]);
+        2 // events panel is at index 2
+    } else {
+        1 // no BLF panel, events at index 1
+    };
+
     // --- Events panel ---
     let event_lines: Vec<Line> = st
         .events
@@ -1214,11 +1326,11 @@ fn draw(f: &mut ratatui::Frame, state: &SharedState) {
         .scroll((
             scroll_offset(
                 st.events.len(),
-                left_chunks[1].height.saturating_sub(2) as usize,
+                left_chunks[events_idx].height.saturating_sub(2) as usize,
             ),
             0,
         ));
-    f.render_widget(events_panel, left_chunks[1]);
+    f.render_widget(events_panel, left_chunks[events_idx]);
 
     // --- Debug panel (right) ---
     let debug_lines: Vec<Line> = st
@@ -1263,7 +1375,7 @@ fn draw(f: &mut ratatui::Frame, state: &SharedState) {
     };
 
     let help_text =
-        "dial(d) accept(a) reject hangup(h) hold resume mute unmute dtmf transfer(xfer) msg echo speaker mic 1/2/3 quit(q)";
+        "dial(d) accept(a) reject hangup(h) hold resume mute unmute dtmf transfer(xfer) msg watch(w) unwatch(uw) echo speaker mic quit(q)";
 
     let cmd_lines = vec![
         Line::from(vec![

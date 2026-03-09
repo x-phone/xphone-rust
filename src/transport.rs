@@ -105,6 +105,15 @@ pub trait SipTransport: Send + Sync {
     /// Args: from, content_type, body.
     fn on_message(&self, _f: Box<dyn Fn(String, String, String) + Send + Sync>) {}
 
+    /// Registers a callback for incoming subscription NOTIFYs (dialog, presence, etc.).
+    /// Args: event header, content_type, body, subscription_state header, from_uri.
+    #[allow(clippy::type_complexity)]
+    fn on_subscription_notify(
+        &self,
+        _f: Box<dyn Fn(String, String, String, String, String) + Send + Sync>,
+    ) {
+    }
+
     /// Sends REGISTER with Expires: 0 to unregister.
     fn unregister(&self, _timeout: Duration) -> Result<()> {
         Ok(())

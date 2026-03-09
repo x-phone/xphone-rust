@@ -54,6 +54,9 @@ struct Inner {
     mwi_notify_handler: Option<Arc<dyn Fn(String) + Send + Sync>>,
     #[allow(clippy::type_complexity)]
     message_handler: Option<Arc<dyn Fn(String, String, String) + Send + Sync>>,
+    #[allow(clippy::type_complexity)]
+    subscription_notify_handler:
+        Option<Arc<dyn Fn(String, String, String, String, String) + Send + Sync>>,
     response_watchers: HashMap<u16, Vec<Sender<bool>>>,
 }
 
@@ -86,6 +89,7 @@ impl MockTransport {
                 info_dtmf_handler: None,
                 mwi_notify_handler: None,
                 message_handler: None,
+                subscription_notify_handler: None,
                 response_watchers: HashMap::new(),
             }),
             response_ready_tx: tx,
@@ -174,6 +178,27 @@ impl MockTransport {
         let handler = self.inner.lock().message_handler.clone();
         if let Some(h) = handler {
             h(from.into(), content_type.into(), body.into());
+        }
+    }
+
+    /// Simulates an incoming subscription NOTIFY (dialog, presence, etc.).
+    pub fn simulate_subscription_notify(
+        &self,
+        event: &str,
+        content_type: &str,
+        body: &str,
+        subscription_state: &str,
+        from_uri: &str,
+    ) {
+        let handler = self.inner.lock().subscription_notify_handler.clone();
+        if let Some(h) = handler {
+            h(
+                event.into(),
+                content_type.into(),
+                body.into(),
+                subscription_state.into(),
+                from_uri.into(),
+            );
         }
     }
 
@@ -404,6 +429,13 @@ impl SipTransport for MockTransport {
 
     fn on_message(&self, f: Box<dyn Fn(String, String, String) + Send + Sync>) {
         self.inner.lock().message_handler = Some(Arc::from(f));
+    }
+
+    fn on_subscription_notify(
+        &self,
+        f: Box<dyn Fn(String, String, String, String, String) + Send + Sync>,
+    ) {
+        self.inner.lock().subscription_notify_handler = Some(Arc::from(f));
     }
 
     fn dial(
