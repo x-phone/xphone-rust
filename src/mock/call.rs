@@ -357,6 +357,45 @@ impl MockCall {
         Ok(())
     }
 
+    /// Returns the dialog identifiers `(call_id, local_tag, remote_tag)`.
+    /// Tags are extracted from the From/To headers if set via [`set_header`](Self::set_header).
+    pub fn dialog_id(&self) -> (String, String, String) {
+        // Use case-insensitive lookup matching MockCall::header().
+        let from_tag = self
+            .header("From")
+            .first()
+            .map(|v| crate::call::sip_header_tag(v).to_string())
+            .unwrap_or_default();
+        let to_tag = self
+            .header("To")
+            .first()
+            .map(|v| crate::call::sip_header_tag(v).to_string())
+            .unwrap_or_default();
+        let inner = self.inner.lock();
+        match inner.direction {
+            Direction::Outbound => (inner.call_id.clone(), from_tag, to_tag),
+            Direction::Inbound => (inner.call_id.clone(), to_tag, from_tag),
+        }
+    }
+
+    /// Ends the call with a specific reason (mirrors `Call::end_with_reason`).
+    pub fn end_with_reason(&self, reason: EndReason) {
+        let (state_cb, ended_cb) = {
+            let mut inner = self.inner.lock();
+            if inner.state == CallState::Ended {
+                return;
+            }
+            inner.state = CallState::Ended;
+            (inner.on_state_fn.clone(), inner.on_ended_fn.clone())
+        };
+        if let Some(f) = state_cb {
+            f(CallState::Ended);
+        }
+        if let Some(f) = ended_cb {
+            f(reason);
+        }
+    }
+
     // --- Callback setters ---
 
     /// Registers a callback fired when a DTMF digit is received.
@@ -703,5 +742,42 @@ mod tests {
         });
         c.accept().unwrap();
         assert_eq!(*state.lock(), CallState::Active);
+    }
+
+    #[test]
+    fn dialog_id_outbound_from_headers() {
+        let c = MockCall::new();
+        c.set_direction(Direction::Outbound);
+        c.set_header("From", "<sip:1001@host>;tag=local1");
+        c.set_header("To", "<sip:1002@host>;tag=remote2");
+        let (cid, local, remote) = c.dialog_id();
+        assert!(!cid.is_empty());
+        assert_eq!(local, "local1");
+        assert_eq!(remote, "remote2");
+    }
+
+    #[test]
+    fn dialog_id_inbound_swaps_tags() {
+        let c = MockCall::new();
+        c.set_direction(Direction::Inbound);
+        c.set_header("From", "<sip:1001@host>;tag=remote1");
+        c.set_header("To", "<sip:1002@host>;tag=local2");
+        let (_, local, remote) = c.dialog_id();
+        assert_eq!(local, "local2");
+        assert_eq!(remote, "remote1");
+    }
+
+    #[test]
+    fn end_with_reason_fires_callback() {
+        let c = MockCall::new();
+        c.accept().unwrap();
+        let reason = Arc::new(Mutex::new(None));
+        let reason_clone = Arc::clone(&reason);
+        c.on_ended(move |r| {
+            *reason_clone.lock() = Some(r);
+        });
+        c.end_with_reason(EndReason::Transfer);
+        assert_eq!(c.state(), CallState::Ended);
+        assert_eq!(*reason.lock(), Some(EndReason::Transfer));
     }
 }

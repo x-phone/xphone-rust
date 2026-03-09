@@ -168,6 +168,26 @@ impl MockPhone {
     pub fn calls(&self) -> Vec<Arc<MockCall>> {
         self.inner.lock().calls.values().cloned().collect()
     }
+
+    /// Initiates an attended transfer between two mock calls.
+    /// Records the transfer on `call_a` and ends both calls with `Transfer` reason.
+    pub fn attended_transfer(&self, call_a: &Arc<MockCall>, call_b: &Arc<MockCall>) -> Result<()> {
+        use crate::types::CallState;
+
+        let state_a = call_a.state();
+        if state_a != CallState::Active && state_a != CallState::OnHold {
+            return Err(Error::InvalidState);
+        }
+        let state_b = call_b.state();
+        if state_b != CallState::Active && state_b != CallState::OnHold {
+            return Err(Error::InvalidState);
+        }
+
+        call_a.blind_transfer(&call_b.remote_uri())?;
+        call_a.end_with_reason(crate::types::EndReason::Transfer);
+        call_b.end_with_reason(crate::types::EndReason::Transfer);
+        Ok(())
+    }
 }
 
 impl Default for MockPhone {
@@ -358,5 +378,28 @@ mod tests {
         });
         p.connect().unwrap();
         assert_eq!(*state.lock(), PhoneState::Registered);
+    }
+
+    #[test]
+    fn attended_transfer_ends_both_calls() {
+        let p = MockPhone::new();
+        p.connect().unwrap();
+        let a = p.dial("sip:bob@pbx.local", DialOptions::default()).unwrap();
+        let b = p
+            .dial("sip:charlie@pbx.local", DialOptions::default())
+            .unwrap();
+        p.attended_transfer(&a, &b).unwrap();
+        assert_eq!(a.state(), crate::types::CallState::Ended);
+        assert_eq!(b.state(), crate::types::CallState::Ended);
+    }
+
+    #[test]
+    fn attended_transfer_rejects_ringing_call() {
+        let p = MockPhone::new();
+        p.connect().unwrap();
+        let a = p.dial("sip:bob@pbx.local", DialOptions::default()).unwrap();
+        let b = Arc::new(MockCall::new()); // Ringing state
+        let result = p.attended_transfer(&a, &b);
+        assert!(result.is_err());
     }
 }

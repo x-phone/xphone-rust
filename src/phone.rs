@@ -4,14 +4,14 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 use tracing::{debug, info, warn};
 
-use crate::call::Call;
+use crate::call::{self, Call};
 use crate::config::{Config, DialOptions};
 use crate::dialog::Dialog;
 use crate::error::{Error, Result};
 use crate::mock::dialog::MockDialog;
 use crate::registry::Registry;
 use crate::transport::SipTransport;
-use crate::types::PhoneState;
+use crate::types::{CallState, Direction, EndReason, PhoneState};
 
 type CallStateCb = Arc<dyn Fn(Arc<Call>, crate::types::CallState) + Send + Sync>;
 type CallEndedCb = Arc<dyn Fn(Arc<Call>, crate::types::EndReason) + Send + Sync>;
@@ -417,6 +417,87 @@ impl Phone {
     pub fn calls(&self) -> Vec<Arc<Call>> {
         self.inner.lock().calls.values().cloned().collect()
     }
+
+    /// Initiates an attended (consultative) transfer.
+    ///
+    /// Transfers `call_a` by sending REFER with a Replaces header that references
+    /// `call_b`'s dialog. After the transfer succeeds (NOTIFY 200), both calls end
+    /// with `EndReason::Transfer`.
+    ///
+    /// Both calls must be in `Active` or `OnHold` state.
+    pub fn attended_transfer(&self, call_a: &Arc<Call>, call_b: &Arc<Call>) -> Result<()> {
+        {
+            let state_a = call_a.state();
+            if state_a != CallState::Active && state_a != CallState::OnHold {
+                return Err(Error::InvalidState);
+            }
+            let state_b = call_b.state();
+            if state_b != CallState::Active && state_b != CallState::OnHold {
+                return Err(Error::InvalidState);
+            }
+        }
+
+        // Extract Call B's dialog identifiers for the Replaces header.
+        let (b_call_id, b_local_tag, b_remote_tag) = call_b.dialog_id();
+        if b_call_id.is_empty() || b_local_tag.is_empty() || b_remote_tag.is_empty() {
+            return Err(Error::Other(
+                "attended transfer: call B dialog missing call-id or tags".into(),
+            ));
+        }
+
+        // Build the remote party's SIP URI from Call B.
+        let remote_uri = match call_b.direction() {
+            Direction::Outbound => {
+                // Outbound: remote party is in the To header.
+                call_b
+                    .header("To")
+                    .first()
+                    .map(|v| call::sip_header_uri(v).to_string())
+                    .unwrap_or_default()
+            }
+            Direction::Inbound => {
+                // Inbound: remote party is in the From header.
+                call_b
+                    .header("From")
+                    .first()
+                    .map(|v| call::sip_header_uri(v).to_string())
+                    .unwrap_or_default()
+            }
+        };
+        if remote_uri.is_empty() {
+            return Err(Error::Other(
+                "attended transfer: cannot determine call B remote URI".into(),
+            ));
+        }
+
+        // Build Refer-To URI with Replaces parameter (URL-encoded per RFC 3891).
+        // Format: <remote_uri>?Replaces=<call-id>%3Bto-tag%3D<remote-tag>%3Bfrom-tag%3D<local-tag>
+        let refer_to = format!(
+            "{}?Replaces={}%3Bto-tag%3D{}%3Bfrom-tag%3D{}",
+            remote_uri,
+            uri_encode(&b_call_id),
+            uri_encode(&b_remote_tag),
+            uri_encode(&b_local_tag),
+        );
+
+        // Wire up NOTIFY handler: on 200, end both calls with Transfer reason.
+        let weak_a = Arc::downgrade(call_a);
+        let weak_b = Arc::downgrade(call_b);
+        call_a.dlg.on_notify(Box::new(move |code| {
+            if code == 200 {
+                if let Some(a) = weak_a.upgrade() {
+                    a.end_with_reason(EndReason::Transfer);
+                }
+                if let Some(b) = weak_b.upgrade() {
+                    b.end_with_reason(EndReason::Transfer);
+                }
+            }
+        }));
+
+        // Send REFER on Call A's dialog.
+        call_a.dlg.send_refer(&refer_to)?;
+        Ok(())
+    }
 }
 
 impl Drop for Phone {
@@ -427,6 +508,27 @@ impl Drop for Phone {
             let _ = self.disconnect();
         }
     }
+}
+
+/// URI-encoding for SIP Replaces header values (RFC 3891).
+/// Encodes URI-reserved characters that appear in Call-IDs and tag values.
+fn uri_encode(val: &str) -> String {
+    let mut out = String::with_capacity(val.len() * 2);
+    for b in val.bytes() {
+        match b {
+            b'%' => out.push_str("%25"),
+            b'@' => out.push_str("%40"),
+            b' ' => out.push_str("%20"),
+            b';' => out.push_str("%3B"),
+            b'?' => out.push_str("%3F"),
+            b'&' => out.push_str("%26"),
+            b'=' => out.push_str("%3D"),
+            b'+' => out.push_str("%2B"),
+            b':' => out.push_str("%3A"),
+            _ => out.push(b as char),
+        }
+    }
+    out
 }
 
 /// Discovers the local IP address used to reach the given host.
@@ -1199,5 +1301,189 @@ mod tests {
             1,
             "Call Arc should have no other holders after end + callback cleanup"
         );
+    }
+
+    // --- Attended Transfer ---
+
+    fn mock_dlg_with_tags(
+        call_id: &str,
+        from: &str,
+        to: &str,
+    ) -> Arc<crate::mock::dialog::MockDialog> {
+        let mut h = std::collections::HashMap::new();
+        h.insert("From".into(), vec![from.into()]);
+        h.insert("To".into(), vec![to.into()]);
+        let dlg = crate::mock::dialog::MockDialog::with_headers(h);
+        dlg.set_call_id(call_id);
+        Arc::new(dlg)
+    }
+
+    #[test]
+    fn attended_transfer_sends_refer_with_replaces() {
+        let tr = Arc::new(MockTransport::new());
+        tr.respond_with(200, "OK"); // REGISTER
+        let phone = Phone::new(test_cfg());
+        phone.connect_with_transport(Arc::clone(&tr) as Arc<dyn SipTransport>);
+
+        // Create Call A (outbound to Bob) with dialog tags.
+        let dlg_a = mock_dlg_with_tags(
+            "call-a-id",
+            "<sip:1001@pbx>;tag=alice-a",
+            "<sip:bob@pbx>;tag=bob-a",
+        );
+        let call_a = Call::new_outbound(dlg_a.clone(), DialOptions::default());
+        call_a.simulate_response(200, "OK");
+
+        // Create Call B (outbound to Charlie) with dialog tags.
+        let dlg_b = mock_dlg_with_tags(
+            "call-b-id@pbx.local",
+            "<sip:1001@pbx>;tag=alice-b",
+            "<sip:charlie@pbx>;tag=charlie-b",
+        );
+        let call_b = Call::new_outbound(dlg_b.clone(), DialOptions::default());
+        call_b.simulate_response(200, "OK");
+        call_b.hold().unwrap(); // typically call_b is active during consultation
+
+        // Execute attended transfer.
+        phone.attended_transfer(&call_a, &call_b).unwrap();
+
+        // Verify REFER was sent on Call A's dialog.
+        assert!(dlg_a.refer_sent());
+        let refer_target = dlg_a.last_refer_target();
+
+        // Refer-To should point to Charlie's URI with Replaces encoding.
+        assert!(
+            refer_target.starts_with("sip:charlie@pbx?Replaces="),
+            "REFER target should start with Charlie's URI: {}",
+            refer_target
+        );
+        // Call-ID should be URL-encoded (@ -> %40).
+        assert!(
+            refer_target.contains("call-b-id%40pbx.local"),
+            "Call-ID @ should be encoded: {}",
+            refer_target
+        );
+        // Tags should be present with URL-encoded separators.
+        assert!(
+            refer_target.contains("to-tag%3Dcharlie-b"),
+            "remote tag (charlie) should be in to-tag: {}",
+            refer_target
+        );
+        assert!(
+            refer_target.contains("from-tag%3Dalice-b"),
+            "local tag (alice) should be in from-tag: {}",
+            refer_target
+        );
+    }
+
+    #[test]
+    fn attended_transfer_ends_both_on_notify_200() {
+        let tr = Arc::new(MockTransport::new());
+        tr.respond_with(200, "OK");
+        let phone = Phone::new(test_cfg());
+        phone.connect_with_transport(Arc::clone(&tr) as Arc<dyn SipTransport>);
+
+        let dlg_a = mock_dlg_with_tags("call-a", "<sip:1001@pbx>;tag=a1", "<sip:bob@pbx>;tag=b1");
+        let dlg_b = mock_dlg_with_tags(
+            "call-b",
+            "<sip:1001@pbx>;tag=a2",
+            "<sip:charlie@pbx>;tag=c2",
+        );
+        let call_a = Call::new_outbound(dlg_a.clone(), DialOptions::default());
+        call_a.simulate_response(200, "OK");
+        let call_b = Call::new_outbound(dlg_b.clone(), DialOptions::default());
+        call_b.simulate_response(200, "OK");
+
+        let (tx_a, rx_a) = crossbeam_channel::bounded(1);
+        let (tx_b, rx_b) = crossbeam_channel::bounded(1);
+        call_a.on_ended(move |r| {
+            let _ = tx_a.send(r);
+        });
+        call_b.on_ended(move |r| {
+            let _ = tx_b.send(r);
+        });
+
+        phone.attended_transfer(&call_a, &call_b).unwrap();
+
+        // Simulate successful NOTIFY from Bob.
+        dlg_a.simulate_notify(200);
+
+        // Wait for callbacks.
+        std::thread::sleep(Duration::from_millis(100));
+
+        assert_eq!(call_a.state(), CallState::Ended);
+        assert_eq!(call_b.state(), CallState::Ended);
+        assert_eq!(
+            rx_a.recv_timeout(Duration::from_millis(200)).unwrap(),
+            EndReason::Transfer
+        );
+        assert_eq!(
+            rx_b.recv_timeout(Duration::from_millis(200)).unwrap(),
+            EndReason::Transfer
+        );
+    }
+
+    #[test]
+    fn attended_transfer_rejects_inactive_call_a() {
+        let phone = Phone::new(test_cfg());
+        let dlg_a = Arc::new(MockDialog::new());
+        let dlg_b = Arc::new(MockDialog::new());
+        let call_a = Call::new_inbound(dlg_a); // Ringing, not Active
+        let call_b = Call::new_outbound(dlg_b, DialOptions::default());
+        call_b.simulate_response(200, "OK");
+
+        let result = phone.attended_transfer(&call_a, &call_b);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn attended_transfer_rejects_inactive_call_b() {
+        let phone = Phone::new(test_cfg());
+        let dlg_a = Arc::new(MockDialog::new());
+        let dlg_b = Arc::new(MockDialog::new());
+        let call_a = Call::new_inbound(dlg_a);
+        call_a.accept().unwrap();
+        let call_b = Call::new_inbound(dlg_b); // Ringing, not Active
+
+        let result = phone.attended_transfer(&call_a, &call_b);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn attended_transfer_notify_non_200_keeps_calls_alive() {
+        let tr = Arc::new(MockTransport::new());
+        tr.respond_with(200, "OK");
+        let phone = Phone::new(test_cfg());
+        phone.connect_with_transport(Arc::clone(&tr) as Arc<dyn SipTransport>);
+
+        let dlg_a = mock_dlg_with_tags("call-a", "<sip:1001@pbx>;tag=a1", "<sip:bob@pbx>;tag=b1");
+        let dlg_b = mock_dlg_with_tags(
+            "call-b",
+            "<sip:1001@pbx>;tag=a2",
+            "<sip:charlie@pbx>;tag=c2",
+        );
+        let call_a = Call::new_outbound(dlg_a.clone(), DialOptions::default());
+        call_a.simulate_response(200, "OK");
+        let call_b = Call::new_outbound(dlg_b.clone(), DialOptions::default());
+        call_b.simulate_response(200, "OK");
+
+        phone.attended_transfer(&call_a, &call_b).unwrap();
+
+        // NOTIFY 100 (Trying) should NOT end the calls.
+        dlg_a.simulate_notify(100);
+        std::thread::sleep(Duration::from_millis(50));
+
+        assert_eq!(call_a.state(), CallState::Active);
+        assert_eq!(call_b.state(), CallState::Active);
+    }
+
+    #[test]
+    fn uri_encode_encodes_special_chars() {
+        assert_eq!(uri_encode("abc@host"), "abc%40host");
+        assert_eq!(uri_encode("hello world"), "hello%20world");
+        assert_eq!(uri_encode("100%done"), "100%25done");
+        assert_eq!(uri_encode("simple"), "simple");
+        assert_eq!(uri_encode("a;b=c?d&e+f"), "a%3Bb%3Dc%3Fd%26e%2Bf");
+        assert_eq!(uri_encode("sip:user"), "sip%3Auser");
     }
 }

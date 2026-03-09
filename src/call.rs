@@ -84,6 +84,21 @@ pub fn sip_header_user(val: &str) -> &str {
     }
 }
 
+/// Extracts the tag parameter from a SIP header value.
+/// e.g. `<sip:1001@host>;tag=abc123` -> `abc123`
+pub fn sip_header_tag(val: &str) -> &str {
+    // Use ASCII lowercase to preserve byte offsets (SIP params are ASCII).
+    let lower = val.to_ascii_lowercase();
+    if let Some(idx) = lower.find(";tag=") {
+        let start = idx + 5;
+        let rest = &val[start..];
+        let end = rest.find([';', '>', ',']).unwrap_or(rest.len());
+        &rest[..end]
+    } else {
+        ""
+    }
+}
+
 /// Extracts the display name from a SIP header value.
 /// e.g. `"Alice" <sip:1001@host>` -> `Alice`
 pub fn sip_header_display_name(val: &str) -> &str {
@@ -155,7 +170,7 @@ struct CallInner {
 /// Created via [`Call::new_inbound`] or [`Call::new_outbound`] and returned as `Arc<Call>`.
 pub struct Call {
     inner: Mutex<CallInner>,
-    dlg: Arc<dyn Dialog>,
+    pub(crate) dlg: Arc<dyn Dialog>,
 }
 
 impl Call {
@@ -306,6 +321,31 @@ impl Call {
         vals.first()
             .map(|v| sip_header_uri(v).to_string())
             .unwrap_or_default()
+    }
+
+    /// Returns the dialog identifiers needed for attended transfer:
+    /// `(call_id, local_tag, remote_tag)`.
+    pub fn dialog_id(&self) -> (String, String, String) {
+        let call_id = self.dlg.call_id();
+        let direction = self.inner.lock().direction;
+
+        let from_tag = self
+            .dlg
+            .header("From")
+            .first()
+            .map(|v| sip_header_tag(v).to_string())
+            .unwrap_or_default();
+        let to_tag = self
+            .dlg
+            .header("To")
+            .first()
+            .map(|v| sip_header_tag(v).to_string())
+            .unwrap_or_default();
+
+        match direction {
+            Direction::Outbound => (call_id, from_tag, to_tag),
+            Direction::Inbound => (call_id, to_tag, from_tag),
+        }
     }
 
     /// Returns the user part of the SIP From header (e.g., `+15551234567`).
@@ -762,6 +802,27 @@ impl Call {
         }));
         self.dlg.send_refer(target)?;
         Ok(())
+    }
+
+    /// Ends the call with a specific reason. Sends BYE if active/on-hold.
+    /// Used by attended transfer to end both legs with `EndReason::Transfer`.
+    pub(crate) fn end_with_reason(&self, reason: EndReason) {
+        let mut inner = self.inner.lock();
+        if inner.state == CallState::Ended {
+            return;
+        }
+        if let Some(ref cancel) = inner.session_timer_cancel {
+            cancel.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        if inner.state == CallState::Active || inner.state == CallState::OnHold {
+            let _ = self.dlg.send_bye();
+        }
+        inner.state = CallState::Ended;
+        if let Some(ref mut h) = inner.media_handle {
+            h.stop();
+        }
+        Self::fire_on_state(&inner, CallState::Ended);
+        Self::fire_on_ended(&mut inner, reason);
     }
 
     // --- Simulation methods (for tests and incoming SIP events) ---
@@ -1628,6 +1689,74 @@ mod tests {
     fn blind_transfer_when_not_active_returns_invalid_state() {
         let call = Call::new_inbound(mock_dlg());
         assert!(call.blind_transfer("sip:1003@pbx").is_err());
+    }
+
+    // --- Tag extraction ---
+
+    #[test]
+    fn sip_header_tag_extracts_tag() {
+        assert_eq!(sip_header_tag("<sip:1001@host>;tag=abc123"), "abc123");
+        assert_eq!(sip_header_tag("\"Alice\" <sip:1001@host>;tag=abc"), "abc");
+        assert_eq!(sip_header_tag("<sip:1001@host>"), "");
+        assert_eq!(sip_header_tag("<sip:1001@host>;tag=abc;other=1"), "abc");
+    }
+
+    // --- Dialog ID ---
+
+    #[test]
+    fn dialog_id_outbound_call() {
+        let mut h = HashMap::new();
+        h.insert("From".into(), vec!["<sip:1001@host>;tag=local1".into()]);
+        h.insert("To".into(), vec!["<sip:1002@host>;tag=remote2".into()]);
+        let dlg = Arc::new(MockDialog::with_headers(h));
+        let call = Call::new_outbound(dlg.clone(), DialOptions::default());
+        let (cid, local, remote) = call.dialog_id();
+        assert_eq!(cid, dlg.call_id());
+        assert_eq!(local, "local1");
+        assert_eq!(remote, "remote2");
+    }
+
+    #[test]
+    fn dialog_id_inbound_call() {
+        let mut h = HashMap::new();
+        h.insert("From".into(), vec!["<sip:1001@host>;tag=remote1".into()]);
+        h.insert("To".into(), vec!["<sip:1002@host>;tag=local2".into()]);
+        let dlg = Arc::new(MockDialog::with_headers(h));
+        let call = Call::new_inbound(dlg.clone());
+        let (cid, local, remote) = call.dialog_id();
+        assert_eq!(cid, dlg.call_id());
+        assert_eq!(local, "local2");
+        assert_eq!(remote, "remote1");
+    }
+
+    // --- End with reason ---
+
+    #[test]
+    fn end_with_reason_transfer() {
+        let dlg = mock_dlg();
+        let call = Call::new_inbound(dlg.clone());
+        call.accept().unwrap();
+        let (tx, rx) = mpsc::channel();
+        call.on_ended(move |r| {
+            let _ = tx.send(r);
+        });
+        call.end_with_reason(EndReason::Transfer);
+        assert_eq!(call.state(), CallState::Ended);
+        assert!(dlg.bye_sent());
+        assert_eq!(
+            rx.recv_timeout(Duration::from_millis(200)).unwrap(),
+            EndReason::Transfer
+        );
+    }
+
+    #[test]
+    fn end_with_reason_already_ended_is_noop() {
+        let call = Call::new_inbound(mock_dlg());
+        call.accept().unwrap();
+        call.end().unwrap();
+        // Should not panic or fire callbacks again.
+        call.end_with_reason(EndReason::Transfer);
+        assert_eq!(call.state(), CallState::Ended);
     }
 
     // --- SDP integration ---
