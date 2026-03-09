@@ -10,9 +10,12 @@ use tracing::{debug, warn};
 use crate::callback_pool::spawn_callback;
 use crate::codec::{self, CodecProcessor};
 use crate::dtmf;
+use crate::ice::IceAgent;
 use crate::jitter::JitterBuffer;
 use crate::rtcp::{self, RtcpStats};
 use crate::srtp::SrtpContext;
+use crate::stun;
+use crate::turn;
 use crate::types::*;
 
 /// Default media configuration values.
@@ -56,6 +59,11 @@ pub struct MediaConfig {
     pub rtcp_socket: Option<Arc<UdpSocket>>,
     /// Remote RTCP address (remote RTP port + 1).
     pub rtcp_remote_addr: Option<SocketAddr>,
+    /// ICE-Lite agent for handling STUN binding requests on the media socket.
+    pub ice_agent: Option<Arc<IceAgent>>,
+    /// TURN channel number + server address for relayed media.
+    /// When set, outbound RTP is wrapped in ChannelData and sent to the TURN server.
+    pub turn_relay: Option<(u16, SocketAddr)>,
 }
 
 impl Default for MediaConfig {
@@ -69,6 +77,8 @@ impl Default for MediaConfig {
             srtp_outbound: None,
             rtcp_socket: None,
             rtcp_remote_addr: None,
+            ice_agent: None,
+            turn_relay: None,
         }
     }
 }
@@ -318,6 +328,8 @@ pub fn start_media(
     let rtcp_socket_for_reader = rtcp_socket.as_ref().map(Arc::clone);
     // Channel for RTCP packets received by the reader thread.
     let (rtcp_recv_tx, rtcp_recv_rx) = bounded::<Vec<u8>>(16);
+    let ice_agent = config.ice_agent;
+
     let reader_thread = transport.as_ref().map(|tr| {
         let socket = Arc::clone(&tr.socket);
         let inbound_tx = channels.rtp_inbound.tx.clone();
@@ -326,6 +338,7 @@ pub fn start_media(
         let srtp_in_clone = srtp_in.clone();
         let rtcp_sock = rtcp_socket_for_reader;
         let rtcp_tx = rtcp_recv_tx;
+        let ice = ice_agent;
         debug!("media: starting UDP reader thread");
         std::thread::spawn(move || {
             let mut buf = [0u8; 2048];
@@ -336,13 +349,43 @@ pub fn start_media(
                     return;
                 }
                 match socket.recv_from(&mut buf) {
-                    Ok((n, _src)) => {
-                        if n < 12 {
+                    Ok((n, src)) => {
+                        if n < 4 {
                             continue;
                         }
+
+                        // Demux: STUN vs ChannelData vs RTP (RFC 5764 §5.1.2).
+                        if stun::is_stun_message(&buf[..n]) {
+                            // ICE connectivity check — respond if agent is configured.
+                            if let Some(ref agent) = ice {
+                                if let Some(resp) = agent.handle_binding_request(&buf[..n], src) {
+                                    let _ = socket.send_to(&resp, src);
+                                }
+                            }
+                            continue;
+                        }
+
+                        // ChannelData from TURN relay — unwrap and process as RTP.
+                        let (rtp_slice, _channel_buf);
+                        if turn::is_channel_data(&buf[..n]) {
+                            match turn::parse_channel_data(&buf[..n]) {
+                                Some((_ch, payload)) => {
+                                    _channel_buf = payload.to_vec();
+                                    rtp_slice = _channel_buf.as_slice();
+                                }
+                                None => continue,
+                            }
+                        } else {
+                            rtp_slice = &buf[..n];
+                        }
+
+                        if rtp_slice.len() < 12 {
+                            continue;
+                        }
+
                         // SRTP decrypt if configured.
                         let rtp_data = if let Some(ref srtp) = srtp_in_clone {
-                            match srtp.lock().unprotect(&buf[..n]) {
+                            match srtp.lock().unprotect(rtp_slice) {
                                 Ok(decrypted) => decrypted,
                                 Err(e) => {
                                     warn!(error = %e, "media: SRTP unprotect failed — dropping packet");
@@ -350,7 +393,7 @@ pub fn start_media(
                                 }
                             }
                         } else {
-                            buf[..n].to_vec()
+                            rtp_slice.to_vec()
                         };
                         if let Some(pkt) = RtpPacket::parse(&rtp_data) {
                             pkt_count += 1;
@@ -396,6 +439,7 @@ pub fn start_media(
     let transport_for_thread = transport.clone();
     let srtp_out_for_thread = srtp_out;
     let rtcp_socket_for_thread = rtcp_socket;
+    let turn_relay = config.turn_relay;
     let thread = std::thread::spawn(move || {
         let mut jb = JitterBuffer::new(jitter_depth);
         let mut out_seq: u16 = 0;
@@ -510,7 +554,7 @@ pub fn start_media(
                         send_drop_oldest(&sent.tx, &sent.rx, clone_packet(&pkt));
                     }
                     if let Some(ref tr) = transport_for_thread {
-                        send_rtp_to_transport(pkt.to_bytes(), &srtp_out_for_thread, tr);
+                        send_rtp_to_transport(pkt.to_bytes(), &srtp_out_for_thread, tr, turn_relay);
                     }
                 },
 
@@ -547,7 +591,7 @@ pub fn start_media(
                         send_drop_oldest(&sent.tx, &sent.rx, clone_packet(&out_pkt));
                     }
                     if let Some(ref tr) = transport_for_thread {
-                        send_rtp_to_transport(out_pkt.to_bytes(), &srtp_out_for_thread, tr);
+                        send_rtp_to_transport(out_pkt.to_bytes(), &srtp_out_for_thread, tr, turn_relay);
                     }
                 },
 
@@ -595,10 +639,13 @@ pub fn start_media(
 }
 
 /// Optionally encrypts with SRTP and sends an RTP packet via transport.
+/// If `turn_relay` is set, wraps the data in ChannelData and sends to the
+/// TURN server instead of the remote peer directly.
 fn send_rtp_to_transport(
     raw: Vec<u8>,
     srtp: &Option<Arc<Mutex<SrtpContext>>>,
     transport: &MediaTransport,
+    turn_relay: Option<(u16, SocketAddr)>,
 ) {
     let data = if let Some(ref ctx) = srtp {
         match ctx.lock().protect(&raw) {
@@ -611,8 +658,13 @@ fn send_rtp_to_transport(
     } else {
         raw
     };
-    let remote = *transport.remote_addr.lock();
-    let _ = transport.socket.send_to(&data, remote);
+    if let Some((channel, server)) = turn_relay {
+        let frame = turn::wrap_channel_data(channel, &data);
+        let _ = transport.socket.send_to(&frame, server);
+    } else {
+        let remote = *transport.remote_addr.lock();
+        let _ = transport.socket.send_to(&data, remote);
+    }
 }
 
 /// Inline drain: pops from jitter buffer and fans out to readers.

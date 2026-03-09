@@ -1,32 +1,58 @@
-//! STUN Binding client (RFC 5389).
+//! STUN Binding client (RFC 5389) and shared STUN primitives.
 //!
 //! Sends a STUN Binding Request to a public STUN server and parses the
 //! response to discover the NAT-mapped (server-reflexive) address.
-//! Only the bare minimum of RFC 5389 is implemented — no authentication,
-//! no FINGERPRINT, no long-term credentials. This covers the common case
-//! of discovering a mapped address for SIP/RTP NAT traversal.
+//!
+//! Also provides generic STUN message building/parsing used by the TURN
+//! client and ICE-Lite modules.
 
-use std::net::{SocketAddr, UdpSocket};
+use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::time::Duration;
 
 use crate::error::{Error, Result};
 
-// STUN message types (RFC 5389 §6).
-const BINDING_REQUEST: u16 = 0x0001;
-const BINDING_RESPONSE: u16 = 0x0101;
+// ─── STUN message types (RFC 5389 §6) ─────────────────────────────────
+
+pub const BINDING_REQUEST: u16 = 0x0001;
+pub const BINDING_RESPONSE: u16 = 0x0101;
+
+// TURN message types (RFC 5766).
+pub(crate) const ALLOCATE_REQUEST: u16 = 0x0003;
+pub(crate) const ALLOCATE_RESPONSE: u16 = 0x0103;
+pub(crate) const ALLOCATE_ERROR: u16 = 0x0113;
+pub(crate) const REFRESH_REQUEST: u16 = 0x0004;
+pub(crate) const REFRESH_RESPONSE: u16 = 0x0104;
+pub(crate) const CREATE_PERMISSION_REQUEST: u16 = 0x0008;
+pub(crate) const CREATE_PERMISSION_RESPONSE: u16 = 0x0108;
+pub(crate) const CHANNEL_BIND_REQUEST: u16 = 0x0009;
+pub(crate) const CHANNEL_BIND_RESPONSE: u16 = 0x0109;
 
 // Magic cookie (RFC 5389 §6).
-const MAGIC_COOKIE: u32 = 0x2112_A442;
+pub(crate) const MAGIC_COOKIE: u32 = 0x2112_A442;
 
 // STUN header size.
-const HEADER_SIZE: usize = 20;
+pub(crate) const HEADER_SIZE: usize = 20;
 
-// Attribute types.
-const ATTR_MAPPED_ADDRESS: u16 = 0x0001;
-const ATTR_XOR_MAPPED_ADDRESS: u16 = 0x0020;
+// ─── Attribute types (RFC 5389 + RFC 5766) ─────────────────────────────
+
+pub(crate) const ATTR_MAPPED_ADDRESS: u16 = 0x0001;
+pub const ATTR_USERNAME: u16 = 0x0006;
+pub(crate) const ATTR_MESSAGE_INTEGRITY: u16 = 0x0008;
+pub(crate) const ATTR_ERROR_CODE: u16 = 0x0009;
+pub(crate) const ATTR_CHANNEL_NUMBER: u16 = 0x000C;
+pub(crate) const ATTR_LIFETIME: u16 = 0x000D;
+pub(crate) const ATTR_XOR_PEER_ADDRESS: u16 = 0x0012;
+pub(crate) const ATTR_REALM: u16 = 0x0014;
+pub(crate) const ATTR_NONCE: u16 = 0x0015;
+pub(crate) const ATTR_XOR_RELAYED_ADDRESS: u16 = 0x0016;
+pub(crate) const ATTR_REQUESTED_TRANSPORT: u16 = 0x0019;
+pub(crate) const ATTR_XOR_MAPPED_ADDRESS: u16 = 0x0020;
+pub(crate) const ATTR_USE_CANDIDATE: u16 = 0x0025;
+#[cfg(test)]
+pub(crate) const ATTR_PRIORITY: u16 = 0x0024;
 
 // Address families.
-const FAMILY_IPV4: u8 = 0x01;
+pub(crate) const FAMILY_IPV4: u8 = 0x01;
 
 /// Default STUN server (Google's public STUN server).
 pub const DEFAULT_STUN_SERVER: &str = "stun.l.google.com:19302";
@@ -91,27 +117,207 @@ pub fn resolve_stun_server(server: &str) -> Result<SocketAddr> {
         .ok_or_else(|| Error::Other(format!("stun: no addresses for {}", server)))
 }
 
-// ─── Internal ────────────────────────────────────────────────────────────
+// ─── Shared STUN primitives ──────────────────────────────────────────────
 
-fn generate_txn_id() -> [u8; 12] {
+/// Generates a random 12-byte transaction ID.
+pub fn generate_txn_id() -> [u8; 12] {
     let mut id = [0u8; 12];
     getrandom::getrandom(&mut id).expect("getrandom failed");
     id
 }
 
-fn build_binding_request(txn_id: &[u8; 12]) -> Vec<u8> {
-    let mut buf = Vec::with_capacity(HEADER_SIZE);
+/// Returns `true` if `data` looks like a STUN message (first two bits `00`,
+/// magic cookie at bytes 4-7, length >= 20).
+pub fn is_stun_message(data: &[u8]) -> bool {
+    if data.len() < HEADER_SIZE {
+        return false;
+    }
+    // First two bits must be 0b00 (RFC 5764 §5.1.2).
+    if data[0] & 0xC0 != 0x00 {
+        return false;
+    }
+    let cookie = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
+    cookie == MAGIC_COOKIE
+}
 
-    // Message type: Binding Request
-    buf.extend_from_slice(&BINDING_REQUEST.to_be_bytes());
-    // Message length: 0 (no attributes)
-    buf.extend_from_slice(&0u16.to_be_bytes());
-    // Magic cookie
+/// A single STUN attribute (type + value).
+pub struct StunAttr {
+    pub attr_type: u16,
+    pub value: Vec<u8>,
+}
+
+/// Builds a STUN message with the given type, transaction ID, and attributes.
+/// Handles 4-byte padding per RFC 5389 §15.
+pub fn build_stun_message(msg_type: u16, txn_id: &[u8; 12], attrs: &[StunAttr]) -> Vec<u8> {
+    // Compute total attribute body length.
+    let body_len: usize = attrs.iter().map(|a| 4 + ((a.value.len() + 3) & !3)).sum();
+
+    let mut buf = Vec::with_capacity(HEADER_SIZE + body_len);
+    buf.extend_from_slice(&msg_type.to_be_bytes());
+    buf.extend_from_slice(&(body_len as u16).to_be_bytes());
     buf.extend_from_slice(&MAGIC_COOKIE.to_be_bytes());
-    // Transaction ID (12 bytes)
     buf.extend_from_slice(txn_id);
 
+    for attr in attrs {
+        buf.extend_from_slice(&attr.attr_type.to_be_bytes());
+        buf.extend_from_slice(&(attr.value.len() as u16).to_be_bytes());
+        buf.extend_from_slice(&attr.value);
+        // Pad to 4-byte boundary.
+        let pad = (4 - (attr.value.len() % 4)) % 4;
+        buf.extend(std::iter::repeat_n(0u8, pad));
+    }
     buf
+}
+
+/// Appends a MESSAGE-INTEGRITY attribute to a STUN message.
+///
+/// Per RFC 5389 §15.4, the message length in the header is adjusted to
+/// point to the end of the MESSAGE-INTEGRITY attribute before computing
+/// the HMAC-SHA1 over the entire message (including the adjusted header).
+pub fn append_message_integrity(msg: &mut Vec<u8>, key: &[u8]) {
+    use hmac::{Hmac, Mac};
+    use sha1::Sha1;
+
+    // MESSAGE-INTEGRITY adds 24 bytes (4-byte attr header + 20-byte HMAC).
+    let new_len = (msg.len() - HEADER_SIZE + 24) as u16;
+    msg[2..4].copy_from_slice(&new_len.to_be_bytes());
+
+    let mut mac = Hmac::<Sha1>::new_from_slice(key).expect("HMAC key length");
+    mac.update(msg);
+    let hmac_result = mac.finalize().into_bytes();
+
+    msg.extend_from_slice(&ATTR_MESSAGE_INTEGRITY.to_be_bytes());
+    msg.extend_from_slice(&20u16.to_be_bytes());
+    msg.extend_from_slice(&hmac_result);
+}
+
+/// Verifies a MESSAGE-INTEGRITY attribute in a STUN message.
+/// Returns true if the HMAC matches. `mi_offset` is the byte offset of the
+/// MESSAGE-INTEGRITY attribute within `msg`.
+pub(crate) fn verify_message_integrity(msg: &[u8], mi_offset: usize, key: &[u8]) -> bool {
+    use hmac::{Hmac, Mac};
+    use sha1::Sha1;
+
+    if mi_offset + 24 > msg.len() || mi_offset < HEADER_SIZE {
+        return false;
+    }
+
+    // The HMAC is over bytes [0..mi_offset] with the message length adjusted.
+    let mut buf = msg[..mi_offset].to_vec();
+    let new_len = (mi_offset - HEADER_SIZE + 24) as u16;
+    buf[2..4].copy_from_slice(&new_len.to_be_bytes());
+
+    let mut mac = Hmac::<Sha1>::new_from_slice(key).expect("HMAC key length");
+    mac.update(&buf);
+    let expected = mac.finalize().into_bytes();
+
+    // The actual HMAC value starts 4 bytes into the attribute (after type + length).
+    msg[mi_offset + 4..mi_offset + 24] == expected[..]
+}
+
+/// Parses STUN attributes from the body portion of a message.
+/// Returns `(attr_type, value_bytes)` pairs.
+pub(crate) fn parse_stun_attrs(data: &[u8]) -> Vec<(u16, Vec<u8>)> {
+    let mut result = Vec::new();
+    let mut offset = 0;
+    while offset + 4 <= data.len() {
+        let attr_type = u16::from_be_bytes([data[offset], data[offset + 1]]);
+        let attr_len = u16::from_be_bytes([data[offset + 2], data[offset + 3]]) as usize;
+        let attr_start = offset + 4;
+        if attr_start + attr_len > data.len() {
+            break;
+        }
+        result.push((attr_type, data[attr_start..attr_start + attr_len].to_vec()));
+        let padded_len = (attr_len + 3) & !3;
+        offset = attr_start + padded_len;
+    }
+    result
+}
+
+/// Decodes an XOR-encoded address (used by XOR-MAPPED-ADDRESS,
+/// XOR-RELAYED-ADDRESS, XOR-PEER-ADDRESS). IPv4 only.
+pub(crate) fn parse_xor_address(data: &[u8]) -> Result<SocketAddr> {
+    if data.len() < 8 {
+        return Err(Error::Other("stun: XOR address too short".into()));
+    }
+    let family = data[1];
+    if family != FAMILY_IPV4 {
+        return Err(Error::Other(format!(
+            "stun: unsupported address family: {}",
+            family
+        )));
+    }
+    let xor_port = u16::from_be_bytes([data[2], data[3]]);
+    let port = xor_port ^ (MAGIC_COOKIE >> 16) as u16;
+    let xor_ip = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
+    let ip = xor_ip ^ MAGIC_COOKIE;
+    Ok(SocketAddr::new(
+        std::net::IpAddr::V4(Ipv4Addr::from(ip)),
+        port,
+    ))
+}
+
+/// Encodes a `SocketAddr` as XOR-MAPPED-ADDRESS attribute value. IPv4 only.
+/// Returns an error for IPv6 addresses.
+pub(crate) fn encode_xor_address(addr: SocketAddr) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(8);
+    buf.push(0x00); // reserved
+    buf.push(FAMILY_IPV4);
+    let xor_port = addr.port() ^ (MAGIC_COOKIE >> 16) as u16;
+    buf.extend_from_slice(&xor_port.to_be_bytes());
+    match addr {
+        SocketAddr::V4(v4) => {
+            let xor_ip = u32::from(*v4.ip()) ^ MAGIC_COOKIE;
+            buf.extend_from_slice(&xor_ip.to_be_bytes());
+        }
+        SocketAddr::V6(_) => {
+            panic!("encode_xor_address: IPv6 not supported");
+        }
+    }
+    buf
+}
+
+/// Extracts the transaction ID from a STUN message. Returns `None` if too short.
+pub(crate) fn extract_txn_id(data: &[u8]) -> Option<[u8; 12]> {
+    if data.len() < HEADER_SIZE {
+        return None;
+    }
+    let mut id = [0u8; 12];
+    id.copy_from_slice(&data[8..20]);
+    Some(id)
+}
+
+/// Extracts the message type from a STUN message.
+pub fn extract_msg_type(data: &[u8]) -> Option<u16> {
+    if data.len() < 2 {
+        return None;
+    }
+    Some(u16::from_be_bytes([data[0], data[1]]))
+}
+
+/// Builds a STUN Binding Response with XOR-MAPPED-ADDRESS and MESSAGE-INTEGRITY.
+pub(crate) fn build_binding_response_integrity(
+    txn_id: &[u8; 12],
+    mapped_addr: SocketAddr,
+    key: &[u8],
+) -> Vec<u8> {
+    let xor_addr = encode_xor_address(mapped_addr);
+    let mut msg = build_stun_message(
+        BINDING_RESPONSE,
+        txn_id,
+        &[StunAttr {
+            attr_type: ATTR_XOR_MAPPED_ADDRESS,
+            value: xor_addr,
+        }],
+    );
+    append_message_integrity(&mut msg, key);
+    msg
+}
+
+// ─── Binding client (original API) ──────────────────────────────────────
+
+fn build_binding_request(txn_id: &[u8; 12]) -> Vec<u8> {
+    build_stun_message(BINDING_REQUEST, txn_id, &[])
 }
 
 fn parse_binding_response(data: &[u8], expected_txn_id: &[u8; 12]) -> Result<SocketAddr> {
@@ -160,57 +366,27 @@ fn parse_binding_response(data: &[u8], expected_txn_id: &[u8; 12]) -> Result<Soc
 
         match attr_type {
             ATTR_XOR_MAPPED_ADDRESS => {
-                // XOR-MAPPED-ADDRESS is preferred — return immediately.
-                return parse_xor_mapped_address(attr_data);
+                return parse_xor_address(attr_data);
             }
             ATTR_MAPPED_ADDRESS => {
-                // Fall back to MAPPED-ADDRESS if no XOR variant found.
                 if let Ok(addr) = parse_mapped_address(attr_data) {
                     mapped = Some(addr);
                 }
             }
             t if t < 0x8000 => {
-                // Unknown comprehension-required attribute (RFC 5389 §15).
                 return Err(Error::Other(format!(
                     "stun: unknown comprehension-required attribute: 0x{:04x}",
                     t
                 )));
             }
-            _ => {} // Skip comprehension-optional attributes.
+            _ => {}
         }
 
-        // Attributes are padded to 4-byte boundaries (RFC 5389 §15).
         let padded_len = (attr_len + 3) & !3;
         offset = attr_start + padded_len;
     }
 
     mapped.ok_or_else(|| Error::Other("stun: no mapped address in response".into()))
-}
-
-fn parse_xor_mapped_address(data: &[u8]) -> Result<SocketAddr> {
-    // Format: 1 byte reserved, 1 byte family, 2 bytes port, 4/16 bytes address
-    if data.len() < 8 {
-        return Err(Error::Other("stun: XOR-MAPPED-ADDRESS too short".into()));
-    }
-
-    let family = data[1];
-    if family != FAMILY_IPV4 {
-        return Err(Error::Other(format!(
-            "stun: unsupported address family: {}",
-            family
-        )));
-    }
-
-    // Port is XOR'd with top 16 bits of magic cookie.
-    let xor_port = u16::from_be_bytes([data[2], data[3]]);
-    let port = xor_port ^ (MAGIC_COOKIE >> 16) as u16;
-
-    // IPv4 address is XOR'd with the magic cookie.
-    let xor_ip = u32::from_be_bytes([data[4], data[5], data[6], data[7]]);
-    let ip = xor_ip ^ MAGIC_COOKIE;
-    let addr = std::net::Ipv4Addr::from(ip);
-
-    Ok(SocketAddr::new(std::net::IpAddr::V4(addr), port))
 }
 
 fn parse_mapped_address(data: &[u8]) -> Result<SocketAddr> {
@@ -227,7 +403,7 @@ fn parse_mapped_address(data: &[u8]) -> Result<SocketAddr> {
     }
 
     let port = u16::from_be_bytes([data[2], data[3]]);
-    let ip = std::net::Ipv4Addr::new(data[4], data[5], data[6], data[7]);
+    let ip = Ipv4Addr::new(data[4], data[5], data[6], data[7]);
 
     Ok(SocketAddr::new(std::net::IpAddr::V4(ip), port))
 }
@@ -256,7 +432,7 @@ mod tests {
     }
 
     #[test]
-    fn parse_xor_mapped_address_ipv4() {
+    fn parse_xor_address_ipv4() {
         // Build a synthetic Binding Response with XOR-MAPPED-ADDRESS.
         let txn_id = [0xAA; 12];
         let mapped_ip: u32 = u32::from(std::net::Ipv4Addr::new(203, 0, 113, 42));
@@ -351,7 +527,7 @@ mod tests {
 
     #[test]
     fn xor_mapped_address_too_short() {
-        let err = parse_xor_mapped_address(&[0u8; 4]).unwrap_err();
+        let err = parse_xor_address(&[0u8; 4]).unwrap_err();
         assert!(err.to_string().contains("too short"));
     }
 
@@ -462,7 +638,7 @@ mod tests {
     fn reject_ipv6_family() {
         // XOR-MAPPED-ADDRESS with IPv6 family (0x02) should be rejected.
         let data = [0x00, 0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
-        let err = parse_xor_mapped_address(&data).unwrap_err();
+        let err = parse_xor_address(&data).unwrap_err();
         assert!(err.to_string().contains("unsupported address family"));
 
         let err = parse_mapped_address(&data).unwrap_err();
@@ -551,5 +727,125 @@ mod tests {
         assert!(!addr.ip().is_unspecified());
         assert_ne!(addr.port(), 0);
         println!("STUN mapped address: {}", addr);
+    }
+
+    // --- Shared primitives tests ---
+
+    #[test]
+    fn is_stun_message_valid() {
+        let txn_id = [0xAA; 12];
+        let msg = build_binding_request(&txn_id);
+        assert!(is_stun_message(&msg));
+    }
+
+    #[test]
+    fn is_stun_message_rtp() {
+        // RTP packet (first byte 0x80 = version 2).
+        let mut rtp = vec![0x80, 0x00];
+        rtp.extend_from_slice(&[0u8; 18]);
+        assert!(!is_stun_message(&rtp));
+    }
+
+    #[test]
+    fn is_stun_message_too_short() {
+        assert!(!is_stun_message(&[0u8; 10]));
+    }
+
+    #[test]
+    fn build_stun_message_with_attrs() {
+        let txn_id = [0x11; 12];
+        let msg = build_stun_message(
+            BINDING_REQUEST,
+            &txn_id,
+            &[StunAttr {
+                attr_type: ATTR_LIFETIME,
+                value: 600u32.to_be_bytes().to_vec(),
+            }],
+        );
+        assert_eq!(msg.len(), HEADER_SIZE + 4 + 4); // header + attr_hdr + 4 bytes value
+        assert_eq!(u16::from_be_bytes([msg[0], msg[1]]), BINDING_REQUEST);
+        assert_eq!(
+            u32::from_be_bytes([msg[4], msg[5], msg[6], msg[7]]),
+            MAGIC_COOKIE
+        );
+    }
+
+    #[test]
+    fn parse_stun_attrs_round_trip() {
+        let txn_id = [0x22; 12];
+        let msg = build_stun_message(
+            BINDING_REQUEST,
+            &txn_id,
+            &[
+                StunAttr {
+                    attr_type: ATTR_LIFETIME,
+                    value: 600u32.to_be_bytes().to_vec(),
+                },
+                StunAttr {
+                    attr_type: ATTR_USERNAME,
+                    value: b"alice".to_vec(),
+                },
+            ],
+        );
+        let attrs = parse_stun_attrs(&msg[HEADER_SIZE..]);
+        assert_eq!(attrs.len(), 2);
+        assert_eq!(attrs[0].0, ATTR_LIFETIME);
+        assert_eq!(
+            u32::from_be_bytes([attrs[0].1[0], attrs[0].1[1], attrs[0].1[2], attrs[0].1[3]]),
+            600
+        );
+        assert_eq!(attrs[1].0, ATTR_USERNAME);
+        assert_eq!(attrs[1].1, b"alice");
+    }
+
+    #[test]
+    fn xor_address_round_trip() {
+        let addr: SocketAddr = "203.0.113.42:12345".parse().unwrap();
+        let encoded = encode_xor_address(addr);
+        let decoded = parse_xor_address(&encoded).unwrap();
+        assert_eq!(decoded, addr);
+    }
+
+    #[test]
+    fn message_integrity_verify() {
+        let txn_id = [0x33; 12];
+        let key = b"test-key";
+        let mut msg = build_stun_message(
+            BINDING_REQUEST,
+            &txn_id,
+            &[StunAttr {
+                attr_type: ATTR_USERNAME,
+                value: b"user".to_vec(),
+            }],
+        );
+        let mi_offset = msg.len();
+        append_message_integrity(&mut msg, key);
+        assert!(verify_message_integrity(&msg, mi_offset, key));
+        assert!(!verify_message_integrity(&msg, mi_offset, b"wrong-key"));
+    }
+
+    #[test]
+    fn binding_response_has_xor_mapped() {
+        let txn_id = [0x44; 12];
+        let addr: SocketAddr = "10.20.30.40:5060".parse().unwrap();
+        let resp = build_binding_response_integrity(&txn_id, addr, b"test-key");
+        assert!(is_stun_message(&resp));
+        let parsed = parse_binding_response(&resp, &txn_id).unwrap();
+        assert_eq!(parsed, addr);
+    }
+
+    #[test]
+    fn extract_txn_id_and_msg_type() {
+        let txn_id = [0x55; 12];
+        let msg = build_binding_request(&txn_id);
+        assert_eq!(extract_txn_id(&msg).unwrap(), txn_id);
+        assert_eq!(extract_msg_type(&msg).unwrap(), BINDING_REQUEST);
+    }
+
+    #[test]
+    #[should_panic(expected = "IPv6 not supported")]
+    fn encode_xor_address_rejects_ipv6() {
+        let addr: SocketAddr = "[::1]:5060".parse().unwrap();
+        encode_xor_address(addr);
     }
 }

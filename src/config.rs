@@ -71,6 +71,16 @@ pub struct Config {
     /// When set, the phone subscribes to `message-summary` events after registration.
     /// Example: `"sip:*97@pbx.local"` or left empty to default to user's AOR.
     pub voicemail_uri: Option<String>,
+    /// TURN server address (e.g. `"turn.example.com:3478"`).
+    /// When set, a TURN relay is allocated for media NAT traversal.
+    pub turn_server: Option<String>,
+    /// TURN username for long-term credentials.
+    pub turn_username: Option<String>,
+    /// TURN password for long-term credentials.
+    pub turn_password: Option<String>,
+    /// Enable ICE-Lite candidate gathering and STUN responder.
+    /// Requires `stun_server` and/or `turn_server` to produce useful candidates.
+    pub ice: bool,
 }
 
 impl Default for Config {
@@ -98,6 +108,10 @@ impl Default for Config {
             stun_server: None,
             dtmf_mode: DtmfMode::Rfc4733,
             voicemail_uri: None,
+            turn_server: None,
+            turn_username: None,
+            turn_password: None,
+            ice: false,
         }
     }
 }
@@ -217,6 +231,25 @@ impl PhoneBuilder {
     /// Sets the voicemail server URI for MWI SUBSCRIBE (RFC 3842).
     pub fn voicemail_uri(mut self, uri: &str) -> Self {
         self.config.voicemail_uri = Some(uri.into());
+        self
+    }
+
+    /// Sets the TURN server for NAT relay allocation.
+    pub fn turn_server(mut self, server: &str) -> Self {
+        self.config.turn_server = Some(server.into());
+        self
+    }
+
+    /// Sets TURN long-term credentials.
+    pub fn turn_credentials(mut self, username: &str, password: &str) -> Self {
+        self.config.turn_username = Some(username.into());
+        self.config.turn_password = Some(password.into());
+        self
+    }
+
+    /// Enables ICE-Lite candidate gathering and STUN responder.
+    pub fn ice(mut self, enabled: bool) -> Self {
+        self.config.ice = enabled;
         self
     }
 

@@ -3,8 +3,10 @@
 #        cargo test --features integration
 #        docker compose down
 #
-# Provides Asterisk with three static SIP extensions (1001, 1002, 1003)
-# for testing registration, calling, transfer, and media flows.
+# Provides:
+#   - Asterisk with three static SIP extensions (1001, 1002, 1003)
+#     for testing registration, calling, transfer, and media flows.
+#   - CoTURN TURN/STUN server for NAT traversal testing.
 
 services:
   asterisk:
@@ -42,6 +44,24 @@ services:
       timeout: 5s
       retries: 10
       start_period: 10s
+    networks:
+      - xphone-test
+
+  coturn:
+    image: coturn/coturn:latest
+    container_name: xphone-coturn
+    ports:
+      - "3478:3478/udp"
+      - "3478:3478/tcp"
+      - "49152-49199:49152-49199/udp"
+    volumes:
+      - ./coturn/turnserver.conf:/etc/coturn/turnserver.conf:ro
+    healthcheck:
+      test: ["CMD", "turnadmin", "-l"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 3s
     networks:
       - xphone-test
 
