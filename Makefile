@@ -1,4 +1,4 @@
-.PHONY: fmt clippy build test test-integration test-docker test-all docker-up docker-down lint sipcli check
+.PHONY: fmt clippy build test test-g729 test-integration test-docker test-all docker-up docker-down lint sipcli check
 
 fmt:
 	cargo fmt
@@ -11,6 +11,9 @@ build:
 
 test:
 	cargo test
+
+test-g729:
+	cargo test --features g729-codec -- g729
 
 test-integration:
 	cargo test --features integration --test integration_test -- --nocapture --test-threads=1

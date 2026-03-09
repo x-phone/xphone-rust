@@ -102,6 +102,12 @@ dependencies = [
 ]
 
 [[package]]
+name = "anyhow"
+version = "1.0.102"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
+
+[[package]]
 name = "audiopus_sys"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -605,6 +611,15 @@ dependencies = [
  "futures-task",
  "pin-project-lite",
  "slab",
+]
+
+[[package]]
+name = "g729-sys"
+version = "0.1.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7c0115766e9b2dcbc585946d207299fe2fce9bf0b8d4ba0d3592c6e0f66fe116"
+dependencies = [
+ "anyhow",
 ]
 
 [[package]]
@@ -2056,6 +2071,7 @@ dependencies = [
  "crossterm",
  "dirs-next",
  "fakepbx",
+ "g729-sys",
  "getrandom 0.2.17",
  "hmac",
  "md5",

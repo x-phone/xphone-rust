@@ -99,6 +99,7 @@ fn codec_name(pt: i32) -> Option<&'static str> {
         0 => Some("PCMU/8000"),
         8 => Some("PCMA/8000"),
         9 => Some("G722/8000"),
+        18 => Some("G729/8000"),
         101 => Some("telephone-event/8000"),
         111 => Some("opus/48000/2"),
         _ => None,
@@ -107,6 +108,7 @@ fn codec_name(pt: i32) -> Option<&'static str> {
 
 fn codec_fmtp(pt: i32) -> Option<&'static str> {
     match pt {
+        18 => Some("annexb=no"),
         101 => Some("0-16"),
         111 => Some("minptime=20;useinbandfec=0"),
         _ => None,
