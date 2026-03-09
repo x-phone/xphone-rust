@@ -7,12 +7,17 @@ use tracing::{debug, info, warn};
 use crate::call::{self, Call};
 use crate::config::{Config, DialOptions};
 use crate::dialog::Dialog;
+use crate::dialog_info::parse_dialog_info;
 use crate::error::{Error, Result};
 use crate::mock::dialog::MockDialog;
 use crate::mwi::MwiSubscriber;
 use crate::registry::Registry;
+use crate::subscription::{SubId, SubscriptionManager};
 use crate::transport::SipTransport;
-use crate::types::{CallState, Direction, EndReason, PhoneState, SipMessage, VoicemailStatus};
+use crate::types::{
+    CallState, Direction, EndReason, ExtensionState, ExtensionStatus, NotifyEvent, PhoneState,
+    SipMessage, VoicemailStatus,
+};
 
 type CallStateCb = Arc<dyn Fn(Arc<Call>, crate::types::CallState) + Send + Sync>;
 type CallEndedCb = Arc<dyn Fn(Arc<Call>, crate::types::EndReason) + Send + Sync>;
@@ -31,6 +36,7 @@ struct Inner {
     on_error_fn: Option<Arc<dyn Fn(Error) + Send + Sync>>,
     on_voicemail_fn: Option<Arc<dyn Fn(VoicemailStatus) + Send + Sync>>,
     on_message_fn: Option<Arc<dyn Fn(SipMessage) + Send + Sync>>,
+    on_subscription_error_fn: Option<Arc<dyn Fn(String, Error) + Send + Sync>>,
 
     // Phone-level call callbacks — auto-wired to every new call.
     on_call_state_fn: Option<CallStateCb>,
@@ -39,6 +45,11 @@ struct Inner {
 
     /// DTMF mode from config, applied to every new call.
     dtmf_mode: crate::config::DtmfMode,
+
+    /// Subscription manager for BLF and generic event subscriptions.
+    subscription_mgr: Option<Arc<SubscriptionManager>>,
+    /// BLF watchers: extension -> (SubId, last known state).
+    blf_watchers: HashMap<String, (SubId, ExtensionState)>,
 }
 
 /// Phone orchestrates SIP registration, call tracking, and incoming/outgoing calls.
@@ -66,10 +77,13 @@ impl Phone {
                 on_error_fn: None,
                 on_voicemail_fn: None,
                 on_message_fn: None,
+                on_subscription_error_fn: None,
                 on_call_state_fn: None,
                 on_call_ended_fn: None,
                 on_call_dtmf_fn: None,
                 dtmf_mode,
+                subscription_mgr: None,
+                blf_watchers: HashMap::new(),
             })),
         }
     }
@@ -172,6 +186,18 @@ impl Phone {
             handle_message(&inner_clone, &from, &content_type, &body);
         }));
 
+        // Create subscription manager and wire NOTIFY handler.
+        let sub_mgr = Arc::new(SubscriptionManager::new(Arc::clone(&tr)));
+        let sub_mgr_clone = Arc::clone(&sub_mgr);
+        tr.on_subscription_notify(Box::new(move |event, ct, body, sub_state, from_uri| {
+            sub_mgr_clone.handle_notify(event, ct, body, sub_state, from_uri);
+        }));
+        // Apply buffered on_subscription_error callback.
+        if let Some(ref f) = self.inner.lock().on_subscription_error_fn {
+            let f = Arc::clone(f);
+            sub_mgr.on_error(move |uri, err| f(uri, err));
+        }
+
         // Start MWI subscriber if voicemail URI is configured and registration succeeded.
         let mwi = if reg_result.is_ok() {
             if let Some(ref vm_uri) = self.cfg.voicemail_uri {
@@ -194,6 +220,7 @@ impl Phone {
         inner.tr = Some(tr);
         inner.reg = Some(reg);
         inner.mwi = mwi;
+        inner.subscription_mgr = Some(sub_mgr);
         if reg_result.is_ok() {
             inner.state = PhoneState::Registered;
         } else {
@@ -204,7 +231,7 @@ impl Phone {
     /// Disconnects the phone: ends all active calls, stops registry, and closes transport.
     pub fn disconnect(&self) -> Result<()> {
         info!("Phone disconnecting");
-        let (reg, tr, unreg_fn, active_calls, mwi) = {
+        let (reg, tr, unreg_fn, active_calls, mwi, sub_mgr) = {
             let mut inner = self.inner.lock();
             if inner.state == PhoneState::Disconnected {
                 return Err(Error::NotConnected);
@@ -214,8 +241,10 @@ impl Phone {
             let unreg_fn = inner.on_unregistered_fn.clone();
             let active_calls: Vec<Arc<Call>> = inner.calls.drain().map(|(_, c)| c).collect();
             let mwi = inner.mwi.take();
+            let sub_mgr = inner.subscription_mgr.take();
+            inner.blf_watchers.clear();
             inner.state = PhoneState::Disconnected;
-            (reg, tr, unreg_fn, active_calls, mwi)
+            (reg, tr, unreg_fn, active_calls, mwi, sub_mgr)
         };
 
         // End all active calls so their resources (media, sockets, SRTP) are released.
@@ -223,6 +252,9 @@ impl Phone {
             let _ = call.end();
         }
 
+        if let Some(sub_mgr) = sub_mgr {
+            sub_mgr.stop();
+        }
         if let Some(mwi) = mwi {
             mwi.stop();
         }
@@ -466,6 +498,136 @@ impl Phone {
             body.as_bytes(),
             std::time::Duration::from_secs(10),
         )
+    }
+
+    /// Returns the subscription manager, or `NotConnected` if not connected.
+    fn get_sub_mgr(&self) -> Result<Arc<SubscriptionManager>> {
+        let inner = self.inner.lock();
+        inner
+            .subscription_mgr
+            .as_ref()
+            .ok_or(Error::NotConnected)
+            .cloned()
+    }
+
+    /// Watch an extension's state via BLF (dialog event package, RFC 4235).
+    ///
+    /// The callback fires with the new `ExtensionStatus` and the previous state
+    /// (`None` on the first update). Duplicate states are suppressed.
+    pub fn watch<F>(&self, extension: &str, f: F) -> Result<()>
+    where
+        F: Fn(ExtensionStatus, Option<ExtensionState>) + Send + Sync + 'static,
+    {
+        if self.inner.lock().state != PhoneState::Registered {
+            return Err(Error::NotRegistered);
+        }
+        let sub_mgr = self.get_sub_mgr()?;
+
+        let uri = format!("sip:{}@{}", extension, self.cfg.host);
+        let ext = extension.to_string();
+        let phone_inner = Arc::clone(&self.inner);
+        let f = Arc::new(f);
+
+        let sub_id = sub_mgr.subscribe(
+            &uri,
+            "dialog",
+            "application/dialog-info+xml",
+            Arc::new(move |notify: NotifyEvent| {
+                let new_state = if notify.body.is_empty() {
+                    ExtensionState::Unknown
+                } else {
+                    parse_dialog_info(&notify.body)
+                };
+
+                // Duplicate suppression + track previous state.
+                // Only update the ExtensionState; preserve the SubId.
+                let (prev, should_fire) = {
+                    let mut inner = phone_inner.lock();
+                    if let Some((_sub_id, last)) = inner.blf_watchers.get_mut(&ext) {
+                        if *last == new_state {
+                            return; // No change — suppress.
+                        }
+                        let prev = Some(*last);
+                        *last = new_state; // Only update state; SubId is preserved.
+                        (prev, true)
+                    } else {
+                        // First NOTIFY before post-subscribe storage — use 0 as placeholder.
+                        inner.blf_watchers.insert(ext.clone(), (0, new_state));
+                        (None, true)
+                    }
+                };
+
+                if should_fire {
+                    let status = ExtensionStatus {
+                        extension: ext.clone(),
+                        state: new_state,
+                    };
+                    f(status, prev);
+                }
+            }),
+        );
+
+        // Store the SubId for unwatch.
+        self.inner
+            .lock()
+            .blf_watchers
+            .entry(extension.to_string())
+            .and_modify(|(id, _)| *id = sub_id)
+            .or_insert((sub_id, ExtensionState::Unknown));
+
+        Ok(())
+    }
+
+    /// Stop watching an extension.
+    pub fn unwatch(&self, extension: &str) -> Result<()> {
+        let sub_mgr = self.get_sub_mgr()?;
+        let sub_id = {
+            let inner = self.inner.lock();
+            let (sub_id, _) = inner
+                .blf_watchers
+                .get(extension)
+                .ok_or_else(|| Error::Other(format!("not watching {}", extension)))?;
+            *sub_id
+        };
+
+        sub_mgr.unsubscribe(sub_id);
+        self.inner.lock().blf_watchers.remove(extension);
+        Ok(())
+    }
+
+    /// Subscribe to a generic event package (power user API).
+    /// Returns a subscription ID for later unsubscribe.
+    pub fn subscribe_event<F>(&self, uri: &str, event: &str, accept: &str, f: F) -> Result<SubId>
+    where
+        F: Fn(NotifyEvent) + Send + Sync + 'static,
+    {
+        if self.inner.lock().state != PhoneState::Registered {
+            return Err(Error::NotRegistered);
+        }
+        let sub_mgr = self.get_sub_mgr()?;
+        Ok(sub_mgr.subscribe(uri, event, accept, Arc::new(f)))
+    }
+
+    /// Unsubscribe from a previously subscribed event.
+    pub fn unsubscribe_event(&self, sub_id: SubId) -> Result<()> {
+        let sub_mgr = self.get_sub_mgr()?;
+        sub_mgr.unsubscribe(sub_id);
+        Ok(())
+    }
+
+    /// Register a callback for subscription errors (permanent failures).
+    pub fn on_subscription_error<F>(&self, f: F)
+    where
+        F: Fn(String, Error) + Send + Sync + 'static,
+    {
+        let mut inner = self.inner.lock();
+        let f: Arc<dyn Fn(String, Error) + Send + Sync> = Arc::new(f);
+        inner.on_subscription_error_fn = Some(Arc::clone(&f));
+        // If subscription manager already exists, wire it.
+        if let Some(ref mgr) = inner.subscription_mgr {
+            let f = Arc::clone(&f);
+            mgr.on_error(move |uri, err| f(uri, err));
+        }
     }
 
     /// Returns the current phone state.
@@ -1707,6 +1869,146 @@ mod tests {
         assert_eq!(msg.from, "sip:1001@pbx.local");
         assert_eq!(msg.body, "Hi there");
         assert_eq!(msg.content_type, "text/plain");
+
+        phone.disconnect().unwrap();
+    }
+
+    #[test]
+    fn watch_before_connect_errors() {
+        let phone = Phone::new(test_cfg());
+        let result = phone.watch("1001", |_, _| {});
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn watch_fires_callback_on_notify() {
+        let tr = Arc::new(MockTransport::new());
+        tr.respond_with(200, "OK"); // REGISTER
+        tr.respond_with(200, "OK"); // SUBSCRIBE
+
+        let phone = Phone::new(test_cfg());
+        phone.connect_with_transport(Arc::clone(&tr) as Arc<dyn SipTransport>);
+
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        phone
+            .watch("1002", move |status, prev| {
+                let _ = tx.send((status, prev));
+            })
+            .unwrap();
+
+        // Simulate a dialog-info NOTIFY with confirmed state.
+        std::thread::sleep(Duration::from_millis(300));
+        tr.simulate_subscription_notify(
+            "dialog",
+            "application/dialog-info+xml",
+            r#"<?xml version="1.0"?>
+<dialog-info xmlns="urn:ietf:params:xml:ns:dialog-info"
+             version="1" state="full" entity="sip:1002@test">
+  <dialog id="d1"><state>confirmed</state></dialog>
+</dialog-info>"#,
+            "active;expires=600",
+            "sip:1002@test",
+        );
+
+        let (status, prev) = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(status.extension, "1002");
+        assert_eq!(status.state, ExtensionState::OnThePhone);
+        assert!(prev.is_none() || prev == Some(ExtensionState::Unknown));
+
+        phone.disconnect().unwrap();
+    }
+
+    #[test]
+    fn watch_duplicate_suppression() {
+        let tr = Arc::new(MockTransport::new());
+        tr.respond_with(200, "OK"); // REGISTER
+        tr.respond_with(200, "OK"); // SUBSCRIBE
+
+        let phone = Phone::new(test_cfg());
+        phone.connect_with_transport(Arc::clone(&tr) as Arc<dyn SipTransport>);
+
+        let (tx, rx) = crossbeam_channel::bounded(10);
+        phone
+            .watch("1002", move |status, _| {
+                let _ = tx.send(status.state);
+            })
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+
+        let confirmed_xml = r#"<?xml version="1.0"?>
+<dialog-info xmlns="urn:ietf:params:xml:ns:dialog-info"
+             version="1" state="full" entity="sip:1002@test">
+  <dialog id="d1"><state>confirmed</state></dialog>
+</dialog-info>"#;
+
+        // Send same state twice.
+        tr.simulate_subscription_notify(
+            "dialog",
+            "application/dialog-info+xml",
+            confirmed_xml,
+            "active;expires=600",
+            "sip:1002@test",
+        );
+        std::thread::sleep(Duration::from_millis(100));
+        tr.simulate_subscription_notify(
+            "dialog",
+            "application/dialog-info+xml",
+            confirmed_xml,
+            "active;expires=600",
+            "sip:1002@test",
+        );
+        std::thread::sleep(Duration::from_millis(100));
+
+        // Should only get one callback (duplicate suppressed).
+        let _first = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        let second = rx.recv_timeout(Duration::from_millis(500));
+        assert!(second.is_err(), "duplicate should be suppressed");
+
+        phone.disconnect().unwrap();
+    }
+
+    #[test]
+    fn unwatch_removes_subscription() {
+        let tr = Arc::new(MockTransport::new());
+        tr.respond_with(200, "OK"); // REGISTER
+        tr.respond_with(200, "OK"); // SUBSCRIBE
+        tr.respond_with(200, "OK"); // unsubscribe
+
+        let phone = Phone::new(test_cfg());
+        phone.connect_with_transport(Arc::clone(&tr) as Arc<dyn SipTransport>);
+        phone.watch("1002", |_, _| {}).unwrap();
+        std::thread::sleep(Duration::from_millis(300));
+
+        phone.unwatch("1002").unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+
+        // Should have sent at least 2 SUBSCRIBEs (initial + unsubscribe).
+        assert!(tr.count_sent("SUBSCRIBE") >= 2);
+
+        phone.disconnect().unwrap();
+    }
+
+    #[test]
+    fn subscribe_event_returns_id() {
+        let tr = Arc::new(MockTransport::new());
+        tr.respond_with(200, "OK"); // REGISTER
+        tr.respond_with(200, "OK"); // SUBSCRIBE
+
+        let phone = Phone::new(test_cfg());
+        phone.connect_with_transport(Arc::clone(&tr) as Arc<dyn SipTransport>);
+
+        let id = phone
+            .subscribe_event(
+                "sip:1002@test",
+                "dialog",
+                "application/dialog-info+xml",
+                |_| {},
+            )
+            .unwrap();
+        assert!(id > 0);
+        std::thread::sleep(Duration::from_millis(200));
+
+        phone.unsubscribe_event(id).unwrap();
 
         phone.disconnect().unwrap();
     }
