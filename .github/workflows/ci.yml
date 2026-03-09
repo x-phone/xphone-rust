@@ -28,6 +28,8 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
       - name: Clippy (opus-codec feature)
         run: cargo clippy --features opus-codec --all-targets -- -D warnings
+      - name: Clippy (g729-codec feature)
+        run: cargo clippy --features g729-codec --all-targets -- -D warnings
       - name: Clippy (cli feature)
         run: cargo clippy --example sipcli --features cli -- -D warnings
 
@@ -44,6 +46,8 @@ jobs:
         run: cargo test --verbose
       - name: Test (opus-codec feature)
         run: cargo test --features opus-codec --verbose
+      - name: Test (g729-codec feature)
+        run: cargo test --features g729-codec --verbose
       - name: Test (release)
         run: cargo test --release
 
@@ -86,5 +90,7 @@ jobs:
       - name: Build library (opus-codec)
         if: runner.os == 'Linux'
         run: cargo build --features opus-codec
+      - name: Build library (g729-codec)
+        run: cargo build --features g729-codec
       - name: Build sipcli
         run: cargo build --example sipcli --features cli --release

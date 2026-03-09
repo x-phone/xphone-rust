@@ -222,6 +222,8 @@ pub enum Codec {
     PCMA = 8,
     /// G.722 (payload type 9).
     G722 = 9,
+    /// G.729 (payload type 18).
+    G729 = 18,
     /// Opus (payload type 111).
     Opus = 111,
 }
@@ -238,6 +240,7 @@ impl Codec {
             0 => Some(Codec::PCMU),
             8 => Some(Codec::PCMA),
             9 => Some(Codec::G722),
+            18 => Some(Codec::G729),
             111 => Some(Codec::Opus),
             _ => None,
         }
@@ -250,6 +253,7 @@ impl fmt::Display for Codec {
             Codec::PCMU => write!(f, "PCMU"),
             Codec::PCMA => write!(f, "PCMA"),
             Codec::G722 => write!(f, "G722"),
+            Codec::G729 => write!(f, "G729"),
             Codec::Opus => write!(f, "Opus"),
         }
     }
@@ -290,6 +294,7 @@ mod tests {
         assert_eq!(Codec::PCMU.payload_type(), 0);
         assert_eq!(Codec::PCMA.payload_type(), 8);
         assert_eq!(Codec::G722.payload_type(), 9);
+        assert_eq!(Codec::G729.payload_type(), 18);
         assert_eq!(Codec::Opus.payload_type(), 111);
     }
 
@@ -298,6 +303,7 @@ mod tests {
         assert_eq!(Codec::from_payload_type(0), Some(Codec::PCMU));
         assert_eq!(Codec::from_payload_type(8), Some(Codec::PCMA));
         assert_eq!(Codec::from_payload_type(9), Some(Codec::G722));
+        assert_eq!(Codec::from_payload_type(18), Some(Codec::G729));
         assert_eq!(Codec::from_payload_type(111), Some(Codec::Opus));
         assert_eq!(Codec::from_payload_type(99), None);
     }
@@ -306,6 +312,7 @@ mod tests {
     fn codec_display() {
         assert_eq!(Codec::PCMU.to_string(), "PCMU");
         assert_eq!(Codec::G722.to_string(), "G722");
+        assert_eq!(Codec::G729.to_string(), "G729");
     }
 
     #[test]
