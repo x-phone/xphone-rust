@@ -52,6 +52,8 @@ struct Inner {
         Option<Arc<dyn Fn(Arc<dyn crate::dialog::Dialog>, String, String, String) + Send + Sync>>,
     info_dtmf_handler: Option<Arc<dyn Fn(String, String) + Send + Sync>>,
     mwi_notify_handler: Option<Arc<dyn Fn(String) + Send + Sync>>,
+    #[allow(clippy::type_complexity)]
+    message_handler: Option<Arc<dyn Fn(String, String, String) + Send + Sync>>,
     response_watchers: HashMap<u16, Vec<Sender<bool>>>,
 }
 
@@ -83,6 +85,7 @@ impl MockTransport {
                 dialog_invite_handler: None,
                 info_dtmf_handler: None,
                 mwi_notify_handler: None,
+                message_handler: None,
                 response_watchers: HashMap::new(),
             }),
             response_ready_tx: tx,
@@ -163,6 +166,14 @@ impl MockTransport {
         let handler = self.inner.lock().mwi_notify_handler.clone();
         if let Some(h) = handler {
             h(body.into());
+        }
+    }
+
+    /// Simulates an incoming SIP MESSAGE.
+    pub fn simulate_message(&self, from: &str, content_type: &str, body: &str) {
+        let handler = self.inner.lock().message_handler.clone();
+        if let Some(h) = handler {
+            h(from.into(), content_type.into(), body.into());
         }
     }
 
@@ -363,6 +374,38 @@ impl SipTransport for MockTransport {
         self.inner.lock().mwi_notify_handler = Some(Arc::from(f));
     }
 
+    fn send_message(
+        &self,
+        _target: &str,
+        _content_type: &str,
+        _body: &[u8],
+        timeout: Duration,
+    ) -> Result<()> {
+        {
+            let mut inner = self.inner.lock();
+            inner.sent.push(SentMessage {
+                method: "MESSAGE".into(),
+                headers: None,
+            });
+
+            if inner.fail_remain > 0 {
+                inner.fail_remain -= 1;
+                return Err(Error::Other("transport error".into()));
+            }
+        }
+
+        let (code, _reason) = self.await_response(timeout)?;
+        if (200..300).contains(&code) {
+            Ok(())
+        } else {
+            Err(Error::Other(format!("MESSAGE rejected: {}", code)))
+        }
+    }
+
+    fn on_message(&self, f: Box<dyn Fn(String, String, String) + Send + Sync>) {
+        self.inner.lock().message_handler = Some(Arc::from(f));
+    }
+
     fn dial(
         &self,
         _target: &str,
@@ -494,5 +537,44 @@ mod tests {
         tr.send_keepalive().unwrap();
         tr.send_keepalive().unwrap();
         assert_eq!(tr.count_keepalives(), 2);
+    }
+
+    #[test]
+    fn simulate_message_fires_handler() {
+        let tr = Arc::new(MockTransport::new());
+        let received = Arc::new(Mutex::new(String::new()));
+        let received_clone = Arc::clone(&received);
+        tr.on_message(Box::new(move |_from, _ct, body| {
+            *received_clone.lock() = body;
+        }));
+        tr.simulate_message("sip:1001@pbx.local", "text/plain", "Hello!");
+        assert_eq!(*received.lock(), "Hello!");
+    }
+
+    #[test]
+    fn send_message_records_sent() {
+        let tr = MockTransport::new();
+        tr.respond_with(200, "OK");
+        let result = tr.send_message(
+            "sip:1002@pbx.local",
+            "text/plain",
+            b"Hi",
+            Duration::from_secs(1),
+        );
+        assert!(result.is_ok());
+        assert_eq!(tr.count_sent("MESSAGE"), 1);
+    }
+
+    #[test]
+    fn send_message_rejected() {
+        let tr = MockTransport::new();
+        tr.respond_with(403, "Forbidden");
+        let result = tr.send_message(
+            "sip:1002@pbx.local",
+            "text/plain",
+            b"Hi",
+            Duration::from_secs(1),
+        );
+        assert!(result.is_err());
     }
 }

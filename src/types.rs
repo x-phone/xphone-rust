@@ -213,6 +213,25 @@ impl fmt::Display for VoicemailStatus {
     }
 }
 
+/// An instant message received or sent via SIP MESSAGE (RFC 3428).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SipMessage {
+    /// SIP URI of the sender (from the From header).
+    pub from: String,
+    /// SIP URI of the recipient (from the To header).
+    pub to: String,
+    /// MIME content type (e.g. "text/plain").
+    pub content_type: String,
+    /// The message body.
+    pub body: String,
+}
+
+impl fmt::Display for SipMessage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "MESSAGE from={} body={}", self.from, self.body)
+    }
+}
+
 /// Audio codec identified by RTP payload type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Codec {
@@ -364,6 +383,27 @@ mod tests {
         assert_eq!(parsed.header.payload_type, 8);
         assert!(!parsed.header.marker);
         assert!(parsed.payload.is_empty());
+    }
+
+    #[test]
+    fn sip_message_default() {
+        let msg = SipMessage::default();
+        assert!(msg.from.is_empty());
+        assert!(msg.body.is_empty());
+        assert!(msg.content_type.is_empty());
+    }
+
+    #[test]
+    fn sip_message_display() {
+        let msg = SipMessage {
+            from: "sip:1001@pbx.local".into(),
+            to: String::new(),
+            content_type: "text/plain".into(),
+            body: "Hello".into(),
+        };
+        let s = msg.to_string();
+        assert!(s.contains("1001@pbx.local"));
+        assert!(s.contains("Hello"));
     }
 
     #[test]
