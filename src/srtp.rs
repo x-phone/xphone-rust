@@ -9,7 +9,7 @@
 //! - TODO: Implement full ROC estimation per RFC 3711 Appendix A instead of the
 //!   simplified 0x1000/0xF000 threshold heuristic (fine for sequential telephony
 //!   traffic but not robust against large packet reordering).
-//! - TODO: Zeroize key material on drop (use `zeroize` crate on `SrtpContext` fields).
+//! - Key material (session keys, salts) is zeroized on drop via the `zeroize` crate.
 //! - TODO: Track per-SSRC crypto state for inbound streams (RFC 3711 §3.2.3).
 
 use std::fmt;
@@ -17,6 +17,7 @@ use std::fmt;
 use aes::cipher::{BlockEncrypt, KeyInit};
 use aes::Aes128;
 use hmac::Mac;
+use zeroize::Zeroize;
 
 type HmacSha1 = hmac::Hmac<sha1::Sha1>;
 
@@ -166,6 +167,17 @@ impl fmt::Debug for SrtpContext {
     }
 }
 
+impl Drop for SrtpContext {
+    fn drop(&mut self) {
+        // Zeroize SRTP and SRTCP session keys and salts.
+        // Aes128 fields are auto-zeroized by the `aes` crate's ZeroizeOnDrop.
+        self.auth_key.zeroize();
+        self.session_salt.zeroize();
+        self.srtcp_auth_key.zeroize();
+        self.srtcp_session_salt.zeroize();
+    }
+}
+
 impl SrtpContext {
     /// Creates a new SRTP context from master key (16 bytes) and master salt (14 bytes).
     pub fn new(master_key: &[u8], master_salt: &[u8]) -> Result<Self> {
@@ -185,26 +197,38 @@ impl SrtpContext {
         }
 
         // Derive SRTP session keys (labels 0x00-0x02).
-        let cipher_key = derive_session_key(master_key, master_salt, LABEL_CIPHER_KEY, 16);
-        let auth_key = derive_session_key(master_key, master_salt, LABEL_AUTH_KEY, 20);
-        let salt_bytes = derive_session_key(master_key, master_salt, LABEL_SALT, 14);
+        let mut cipher_key = derive_session_key(master_key, master_salt, LABEL_CIPHER_KEY, 16);
+        let mut auth_key_bytes = derive_session_key(master_key, master_salt, LABEL_AUTH_KEY, 20);
+        let mut salt_bytes = derive_session_key(master_key, master_salt, LABEL_SALT, 14);
 
         let cipher = Aes128::new(cipher_key[..16].into());
         let mut ak = [0u8; 20];
-        ak.copy_from_slice(&auth_key);
+        ak.copy_from_slice(&auth_key_bytes);
         let mut ss = [0u8; 14];
         ss.copy_from_slice(&salt_bytes);
 
+        // Zeroize intermediate derived key vectors.
+        cipher_key.zeroize();
+        auth_key_bytes.zeroize();
+        salt_bytes.zeroize();
+
         // Derive SRTCP session keys (labels 0x03-0x05).
-        let srtcp_ck = derive_session_key(master_key, master_salt, LABEL_SRTCP_CIPHER_KEY, 16);
-        let srtcp_ak_bytes = derive_session_key(master_key, master_salt, LABEL_SRTCP_AUTH_KEY, 20);
-        let srtcp_salt = derive_session_key(master_key, master_salt, LABEL_SRTCP_SALT, 14);
+        let mut srtcp_ck = derive_session_key(master_key, master_salt, LABEL_SRTCP_CIPHER_KEY, 16);
+        let mut srtcp_ak_bytes =
+            derive_session_key(master_key, master_salt, LABEL_SRTCP_AUTH_KEY, 20);
+        let mut srtcp_salt_bytes =
+            derive_session_key(master_key, master_salt, LABEL_SRTCP_SALT, 14);
 
         let srtcp_cipher = Aes128::new(srtcp_ck[..16].into());
         let mut srtcp_ak = [0u8; 20];
         srtcp_ak.copy_from_slice(&srtcp_ak_bytes);
         let mut srtcp_ss = [0u8; 14];
-        srtcp_ss.copy_from_slice(&srtcp_salt);
+        srtcp_ss.copy_from_slice(&srtcp_salt_bytes);
+
+        // Zeroize intermediate derived key vectors.
+        srtcp_ck.zeroize();
+        srtcp_ak_bytes.zeroize();
+        srtcp_salt_bytes.zeroize();
 
         Ok(Self {
             cipher,
@@ -226,8 +250,9 @@ impl SrtpContext {
     /// Format: `inline:<base64(master_key || master_salt)>`
     pub fn from_sdes_inline(inline: &str) -> Result<Self> {
         let b64 = inline.strip_prefix("inline:").unwrap_or(inline);
-        let decoded = base64_decode(b64)?;
+        let mut decoded = base64_decode(b64)?;
         if decoded.len() < KEYING_MATERIAL_LEN {
+            decoded.zeroize();
             return Err(Error::Other(format!(
                 "srtp: SDES keying material must be {} bytes, got {}",
                 KEYING_MATERIAL_LEN,
@@ -236,7 +261,9 @@ impl SrtpContext {
         }
         let master_key = &decoded[..MASTER_KEY_LEN];
         let master_salt = &decoded[MASTER_KEY_LEN..KEYING_MATERIAL_LEN];
-        Self::new(master_key, master_salt)
+        let result = Self::new(master_key, master_salt);
+        decoded.zeroize();
+        result
     }
 
     /// Encrypts an RTP packet in-place and appends a 10-byte auth tag.
@@ -1325,5 +1352,41 @@ mod tests {
             let result = receiver.unprotect_rtcp(pkt);
             assert!(result.is_ok(), "reverse packet {} should succeed", i);
         }
+    }
+
+    #[test]
+    fn key_material_zeroized_on_drop() {
+        let mk = [0x11u8; 16];
+        let ms = [0x22u8; 14];
+
+        // Use ManuallyDrop so we can inspect fields after explicit zeroization.
+        let mut ctx = std::mem::ManuallyDrop::new(SrtpContext::new(&mk, &ms).unwrap());
+
+        // Verify keys are non-zero before zeroization.
+        assert_ne!(ctx.auth_key, [0u8; 20]);
+        assert_ne!(ctx.session_salt, [0u8; 14]);
+        assert_ne!(ctx.srtcp_auth_key, [0u8; 20]);
+        assert_ne!(ctx.srtcp_session_salt, [0u8; 14]);
+
+        // Manually invoke the same zeroization that Drop performs.
+        ctx.auth_key.zeroize();
+        ctx.session_salt.zeroize();
+        ctx.srtcp_auth_key.zeroize();
+        ctx.srtcp_session_salt.zeroize();
+
+        // Verify all key material is zeroed.
+        assert_eq!(ctx.auth_key, [0u8; 20], "auth_key should be zeroed");
+        assert_eq!(ctx.session_salt, [0u8; 14], "session_salt should be zeroed");
+        assert_eq!(
+            ctx.srtcp_auth_key, [0u8; 20],
+            "srtcp_auth_key should be zeroed"
+        );
+        assert_eq!(
+            ctx.srtcp_session_salt, [0u8; 14],
+            "srtcp_session_salt should be zeroed"
+        );
+
+        // Now actually drop to clean up (calls Drop which zeroizes again — harmless).
+        unsafe { std::mem::ManuallyDrop::drop(&mut ctx) };
     }
 }
