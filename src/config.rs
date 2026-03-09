@@ -67,6 +67,10 @@ pub struct Config {
     pub stun_server: Option<String>,
     /// DTMF transport mode (default: RFC 4733 RTP telephone-events).
     pub dtmf_mode: DtmfMode,
+    /// Voicemail server URI for MWI SUBSCRIBE (RFC 3842).
+    /// When set, the phone subscribes to `message-summary` events after registration.
+    /// Example: `"sip:*97@pbx.local"` or left empty to default to user's AOR.
+    pub voicemail_uri: Option<String>,
 }
 
 impl Default for Config {
@@ -93,6 +97,7 @@ impl Default for Config {
             srtp: false,
             stun_server: None,
             dtmf_mode: DtmfMode::Rfc4733,
+            voicemail_uri: None,
         }
     }
 }
@@ -206,6 +211,12 @@ impl PhoneBuilder {
     /// Sets the DTMF transport mode.
     pub fn dtmf_mode(mut self, mode: DtmfMode) -> Self {
         self.config.dtmf_mode = mode;
+        self
+    }
+
+    /// Sets the voicemail server URI for MWI SUBSCRIBE (RFC 3842).
+    pub fn voicemail_uri(mut self, uri: &str) -> Self {
+        self.config.voicemail_uri = Some(uri.into());
         self
     }
 

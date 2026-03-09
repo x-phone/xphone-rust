@@ -51,6 +51,7 @@ struct Inner {
     dialog_invite_handler:
         Option<Arc<dyn Fn(Arc<dyn crate::dialog::Dialog>, String, String, String) + Send + Sync>>,
     info_dtmf_handler: Option<Arc<dyn Fn(String, String) + Send + Sync>>,
+    mwi_notify_handler: Option<Arc<dyn Fn(String) + Send + Sync>>,
     response_watchers: HashMap<u16, Vec<Sender<bool>>>,
 }
 
@@ -81,6 +82,7 @@ impl MockTransport {
                 incoming_handler: None,
                 dialog_invite_handler: None,
                 info_dtmf_handler: None,
+                mwi_notify_handler: None,
                 response_watchers: HashMap::new(),
             }),
             response_ready_tx: tx,
@@ -153,6 +155,14 @@ impl MockTransport {
         let handler = self.inner.lock().info_dtmf_handler.clone();
         if let Some(h) = handler {
             h(call_id.into(), digit.into());
+        }
+    }
+
+    /// Simulates an incoming MWI NOTIFY with a message-summary body.
+    pub fn simulate_mwi_notify(&self, body: &str) {
+        let handler = self.inner.lock().mwi_notify_handler.clone();
+        if let Some(h) = handler {
+            h(body.into());
         }
     }
 
@@ -322,6 +332,35 @@ impl SipTransport for MockTransport {
 
     fn on_info_dtmf(&self, f: Box<dyn Fn(String, String) + Send + Sync>) {
         self.inner.lock().info_dtmf_handler = Some(Arc::from(f));
+    }
+
+    fn send_subscribe(
+        &self,
+        _uri: &str,
+        _headers: &HashMap<String, String>,
+        timeout: Duration,
+    ) -> Result<Message> {
+        {
+            let mut inner = self.inner.lock();
+            inner.sent.push(SentMessage {
+                method: "SUBSCRIBE".into(),
+                headers: None,
+            });
+
+            if inner.fail_remain > 0 {
+                inner.fail_remain -= 1;
+                return Err(Error::Other("transport error".into()));
+            }
+        }
+
+        let (code, reason) = self.await_response(timeout)?;
+        let mut msg = Message::new_response(code, &reason);
+        msg.set_header("CSeq", "1 SUBSCRIBE");
+        Ok(msg)
+    }
+
+    fn on_mwi_notify(&self, f: Box<dyn Fn(String) + Send + Sync>) {
+        self.inner.lock().mwi_notify_handler = Some(Arc::from(f));
     }
 
     fn dial(

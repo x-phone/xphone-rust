@@ -192,6 +192,27 @@ impl RtpPacket {
     }
 }
 
+/// Voicemail (MWI) status from a `message-summary` NOTIFY (RFC 3842).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct VoicemailStatus {
+    /// Whether new messages are waiting.
+    pub messages_waiting: bool,
+    /// Optional message account URI (e.g. `sip:*97@pbx.local`).
+    pub account: String,
+    /// `(new, old)` voice message counts. `(0, 0)` if not reported.
+    pub voice: (u32, u32),
+}
+
+impl fmt::Display for VoicemailStatus {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "MWI: waiting={}, voice={}/{}",
+            self.messages_waiting, self.voice.0, self.voice.1
+        )
+    }
+}
+
 /// Audio codec identified by RTP payload type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Codec {

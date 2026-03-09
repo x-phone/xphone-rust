@@ -72,6 +72,22 @@ pub trait SipTransport: Send + Sync {
     /// Args: Call-ID, digit.
     fn on_info_dtmf(&self, _f: Box<dyn Fn(String, String) + Send + Sync>) {}
 
+    /// Sends a SIP SUBSCRIBE request to the given URI with extra headers.
+    /// Returns the final response.
+    fn send_subscribe(
+        &self,
+        _uri: &str,
+        _headers: &HashMap<String, String>,
+        _timeout: Duration,
+    ) -> Result<Message> {
+        Err(Error::Other(
+            "subscribe not supported on this transport".into(),
+        ))
+    }
+
+    /// Registers a callback for incoming MWI NOTIFY (message-summary body).
+    fn on_mwi_notify(&self, _f: Box<dyn Fn(String) + Send + Sync>) {}
+
     /// Sends REGISTER with Expires: 0 to unregister.
     fn unregister(&self, _timeout: Duration) -> Result<()> {
         Ok(())
