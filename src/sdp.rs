@@ -1,4 +1,5 @@
 use crate::error::Error;
+use crate::ice::IceSdpParams;
 
 /// SDP direction: send and receive.
 pub const DIR_SEND_RECV: &str = "sendrecv";
@@ -20,6 +21,12 @@ pub struct Session {
     pub media: Vec<MediaDesc>,
     /// The original raw SDP text.
     pub raw: String,
+    /// ICE username fragment from `a=ice-ufrag:`.
+    pub ice_ufrag: Option<String>,
+    /// ICE password from `a=ice-pwd:`.
+    pub ice_pwd: Option<String>,
+    /// Whether `a=ice-lite` is present.
+    pub ice_lite: bool,
 }
 
 /// A single media description from an SDP m= line.
@@ -35,6 +42,8 @@ pub struct MediaDesc {
     pub profile: String,
     /// SRTP crypto attributes parsed from `a=crypto:` lines.
     pub crypto: Vec<CryptoAttr>,
+    /// Raw `a=candidate:` lines.
+    pub candidates: Vec<String>,
 }
 
 /// Parsed SRTP crypto attribute from an `a=crypto:` SDP line.
@@ -111,6 +120,9 @@ pub fn parse(raw: &str) -> crate::error::Result<Session> {
         connection: String::new(),
         media: Vec::new(),
         raw: raw.to_string(),
+        ice_ufrag: None,
+        ice_pwd: None,
+        ice_lite: false,
     };
     let mut has_version = false;
     let mut cur_media_idx: Option<usize> = None;
@@ -147,6 +159,7 @@ pub fn parse(raw: &str) -> crate::error::Result<Session> {
                         direction: String::new(),
                         profile,
                         crypto: Vec::new(),
+                        candidates: Vec::new(),
                     });
                     cur_media_idx = Some(session.media.len() - 1);
                 }
@@ -163,6 +176,16 @@ pub fn parse(raw: &str) -> crate::error::Result<Session> {
                             if let Some(attr) = parse_crypto_val(crypto_val) {
                                 session.media[idx].crypto.push(attr);
                             }
+                        }
+                    } else if let Some(ufrag) = val.strip_prefix("ice-ufrag:") {
+                        session.ice_ufrag = Some(ufrag.to_string());
+                    } else if let Some(pwd) = val.strip_prefix("ice-pwd:") {
+                        session.ice_pwd = Some(pwd.to_string());
+                    } else if val == "ice-lite" {
+                        session.ice_lite = true;
+                    } else if let Some(cand_val) = val.strip_prefix("candidate:") {
+                        if let Some(idx) = cur_media_idx {
+                            session.media[idx].candidates.push(cand_val.to_string());
                         }
                     }
                 }
@@ -184,6 +207,7 @@ fn build_offer_inner(
     direction: &str,
     profile: &str,
     crypto_inline_key: Option<&str>,
+    ice: Option<&IceSdpParams>,
 ) -> String {
     let mut b = String::new();
     b.push_str("v=0\r\n");
@@ -195,6 +219,12 @@ fn build_offer_inner(
     b.push_str(ip);
     b.push_str("\r\n");
     b.push_str("t=0 0\r\n");
+    // ICE-Lite is a session-level attribute.
+    if let Some(ice_params) = ice {
+        if ice_params.ice_lite {
+            b.push_str("a=ice-lite\r\n");
+        }
+    }
     b.push_str(&format!("m=audio {} {}", port, profile));
     for c in codecs {
         b.push_str(&format!(" {}", c));
@@ -214,6 +244,14 @@ fn build_offer_inner(
             key
         ));
     }
+    // ICE attributes (media-level).
+    if let Some(ice_params) = ice {
+        b.push_str(&format!("a=ice-ufrag:{}\r\n", ice_params.ufrag));
+        b.push_str(&format!("a=ice-pwd:{}\r\n", ice_params.pwd));
+        for cand in &ice_params.candidates {
+            b.push_str(&format!("a=candidate:{}\r\n", cand.to_sdp_value()));
+        }
+    }
     b.push_str("a=");
     b.push_str(direction);
     b.push_str("\r\n");
@@ -222,7 +260,18 @@ fn build_offer_inner(
 
 /// Creates an SDP offer string.
 pub fn build_offer(ip: &str, port: i32, codecs: &[i32], direction: &str) -> String {
-    build_offer_inner(ip, port, codecs, direction, "RTP/AVP", None)
+    build_offer_inner(ip, port, codecs, direction, "RTP/AVP", None, None)
+}
+
+/// Creates an SDP offer with ICE attributes.
+pub fn build_offer_ice(
+    ip: &str,
+    port: i32,
+    codecs: &[i32],
+    direction: &str,
+    ice: &IceSdpParams,
+) -> String {
+    build_offer_inner(ip, port, codecs, direction, "RTP/AVP", None, Some(ice))
 }
 
 /// Creates an SDP answer that only includes codecs present in both
@@ -263,6 +312,27 @@ pub fn build_offer_srtp(
         direction,
         "RTP/SAVP",
         Some(crypto_inline_key),
+        None,
+    )
+}
+
+/// Creates an SDP offer with SRTP and ICE attributes.
+pub fn build_offer_srtp_ice(
+    ip: &str,
+    port: i32,
+    codecs: &[i32],
+    direction: &str,
+    crypto_inline_key: &str,
+    ice: &IceSdpParams,
+) -> String {
+    build_offer_inner(
+        ip,
+        port,
+        codecs,
+        direction,
+        "RTP/SAVP",
+        Some(crypto_inline_key),
+        Some(ice),
     )
 }
 
@@ -454,5 +524,84 @@ mod tests {
         let s = parse(&sdp).unwrap();
         // Only codec 8 is common.
         assert_eq!(s.media[0].codecs, vec![8]);
+    }
+
+    // --- ICE SDP tests ---
+
+    #[test]
+    fn build_offer_ice_has_candidates() {
+        use crate::ice::{self, IceSdpParams};
+        let cands = ice::gather_candidates(
+            "192.168.1.100:5004".parse().unwrap(),
+            Some("203.0.113.42:12345".parse().unwrap()),
+            None,
+            1,
+        );
+        let ice_params = IceSdpParams {
+            ufrag: "abcd1234".into(),
+            pwd: "longpasswordstring12345".into(),
+            candidates: cands,
+            ice_lite: true,
+        };
+        let sdp = build_offer_ice("192.168.1.100", 5004, &[0], "sendrecv", &ice_params);
+        assert!(sdp.contains("a=ice-lite"));
+        assert!(sdp.contains("a=ice-ufrag:abcd1234"));
+        assert!(sdp.contains("a=ice-pwd:longpasswordstring12345"));
+        assert!(sdp.contains("a=candidate:1"));
+        assert!(sdp.contains("typ host"));
+        assert!(sdp.contains("a=candidate:2"));
+        assert!(sdp.contains("typ srflx"));
+    }
+
+    #[test]
+    fn build_offer_srtp_ice_has_both() {
+        use crate::ice::{self, IceSdpParams};
+        let cands = ice::gather_candidates("10.0.0.1:5004".parse().unwrap(), None, None, 1);
+        let ice_params = IceSdpParams {
+            ufrag: "ufrag".into(),
+            pwd: "password".into(),
+            candidates: cands,
+            ice_lite: false,
+        };
+        let sdp = build_offer_srtp_ice("10.0.0.1", 5004, &[0], "sendrecv", "key123", &ice_params);
+        assert!(sdp.contains("RTP/SAVP"));
+        assert!(sdp.contains("a=crypto:"));
+        assert!(sdp.contains("a=ice-ufrag:ufrag"));
+        assert!(sdp.contains("a=candidate:1"));
+        assert!(!sdp.contains("a=ice-lite"));
+    }
+
+    #[test]
+    fn parse_sdp_with_ice_attrs() {
+        use crate::ice::{self, IceSdpParams};
+        let cands = ice::gather_candidates(
+            "192.168.1.100:5004".parse().unwrap(),
+            Some("203.0.113.42:12345".parse().unwrap()),
+            None,
+            1,
+        );
+        let ice_params = IceSdpParams {
+            ufrag: "testufrag".into(),
+            pwd: "testpassword".into(),
+            candidates: cands,
+            ice_lite: true,
+        };
+        let sdp = build_offer_ice("192.168.1.100", 5004, &[0], "sendrecv", &ice_params);
+        let s = parse(&sdp).unwrap();
+
+        assert!(s.ice_lite);
+        assert_eq!(s.ice_ufrag.as_deref(), Some("testufrag"));
+        assert_eq!(s.ice_pwd.as_deref(), Some("testpassword"));
+        assert_eq!(s.media[0].candidates.len(), 2);
+    }
+
+    #[test]
+    fn parse_sdp_without_ice() {
+        let sdp = build_offer("10.0.0.1", 5004, &[0], "sendrecv");
+        let s = parse(&sdp).unwrap();
+        assert!(!s.ice_lite);
+        assert!(s.ice_ufrag.is_none());
+        assert!(s.ice_pwd.is_none());
+        assert!(s.media[0].candidates.is_empty());
     }
 }

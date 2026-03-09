@@ -10,6 +10,7 @@ pub mod config;
 pub mod dialog;
 pub mod dtmf;
 pub mod error;
+pub mod ice;
 pub mod jitter;
 pub mod media;
 pub mod mock;
@@ -22,6 +23,7 @@ pub mod sip;
 pub mod srtp;
 pub mod stun;
 pub mod transport;
+pub mod turn;
 pub mod types;
 
 // Re-export the primary public API at the crate root.

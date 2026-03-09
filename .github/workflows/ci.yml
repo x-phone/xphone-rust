@@ -48,7 +48,7 @@ jobs:
         run: cargo test --release
 
   integration:
-    name: Integration (Docker/Asterisk)
+    name: Integration (Docker/Asterisk + CoTURN)
     runs-on: ubuntu-latest
     needs: test
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
@@ -58,11 +58,13 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - name: Install system dependencies
         run: sudo apt-get update && sudo apt-get install -y libasound2-dev libopus-dev
-      - name: Start Asterisk
+      - name: Start Asterisk + CoTURN
         run: docker compose -f testutil/docker/docker-compose.yml up -d --wait
-      - name: Run integration tests
+      - name: Run integration tests (Asterisk)
         run: cargo test --features integration --test integration_test -- --nocapture --test-threads=1
-      - name: Stop Asterisk
+      - name: Run TURN/ICE integration tests
+        run: cargo test --features integration --test turn_test -- --nocapture --test-threads=1
+      - name: Stop services
         if: always()
         run: docker compose -f testutil/docker/docker-compose.yml down
 
