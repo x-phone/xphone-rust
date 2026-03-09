@@ -427,7 +427,11 @@ fn sip_message_between_extensions() {
         .expect("MESSAGE not received by p2");
     assert_eq!(msg.body, "Hello from 1001");
     assert_eq!(msg.content_type, "text/plain");
-    assert!(msg.from.contains("1001"), "from should contain sender: {}", msg.from);
+    assert!(
+        msg.from.contains("1001"),
+        "from should contain sender: {}",
+        msg.from
+    );
 
     p1.disconnect().unwrap();
     p2.disconnect().unwrap();
