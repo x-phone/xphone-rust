@@ -1,7 +1,7 @@
 use std::time::Duration;
 
 use crate::sip::conn::TlsConfig;
-use crate::types::Codec;
+use crate::types::{Codec, VideoCodec};
 
 /// Selects how DTMF digits are sent and received.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -280,6 +280,11 @@ pub struct DialOptions {
     pub timeout: Duration,
     /// Codec list that overrides the phone-level preferences for this call.
     pub codec_override: Vec<Codec>,
+    /// Enable video in the SDP offer.
+    pub video: bool,
+    /// Video codecs in preference order. Defaults to `[H264, VP8]` when
+    /// `video` is enabled. Only used when `video` is `true`.
+    pub video_codecs: Vec<VideoCodec>,
 }
 
 impl Default for DialOptions {
@@ -290,6 +295,8 @@ impl Default for DialOptions {
             early_media: false,
             timeout: Duration::from_secs(30),
             codec_override: Vec::new(),
+            video: false,
+            video_codecs: Vec::new(),
         }
     }
 }
@@ -334,6 +341,22 @@ impl DialOptionsBuilder {
     /// Overrides the phone-level codec preferences for this call.
     pub fn codec_override(mut self, codecs: Vec<Codec>) -> Self {
         self.opts.codec_override = codecs;
+        self
+    }
+
+    /// Enables video in the SDP offer. Also sets default video codecs
+    /// `[H264, VP8]` if none were explicitly set.
+    pub fn video(mut self) -> Self {
+        self.opts.video = true;
+        if self.opts.video_codecs.is_empty() {
+            self.opts.video_codecs = vec![VideoCodec::H264, VideoCodec::VP8];
+        }
+        self
+    }
+
+    /// Sets the preferred video codecs (default: `[H264, VP8]`).
+    pub fn video_codecs(mut self, codecs: Vec<VideoCodec>) -> Self {
+        self.opts.video_codecs = codecs;
         self
     }
 
@@ -440,5 +463,41 @@ mod tests {
         assert!(opts.early_media);
         assert_eq!(opts.timeout, Duration::from_secs(60));
         assert_eq!(opts.codec_override, vec![Codec::G722]);
+    }
+
+    #[test]
+    fn dial_options_video_default_off() {
+        let opts = DialOptions::default();
+        assert!(!opts.video);
+        assert!(opts.video_codecs.is_empty());
+    }
+
+    #[test]
+    fn dial_options_builder_video() {
+        let opts = DialOptionsBuilder::new()
+            .video()
+            .video_codecs(vec![VideoCodec::H264, VideoCodec::VP8])
+            .build();
+        assert!(opts.video);
+        assert_eq!(opts.video_codecs, vec![VideoCodec::H264, VideoCodec::VP8]);
+    }
+
+    #[test]
+    fn dial_options_builder_video_default_codecs() {
+        // .video() without .video_codecs() should default to [H264, VP8].
+        let opts = DialOptionsBuilder::new().video().build();
+        assert!(opts.video);
+        assert_eq!(opts.video_codecs, vec![VideoCodec::H264, VideoCodec::VP8]);
+    }
+
+    #[test]
+    fn dial_options_builder_video_h264_only() {
+        // Explicit .video_codecs() before .video() is preserved.
+        let opts = DialOptionsBuilder::new()
+            .video_codecs(vec![VideoCodec::H264])
+            .video()
+            .build();
+        assert!(opts.video);
+        assert_eq!(opts.video_codecs, vec![VideoCodec::H264]);
     }
 }

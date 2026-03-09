@@ -357,6 +357,74 @@ fn parse_param(params: &str, name: &str) -> Option<String> {
     None
 }
 
+/// Video codec for SDP negotiation and RTP packetization.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum VideoCodec {
+    /// H.264 / AVC (RFC 6184).
+    H264,
+    /// VP8 (RFC 7741).
+    VP8,
+}
+
+impl VideoCodec {
+    /// Default dynamic RTP payload type used in SDP offers.
+    pub fn default_payload_type(self) -> u8 {
+        match self {
+            VideoCodec::H264 => 96,
+            VideoCodec::VP8 => 97,
+        }
+    }
+
+    /// RTP clock rate (always 90 kHz for video).
+    pub fn clock_rate(self) -> u32 {
+        90000
+    }
+
+    /// SDP rtpmap encoding name (e.g. `"H264/90000"`).
+    pub fn rtpmap_name(self) -> &'static str {
+        match self {
+            VideoCodec::H264 => "H264/90000",
+            VideoCodec::VP8 => "VP8/90000",
+        }
+    }
+
+    /// SDP fmtp parameters, if any.
+    pub fn fmtp(self) -> Option<&'static str> {
+        match self {
+            VideoCodec::H264 => Some("profile-level-id=42e01f;packetization-mode=1"),
+            VideoCodec::VP8 => None,
+        }
+    }
+
+    /// RTCP feedback types for this codec.
+    pub fn rtcp_fb(self) -> &'static [&'static str] {
+        match self {
+            VideoCodec::H264 | VideoCodec::VP8 => &["nack", "nack pli", "ccm fir"],
+        }
+    }
+
+    /// Attempts to identify a video codec from an rtpmap encoding name.
+    pub fn from_rtpmap_name(name: &str) -> Option<VideoCodec> {
+        let codec_part = name.split('/').next()?;
+        if codec_part.eq_ignore_ascii_case("H264") {
+            Some(VideoCodec::H264)
+        } else if codec_part.eq_ignore_ascii_case("VP8") {
+            Some(VideoCodec::VP8)
+        } else {
+            None
+        }
+    }
+}
+
+impl fmt::Display for VideoCodec {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            VideoCodec::H264 => write!(f, "H264"),
+            VideoCodec::VP8 => write!(f, "VP8"),
+        }
+    }
+}
+
 /// Audio codec identified by RTP payload type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Codec {
@@ -617,6 +685,68 @@ mod tests {
             .to_string(),
             "terminated;reason=timeout"
         );
+    }
+
+    #[test]
+    fn video_codec_display() {
+        assert_eq!(VideoCodec::H264.to_string(), "H264");
+        assert_eq!(VideoCodec::VP8.to_string(), "VP8");
+    }
+
+    #[test]
+    fn video_codec_default_payload_type() {
+        assert_eq!(VideoCodec::H264.default_payload_type(), 96);
+        assert_eq!(VideoCodec::VP8.default_payload_type(), 97);
+    }
+
+    #[test]
+    fn video_codec_clock_rate() {
+        assert_eq!(VideoCodec::H264.clock_rate(), 90000);
+        assert_eq!(VideoCodec::VP8.clock_rate(), 90000);
+    }
+
+    #[test]
+    fn video_codec_rtpmap_name() {
+        assert_eq!(VideoCodec::H264.rtpmap_name(), "H264/90000");
+        assert_eq!(VideoCodec::VP8.rtpmap_name(), "VP8/90000");
+    }
+
+    #[test]
+    fn video_codec_fmtp() {
+        assert!(VideoCodec::H264
+            .fmtp()
+            .unwrap()
+            .contains("profile-level-id"));
+        assert!(VideoCodec::H264
+            .fmtp()
+            .unwrap()
+            .contains("packetization-mode=1"));
+        assert!(VideoCodec::VP8.fmtp().is_none());
+    }
+
+    #[test]
+    fn video_codec_rtcp_fb() {
+        let fb = VideoCodec::H264.rtcp_fb();
+        assert!(fb.contains(&"nack"));
+        assert!(fb.contains(&"nack pli"));
+        assert!(fb.contains(&"ccm fir"));
+    }
+
+    #[test]
+    fn video_codec_from_rtpmap_name() {
+        assert_eq!(
+            VideoCodec::from_rtpmap_name("H264/90000"),
+            Some(VideoCodec::H264)
+        );
+        assert_eq!(
+            VideoCodec::from_rtpmap_name("VP8/90000"),
+            Some(VideoCodec::VP8)
+        );
+        assert_eq!(
+            VideoCodec::from_rtpmap_name("h264/90000"),
+            Some(VideoCodec::H264)
+        );
+        assert_eq!(VideoCodec::from_rtpmap_name("PCMU/8000"), None);
     }
 
     #[test]
