@@ -376,7 +376,15 @@ pub fn start_media(
                 if let Some(ref rsock) = rtcp_sock {
                     match rsock.recv_from(&mut rtcp_buf) {
                         Ok((n, _)) if n >= 8 => {
-                            let _ = rtcp_tx.try_send(rtcp_buf[..n].to_vec());
+                            let rtcp_data = if let Some(ref srtp) = srtp_in_clone {
+                                match srtp.lock().unprotect_rtcp(&rtcp_buf[..n]) {
+                                    Ok(decrypted) => decrypted,
+                                    Err(_) => continue, // Drop unauthenticated RTCP
+                                }
+                            } else {
+                                rtcp_buf[..n].to_vec()
+                            };
+                            let _ = rtcp_tx.try_send(rtcp_data);
                         }
                         _ => {}
                     }
@@ -547,7 +555,18 @@ pub fn start_media(
                     if let Some(ref rsock) = rtcp_socket_for_thread {
                         if let Some(addr) = rtcp_remote_addr {
                             let sr = rtcp::build_sr(out_ssrc, &mut rtcp_stats);
-                            let _ = rsock.send_to(&sr, addr);
+                            let data = if let Some(ref ctx) = srtp_out_for_thread {
+                                match ctx.lock().protect_rtcp(&sr) {
+                                    Ok(encrypted) => encrypted,
+                                    Err(e) => {
+                                        warn!(error = %e, "media: SRTCP protect failed, dropping RTCP");
+                                        continue;
+                                    }
+                                }
+                            } else {
+                                sr
+                            };
+                            let _ = rsock.send_to(&data, addr);
                         }
                     }
                 },
