@@ -23,6 +23,7 @@ struct Inner {
     bye_handler: Option<Arc<dyn Fn(String) + Send + Sync>>,
     notify_handler: Option<Arc<dyn Fn(String, u16) + Send + Sync>>,
     info_dtmf_handler: Option<Arc<dyn Fn(String, String) + Send + Sync>>,
+    mwi_notify_handler: Option<Arc<dyn Fn(String) + Send + Sync>>,
 }
 
 /// Production SIP transport backed by `sip::client::Client`.
@@ -85,6 +86,7 @@ impl SipUA {
             bye_handler: None,
             notify_handler: None,
             info_dtmf_handler: None,
+            mwi_notify_handler: None,
         }));
 
         // Wire up incoming SIP request handler.
@@ -227,8 +229,21 @@ fn handle_notify(
     debug!("SIP >>> 200 OK (NOTIFY)");
     let _ = client.send_raw_to(&resp.to_bytes(), from_addr);
 
-    // Parse status code from sipfrag body (e.g. "SIP/2.0 200 OK").
+    let content_type = msg.header("Content-Type");
     let body = String::from_utf8_lossy(&msg.body);
+
+    // Dispatch based on Content-Type (strip parameters before comparing).
+    let media_type = content_type.split(';').next().unwrap_or("").trim();
+    if media_type.eq_ignore_ascii_case("application/simple-message-summary") {
+        // MWI NOTIFY (RFC 3842).
+        let cb = inner.lock().mwi_notify_handler.clone();
+        if let Some(f) = cb {
+            f(body.to_string());
+        }
+        return;
+    }
+
+    // Default: parse status code from sipfrag body (REFER progress).
     let status_code = parse_sipfrag_status(&body);
 
     if let Some(code) = status_code {
@@ -404,6 +419,21 @@ impl SipTransport for SipUA {
 
     fn on_info_dtmf(&self, f: Box<dyn Fn(String, String) + Send + Sync>) {
         self.inner.lock().info_dtmf_handler = Some(Arc::from(f));
+    }
+
+    fn send_subscribe(
+        &self,
+        uri: &str,
+        headers: &HashMap<String, String>,
+        timeout: Duration,
+    ) -> Result<Message> {
+        let (code, reason) = self.client.send_subscribe(uri, headers, timeout)?;
+        let msg = Message::new_response(code, &reason);
+        Ok(msg)
+    }
+
+    fn on_mwi_notify(&self, f: Box<dyn Fn(String) + Send + Sync>) {
+        self.inner.lock().mwi_notify_handler = Some(Arc::from(f));
     }
 
     fn unregister(&self, timeout: Duration) -> Result<()> {

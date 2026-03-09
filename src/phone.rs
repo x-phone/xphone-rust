@@ -9,9 +9,10 @@ use crate::config::{Config, DialOptions};
 use crate::dialog::Dialog;
 use crate::error::{Error, Result};
 use crate::mock::dialog::MockDialog;
+use crate::mwi::MwiSubscriber;
 use crate::registry::Registry;
 use crate::transport::SipTransport;
-use crate::types::{CallState, Direction, EndReason, PhoneState};
+use crate::types::{CallState, Direction, EndReason, PhoneState, VoicemailStatus};
 
 type CallStateCb = Arc<dyn Fn(Arc<Call>, crate::types::CallState) + Send + Sync>;
 type CallEndedCb = Arc<dyn Fn(Arc<Call>, crate::types::EndReason) + Send + Sync>;
@@ -21,12 +22,14 @@ struct Inner {
     state: PhoneState,
     tr: Option<Arc<dyn SipTransport>>,
     reg: Option<Arc<Registry>>,
+    mwi: Option<Arc<MwiSubscriber>>,
     incoming: Option<Arc<dyn Fn(Arc<Call>) + Send + Sync>>,
     calls: HashMap<String, Arc<Call>>,
 
     on_registered_fn: Option<Arc<dyn Fn() + Send + Sync>>,
     on_unregistered_fn: Option<Arc<dyn Fn() + Send + Sync>>,
     on_error_fn: Option<Arc<dyn Fn(Error) + Send + Sync>>,
+    on_voicemail_fn: Option<Arc<dyn Fn(VoicemailStatus) + Send + Sync>>,
 
     // Phone-level call callbacks — auto-wired to every new call.
     on_call_state_fn: Option<CallStateCb>,
@@ -54,11 +57,13 @@ impl Phone {
                 state: PhoneState::Disconnected,
                 tr: None,
                 reg: None,
+                mwi: None,
                 incoming: None,
                 calls: HashMap::new(),
                 on_registered_fn: None,
                 on_unregistered_fn: None,
                 on_error_fn: None,
+                on_voicemail_fn: None,
                 on_call_state_fn: None,
                 on_call_ended_fn: None,
                 on_call_dtmf_fn: None,
@@ -159,9 +164,28 @@ impl Phone {
             handle_info_dtmf(&inner_clone, &call_id, &digit);
         }));
 
+        // Start MWI subscriber if voicemail URI is configured and registration succeeded.
+        let mwi = if reg_result.is_ok() {
+            if let Some(ref vm_uri) = self.cfg.voicemail_uri {
+                let sub = Arc::new(MwiSubscriber::new(Arc::clone(&tr), vm_uri.clone()));
+                // Apply buffered on_voicemail callback.
+                if let Some(ref f) = self.inner.lock().on_voicemail_fn {
+                    let f = Arc::clone(f);
+                    sub.on_voicemail(move |s| f(s));
+                }
+                sub.start();
+                Some(sub)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+
         let mut inner = self.inner.lock();
         inner.tr = Some(tr);
         inner.reg = Some(reg);
+        inner.mwi = mwi;
         if reg_result.is_ok() {
             inner.state = PhoneState::Registered;
         } else {
@@ -172,7 +196,7 @@ impl Phone {
     /// Disconnects the phone: ends all active calls, stops registry, and closes transport.
     pub fn disconnect(&self) -> Result<()> {
         info!("Phone disconnecting");
-        let (reg, tr, unreg_fn, active_calls) = {
+        let (reg, tr, unreg_fn, active_calls, mwi) = {
             let mut inner = self.inner.lock();
             if inner.state == PhoneState::Disconnected {
                 return Err(Error::NotConnected);
@@ -181,8 +205,9 @@ impl Phone {
             let tr = inner.tr.take();
             let unreg_fn = inner.on_unregistered_fn.clone();
             let active_calls: Vec<Arc<Call>> = inner.calls.drain().map(|(_, c)| c).collect();
+            let mwi = inner.mwi.take();
             inner.state = PhoneState::Disconnected;
-            (reg, tr, unreg_fn, active_calls)
+            (reg, tr, unreg_fn, active_calls, mwi)
         };
 
         // End all active calls so their resources (media, sockets, SRTP) are released.
@@ -190,6 +215,9 @@ impl Phone {
             let _ = call.end();
         }
 
+        if let Some(mwi) = mwi {
+            mwi.stop();
+        }
         if let Some(reg) = reg {
             reg.stop();
         }
@@ -370,6 +398,21 @@ impl Phone {
         if let Some(reg) = reg {
             let cb = Arc::clone(&cb);
             reg.on_error(move |e| cb(e));
+        }
+    }
+
+    /// Sets the callback for voicemail (MWI) status updates.
+    /// Fires whenever a NOTIFY with `application/simple-message-summary` is received.
+    pub fn on_voicemail<F: Fn(VoicemailStatus) + Send + Sync + 'static>(&self, f: F) {
+        let cb: Arc<dyn Fn(VoicemailStatus) + Send + Sync> = Arc::new(f);
+        let mwi = {
+            let mut inner = self.inner.lock();
+            inner.on_voicemail_fn = Some(Arc::clone(&cb));
+            inner.mwi.clone()
+        };
+        if let Some(mwi) = mwi {
+            let cb = Arc::clone(&cb);
+            mwi.on_voicemail(move |s| cb(s));
         }
     }
 
@@ -1485,5 +1528,72 @@ mod tests {
         assert_eq!(uri_encode("simple"), "simple");
         assert_eq!(uri_encode("a;b=c?d&e+f"), "a%3Bb%3Dc%3Fd%26e%2Bf");
         assert_eq!(uri_encode("sip:user"), "sip%3Auser");
+    }
+
+    // --- MWI ---
+
+    #[test]
+    fn mwi_subscribes_on_connect() {
+        let tr = Arc::new(MockTransport::new());
+        tr.respond_with(200, "OK"); // REGISTER
+        tr.respond_with(200, "OK"); // SUBSCRIBE
+
+        let mut cfg = test_cfg();
+        cfg.voicemail_uri = Some("sip:*97@pbx.local".into());
+        let phone = Phone::new(cfg);
+        phone.connect_with_transport(Arc::clone(&tr) as Arc<dyn SipTransport>);
+
+        // Give MWI thread time to send SUBSCRIBE.
+        std::thread::sleep(Duration::from_millis(300));
+
+        assert!(
+            tr.count_sent("SUBSCRIBE") >= 1,
+            "expected at least 1 SUBSCRIBE, got {}",
+            tr.count_sent("SUBSCRIBE")
+        );
+
+        phone.disconnect().unwrap();
+    }
+
+    #[test]
+    fn mwi_fires_on_voicemail_callback() {
+        let tr = Arc::new(MockTransport::new());
+        tr.respond_with(200, "OK"); // REGISTER
+        tr.respond_with(200, "OK"); // SUBSCRIBE
+
+        let mut cfg = test_cfg();
+        cfg.voicemail_uri = Some("sip:*97@pbx.local".into());
+        let phone = Phone::new(cfg);
+
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        phone.on_voicemail(move |status| {
+            let _ = tx.send(status);
+        });
+
+        phone.connect_with_transport(Arc::clone(&tr) as Arc<dyn SipTransport>);
+        std::thread::sleep(Duration::from_millis(200));
+
+        // Simulate MWI NOTIFY.
+        tr.simulate_mwi_notify("Messages-Waiting: yes\r\nVoice-Message: 2/4\r\n");
+
+        let status = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(status.messages_waiting);
+        assert_eq!(status.voice, (2, 4));
+
+        phone.disconnect().unwrap();
+    }
+
+    #[test]
+    fn no_mwi_without_voicemail_uri() {
+        let tr = Arc::new(MockTransport::new());
+        tr.respond_with(200, "OK"); // REGISTER
+
+        let phone = Phone::new(test_cfg()); // no voicemail_uri
+        phone.connect_with_transport(Arc::clone(&tr) as Arc<dyn SipTransport>);
+
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(tr.count_sent("SUBSCRIBE"), 0);
+
+        phone.disconnect().unwrap();
     }
 }

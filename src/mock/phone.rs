@@ -6,7 +6,7 @@ use parking_lot::Mutex;
 use crate::config::DialOptions;
 use crate::error::{Error, Result};
 use crate::mock::call::MockCall;
-use crate::types::PhoneState;
+use crate::types::{PhoneState, VoicemailStatus};
 
 struct Inner {
     state: PhoneState,
@@ -14,6 +14,7 @@ struct Inner {
     on_registered_fn: Option<Arc<dyn Fn() + Send + Sync>>,
     on_unregistered_fn: Option<Arc<dyn Fn() + Send + Sync>>,
     on_error_fn: Option<Arc<dyn Fn(Error) + Send + Sync>>,
+    on_voicemail_fn: Option<Arc<dyn Fn(VoicemailStatus) + Send + Sync>>,
     last_call: Option<Arc<MockCall>>,
     calls: HashMap<String, Arc<MockCall>>,
 }
@@ -43,6 +44,7 @@ impl MockPhone {
                 on_registered_fn: None,
                 on_unregistered_fn: None,
                 on_error_fn: None,
+                on_voicemail_fn: None,
                 last_call: None,
                 calls: HashMap::new(),
             }),
@@ -123,6 +125,11 @@ impl MockPhone {
         self.inner.lock().on_error_fn = Some(Arc::new(f));
     }
 
+    /// Registers a callback fired on voicemail (MWI) status updates.
+    pub fn on_voicemail<F: Fn(VoicemailStatus) + Send + Sync + 'static>(&self, f: F) {
+        self.inner.lock().on_voicemail_fn = Some(Arc::new(f));
+    }
+
     /// Returns the current phone state.
     pub fn state(&self) -> PhoneState {
         self.inner.lock().state
@@ -151,6 +158,14 @@ impl MockPhone {
         let cb = self.inner.lock().on_error_fn.clone();
         if let Some(f) = cb {
             f(err);
+        }
+    }
+
+    /// Fires the OnVoicemail callback with the given status.
+    pub fn simulate_mwi(&self, status: VoicemailStatus) {
+        let cb = self.inner.lock().on_voicemail_fn.clone();
+        if let Some(f) = cb {
+            f(status);
         }
     }
 
@@ -401,5 +416,33 @@ mod tests {
         let b = Arc::new(MockCall::new()); // Ringing state
         let result = p.attended_transfer(&a, &b);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn simulate_mwi_fires_callback() {
+        let p = MockPhone::new();
+        let received = Arc::new(Mutex::new(None));
+        let received_clone = Arc::clone(&received);
+        p.on_voicemail(move |status| {
+            *received_clone.lock() = Some(status);
+        });
+
+        p.simulate_mwi(VoicemailStatus {
+            messages_waiting: true,
+            account: "sip:*97@pbx.local".into(),
+            voice: (3, 5),
+        });
+
+        let s = received.lock().clone().unwrap();
+        assert!(s.messages_waiting);
+        assert_eq!(s.voice, (3, 5));
+        assert_eq!(s.account, "sip:*97@pbx.local");
+    }
+
+    #[test]
+    fn simulate_mwi_without_callback() {
+        let p = MockPhone::new();
+        // Should not panic.
+        p.simulate_mwi(VoicemailStatus::default());
     }
 }
