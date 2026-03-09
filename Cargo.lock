@@ -11,6 +11,7 @@ dependencies = [
  "cfg-if",
  "cipher",
  "cpufeatures",
+ "zeroize",
 ]
 
 [[package]]
@@ -2071,6 +2072,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "webpki-roots 0.26.11",
+ "zeroize",
 ]
 
 [[package]]
