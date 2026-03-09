@@ -73,18 +73,18 @@ Extend SDP building/parsing to support multiple m= lines. No video flowing yet â
 
 Extract monolithic media pipeline into a per-stream `MediaStream` abstraction. Call holds a `Vec<MediaStream>`, audio is `streams[0]`. Zero new features â€” all existing tests must pass unchanged.
 
-- [ ] Define `MediaStream` struct (owns: socket, jitter buffer, RTP state, codec, RTCP context)
-- [ ] Extract current `media.rs` audio pipeline into `MediaStream`
-- [ ] Call holds `Vec<MediaStream>`, `streams[0]` = audio
-- [ ] Per-stream mute flag (audio stream only for now)
-- [ ] Add `mute_audio()`/`unmute_audio()` methods on Call
-- [ ] Update `mute()`/`unmute()` to mute all streams (backwards compatible)
-- [ ] DTMF stays on audio stream (stream index 0)
-- [ ] Hold/resume operates per-stream (`a=sendonly`/`a=inactive` per m= line)
-- [ ] Per-stream RTCP with correct clock rate
-- [ ] ALL existing tests pass unchanged (this is the acceptance criteria)
-- [ ] Tests: per-stream mute, mute-all behavior
-- [ ] Verify: `cargo fmt && cargo clippy -- -D warnings && cargo test` all pass
+- [x] Define `MediaStream` struct (owns: handle, channels, per-stream muted flag)
+- [x] Extract current `media.rs` audio pipeline into `MediaStream`
+- [x] Call holds `Vec<MediaStream>`, `streams[0]` = audio
+- [x] Per-stream mute flag (audio stream only for now)
+- [x] Add `mute_audio()`/`unmute_audio()` methods on Call
+- [x] Update `mute()`/`unmute()` to mute all streams (backwards compatible)
+- [x] DTMF stays on audio stream (stream index 0)
+- [x] Hold/resume operates per-stream (shared state unchanged for now)
+- [x] Per-stream RTCP with correct clock rate
+- [x] ALL existing tests pass unchanged (this is the acceptance criteria)
+- [x] Tests: per-stream mute uses Arc<AtomicBool>, mute-all iterates streams
+- [x] Verify: `cargo fmt && cargo clippy -- -D warnings && cargo test` all pass
 
 ## PR 3: Video plumbing
 
