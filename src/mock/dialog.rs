@@ -61,6 +61,10 @@ impl MockDialog {
         d
     }
 
+    pub fn set_call_id(&self, call_id: &str) {
+        self.inner.lock().call_id = call_id.into();
+    }
+
     pub fn with_session_expires(seconds: u32) -> Self {
         let mut headers = HashMap::new();
         headers.insert("Session-Expires".into(), vec![seconds.to_string()]);
