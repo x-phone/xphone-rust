@@ -40,6 +40,16 @@ const LABEL_CIPHER_KEY: u8 = 0x00;
 const LABEL_AUTH_KEY: u8 = 0x01;
 const LABEL_SALT: u8 = 0x02;
 
+/// SRTCP key derivation labels per RFC 3711 §4.3.1.
+const LABEL_SRTCP_CIPHER_KEY: u8 = 0x03;
+const LABEL_SRTCP_AUTH_KEY: u8 = 0x04;
+const LABEL_SRTCP_SALT: u8 = 0x05;
+
+/// SRTCP index field length (4 bytes: E-bit + 31-bit index).
+const SRTCP_INDEX_LEN: usize = 4;
+/// Minimum RTCP header size (V, P, RC, PT, length, SSRC).
+const RTCP_HEADER_MIN: usize = 8;
+
 /// Default replay window size (128 packets). Covers ~2.5 seconds of audio at 50 pps.
 const REPLAY_WINDOW_SIZE: u64 = 128;
 const _: () = assert!(
@@ -114,6 +124,9 @@ impl ReplayWindow {
 }
 
 /// SRTP crypto context for a single direction (send or receive).
+///
+/// Holds both SRTP (RTP) and SRTCP (RTCP) session keys, derived from the
+/// same master key/salt with different KDF labels per RFC 3711 §4.3.1.
 pub struct SrtpContext {
     /// Cached AES-128 cipher (expanded key schedule), derived from master key.
     cipher: Aes128,
@@ -129,6 +142,18 @@ pub struct SrtpContext {
     seq_initialized: bool,
     /// Replay protection window (used by unprotect only).
     replay: ReplayWindow,
+
+    // --- SRTCP fields (RFC 3711 §3.4) ---
+    /// SRTCP: AES-128 cipher derived with label 0x03.
+    srtcp_cipher: Aes128,
+    /// SRTCP: HMAC-SHA1 authentication key (20 bytes), derived with label 0x04.
+    srtcp_auth_key: [u8; 20],
+    /// SRTCP: session salt (14 bytes), derived with label 0x05.
+    srtcp_session_salt: [u8; 14],
+    /// SRTCP: monotonically increasing 31-bit packet index (sender side).
+    srtcp_index: u32,
+    /// SRTCP: replay protection window (receiver side).
+    srtcp_replay: ReplayWindow,
 }
 
 impl fmt::Debug for SrtpContext {
@@ -136,6 +161,7 @@ impl fmt::Debug for SrtpContext {
         f.debug_struct("SrtpContext")
             .field("roc", &self.roc)
             .field("last_seq", &self.last_seq)
+            .field("srtcp_index", &self.srtcp_index)
             .finish()
     }
 }
@@ -158,6 +184,7 @@ impl SrtpContext {
             )));
         }
 
+        // Derive SRTP session keys (labels 0x00-0x02).
         let cipher_key = derive_session_key(master_key, master_salt, LABEL_CIPHER_KEY, 16);
         let auth_key = derive_session_key(master_key, master_salt, LABEL_AUTH_KEY, 20);
         let salt_bytes = derive_session_key(master_key, master_salt, LABEL_SALT, 14);
@@ -168,6 +195,17 @@ impl SrtpContext {
         let mut ss = [0u8; 14];
         ss.copy_from_slice(&salt_bytes);
 
+        // Derive SRTCP session keys (labels 0x03-0x05).
+        let srtcp_ck = derive_session_key(master_key, master_salt, LABEL_SRTCP_CIPHER_KEY, 16);
+        let srtcp_ak_bytes = derive_session_key(master_key, master_salt, LABEL_SRTCP_AUTH_KEY, 20);
+        let srtcp_salt = derive_session_key(master_key, master_salt, LABEL_SRTCP_SALT, 14);
+
+        let srtcp_cipher = Aes128::new(srtcp_ck[..16].into());
+        let mut srtcp_ak = [0u8; 20];
+        srtcp_ak.copy_from_slice(&srtcp_ak_bytes);
+        let mut srtcp_ss = [0u8; 14];
+        srtcp_ss.copy_from_slice(&srtcp_salt);
+
         Ok(Self {
             cipher,
             auth_key: ak,
@@ -176,6 +214,11 @@ impl SrtpContext {
             last_seq: 0,
             seq_initialized: false,
             replay: ReplayWindow::new(),
+            srtcp_cipher,
+            srtcp_auth_key: srtcp_ak,
+            srtcp_session_salt: srtcp_ss,
+            srtcp_index: 0,
+            srtcp_replay: ReplayWindow::new(),
         })
     }
 
@@ -322,6 +365,111 @@ impl SrtpContext {
             self.last_seq = seq;
         }
     }
+
+    // --- SRTCP (RFC 3711 §3.4) ---
+
+    /// Encrypts an RTCP packet and appends SRTCP index + auth tag.
+    ///
+    /// Layout: `[header(8)][encrypted_payload][SRTCP_index(4)][auth_tag(10)]`
+    /// - First 8 bytes stay cleartext (authenticated but not encrypted).
+    /// - SRTCP index has E-bit (bit 31) set to indicate encryption.
+    /// - Auth tag covers the entire encrypted packet + SRTCP index.
+    pub fn protect_rtcp(&mut self, rtcp: &[u8]) -> Result<Vec<u8>> {
+        if rtcp.len() < RTCP_HEADER_MIN {
+            return Err(Error::Other("srtcp: packet too short".into()));
+        }
+
+        let ssrc = u32::from_be_bytes([rtcp[4], rtcp[5], rtcp[6], rtcp[7]]);
+        let index = self.srtcp_index;
+        self.srtcp_index += 1;
+
+        let mut out = rtcp.to_vec();
+
+        // Encrypt bytes 8..end (header stays cleartext).
+        if out.len() > RTCP_HEADER_MIN {
+            let payload_len = out.len() - RTCP_HEADER_MIN;
+            let keystream = generate_keystream(
+                &self.srtcp_cipher,
+                &self.srtcp_session_salt,
+                ssrc,
+                index as u64,
+                payload_len,
+            );
+            for i in RTCP_HEADER_MIN..out.len() {
+                out[i] ^= keystream[i - RTCP_HEADER_MIN];
+            }
+        }
+
+        // Append SRTCP index with E-bit set (bit 31 = 1 → encrypted).
+        let srtcp_index_word = 0x80000000 | index;
+        out.extend_from_slice(&srtcp_index_word.to_be_bytes());
+
+        // Auth tag covers: encrypted RTCP + SRTCP index.
+        let tag = compute_srtcp_auth_tag(&self.srtcp_auth_key, &out);
+        out.extend_from_slice(&tag);
+
+        Ok(out)
+    }
+
+    /// Verifies auth tag, strips SRTCP index, and decrypts the SRTCP packet.
+    ///
+    /// Input: SRTCP bytes `[header][encrypted_payload][SRTCP_index(4)][auth_tag(10)]`
+    /// Output: raw RTCP bytes.
+    pub fn unprotect_rtcp(&mut self, srtcp: &[u8]) -> Result<Vec<u8>> {
+        // Minimum: 8 (header) + 4 (SRTCP index) + 10 (auth tag) = 22.
+        if srtcp.len() < RTCP_HEADER_MIN + SRTCP_INDEX_LEN + AUTH_TAG_LEN {
+            return Err(Error::Other("srtcp: packet too short for unprotect".into()));
+        }
+
+        let tag_start = srtcp.len() - AUTH_TAG_LEN;
+        let index_start = tag_start - SRTCP_INDEX_LEN;
+        let received_tag = &srtcp[tag_start..];
+        let authenticated_portion = &srtcp[..tag_start]; // everything before auth tag
+
+        // Extract SRTCP index word (E-bit + 31-bit index).
+        let index_word = u32::from_be_bytes([
+            srtcp[index_start],
+            srtcp[index_start + 1],
+            srtcp[index_start + 2],
+            srtcp[index_start + 3],
+        ]);
+        let encrypted = (index_word & 0x80000000) != 0;
+        let index = index_word & 0x7FFFFFFF;
+
+        // Replay check.
+        if self.srtcp_replay.is_replay(index as u64) {
+            return Err(Error::Other("srtcp: replay detected".into()));
+        }
+
+        // Verify auth tag (constant-time via hmac crate).
+        if !verify_srtcp_auth_tag(&self.srtcp_auth_key, authenticated_portion, received_tag) {
+            return Err(Error::Other("srtcp: authentication failed".into()));
+        }
+
+        // Auth passed — update replay window.
+        self.srtcp_replay.accept(index as u64);
+
+        // The RTCP data is everything before the SRTCP index.
+        let mut out = srtcp[..index_start].to_vec();
+
+        // Decrypt if E-bit is set.
+        if encrypted && out.len() > RTCP_HEADER_MIN {
+            let ssrc = u32::from_be_bytes([out[4], out[5], out[6], out[7]]);
+            let payload_len = out.len() - RTCP_HEADER_MIN;
+            let keystream = generate_keystream(
+                &self.srtcp_cipher,
+                &self.srtcp_session_salt,
+                ssrc,
+                index as u64,
+                payload_len,
+            );
+            for i in RTCP_HEADER_MIN..out.len() {
+                out[i] ^= keystream[i - RTCP_HEADER_MIN];
+            }
+        }
+
+        Ok(out)
+    }
 }
 
 /// Derives a session key using AES-128-CM key derivation (RFC 3711 §4.3.1).
@@ -427,6 +575,24 @@ fn verify_auth_tag(auth_key: &[u8], authenticated: &[u8], roc: u32, received_tag
     let mut mac = <HmacSha1 as Mac>::new_from_slice(auth_key).expect("HMAC accepts any key length");
     mac.update(authenticated);
     mac.update(&roc.to_be_bytes());
+    mac.verify_truncated_left(received_tag).is_ok()
+}
+
+/// Computes HMAC-SHA1-80 auth tag for SRTCP.
+/// Unlike SRTP, the SRTCP index is already part of the authenticated data (no separate ROC append).
+fn compute_srtcp_auth_tag(auth_key: &[u8], authenticated: &[u8]) -> [u8; AUTH_TAG_LEN] {
+    let mut mac = <HmacSha1 as Mac>::new_from_slice(auth_key).expect("HMAC accepts any key length");
+    mac.update(authenticated);
+    let full_mac = mac.finalize().into_bytes();
+    let mut result = [0u8; AUTH_TAG_LEN];
+    result.copy_from_slice(&full_mac[..AUTH_TAG_LEN]);
+    result
+}
+
+/// Verifies SRTCP auth tag using constant-time comparison.
+fn verify_srtcp_auth_tag(auth_key: &[u8], authenticated: &[u8], received_tag: &[u8]) -> bool {
+    let mut mac = <HmacSha1 as Mac>::new_from_slice(auth_key).expect("HMAC accepts any key length");
+    mac.update(authenticated);
     mac.verify_truncated_left(received_tag).is_ok()
 }
 
@@ -950,5 +1116,214 @@ mod tests {
         let result = receiver.unprotect(&old_pkt);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("replay"));
+    }
+
+    // --- SRTCP tests ---
+
+    /// Builds a minimal RTCP SR for testing (28 bytes: header + sender info, no report blocks).
+    fn make_rtcp_sr(ssrc: u32) -> Vec<u8> {
+        let mut buf = vec![0u8; 28];
+        buf[0] = 0x80; // V=2, P=0, RC=0
+        buf[1] = 200; // PT=SR
+        buf[2] = 0;
+        buf[3] = 6; // length = 6 words
+        buf[4..8].copy_from_slice(&ssrc.to_be_bytes());
+        // NTP timestamp, RTP timestamp, packet/octet counts are zero — fine for crypto tests.
+        buf
+    }
+
+    #[test]
+    fn srtcp_protect_unprotect_round_trip() {
+        let mk = [0x10u8; 16];
+        let ms = [0x11u8; 14];
+
+        let mut sender = SrtpContext::new(&mk, &ms).unwrap();
+        let mut receiver = SrtpContext::new(&mk, &ms).unwrap();
+
+        let rtcp = make_rtcp_sr(0xDEADBEEF);
+        let protected = sender.protect_rtcp(&rtcp).unwrap();
+        let decrypted = receiver.unprotect_rtcp(&protected).unwrap();
+        assert_eq!(decrypted, rtcp);
+    }
+
+    #[test]
+    fn srtcp_header_stays_cleartext() {
+        let mk = [0x12u8; 16];
+        let ms = [0x13u8; 14];
+
+        let mut ctx = SrtpContext::new(&mk, &ms).unwrap();
+        let rtcp = make_rtcp_sr(0xCAFEBABE);
+        let protected = ctx.protect_rtcp(&rtcp).unwrap();
+
+        // First 8 bytes (V, PT, length, SSRC) must be identical.
+        assert_eq!(&protected[..8], &rtcp[..8]);
+    }
+
+    #[test]
+    fn srtcp_e_bit_set() {
+        let mk = [0x14u8; 16];
+        let ms = [0x15u8; 14];
+
+        let mut ctx = SrtpContext::new(&mk, &ms).unwrap();
+        let rtcp = make_rtcp_sr(0x11111111);
+        let protected = ctx.protect_rtcp(&rtcp).unwrap();
+
+        // SRTCP index is at [len - 14 .. len - 10] (before the 10-byte auth tag).
+        let idx_start = protected.len() - AUTH_TAG_LEN - SRTCP_INDEX_LEN;
+        let index_word = u32::from_be_bytes([
+            protected[idx_start],
+            protected[idx_start + 1],
+            protected[idx_start + 2],
+            protected[idx_start + 3],
+        ]);
+        assert_ne!(index_word & 0x80000000, 0, "E-bit must be set");
+        assert_eq!(index_word & 0x7FFFFFFF, 0, "first packet index should be 0");
+    }
+
+    #[test]
+    fn srtcp_index_increments() {
+        let mk = [0x16u8; 16];
+        let ms = [0x17u8; 14];
+
+        let mut ctx = SrtpContext::new(&mk, &ms).unwrap();
+        let rtcp = make_rtcp_sr(0x22222222);
+
+        for expected_idx in 0u32..5 {
+            let protected = ctx.protect_rtcp(&rtcp).unwrap();
+            let idx_start = protected.len() - AUTH_TAG_LEN - SRTCP_INDEX_LEN;
+            let index_word = u32::from_be_bytes([
+                protected[idx_start],
+                protected[idx_start + 1],
+                protected[idx_start + 2],
+                protected[idx_start + 3],
+            ]);
+            assert_eq!(index_word & 0x7FFFFFFF, expected_idx);
+        }
+    }
+
+    #[test]
+    fn srtcp_tampered_auth_fails() {
+        let mk = [0x18u8; 16];
+        let ms = [0x19u8; 14];
+
+        let mut sender = SrtpContext::new(&mk, &ms).unwrap();
+        let mut receiver = SrtpContext::new(&mk, &ms).unwrap();
+
+        let rtcp = make_rtcp_sr(0x33333333);
+        let mut protected = sender.protect_rtcp(&rtcp).unwrap();
+
+        // Flip a byte in the encrypted payload.
+        protected[10] ^= 0xFF;
+
+        let result = receiver.unprotect_rtcp(&protected);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("authentication"));
+    }
+
+    #[test]
+    fn srtcp_replay_detected() {
+        let mk = [0x1Au8; 16];
+        let ms = [0x1Bu8; 14];
+
+        let mut sender = SrtpContext::new(&mk, &ms).unwrap();
+        let mut receiver = SrtpContext::new(&mk, &ms).unwrap();
+
+        let rtcp = make_rtcp_sr(0x44444444);
+        let protected = sender.protect_rtcp(&rtcp).unwrap();
+
+        // First unprotect succeeds.
+        assert!(receiver.unprotect_rtcp(&protected).is_ok());
+
+        // Replay is rejected.
+        let result = receiver.unprotect_rtcp(&protected);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("replay"));
+    }
+
+    #[test]
+    fn srtcp_wrong_key_fails() {
+        let mk_a = [0x1Cu8; 16];
+        let mk_b = [0x1Du8; 16];
+        let ms = [0x1Eu8; 14];
+
+        let mut sender = SrtpContext::new(&mk_a, &ms).unwrap();
+        let mut receiver = SrtpContext::new(&mk_b, &ms).unwrap();
+
+        let rtcp = make_rtcp_sr(0x55555555);
+        let protected = sender.protect_rtcp(&rtcp).unwrap();
+        assert!(receiver.unprotect_rtcp(&protected).is_err());
+    }
+
+    #[test]
+    fn srtcp_protect_too_short_fails() {
+        let mk = [0x1Fu8; 16];
+        let ms = [0x20u8; 14];
+        let mut ctx = SrtpContext::new(&mk, &ms).unwrap();
+        assert!(ctx.protect_rtcp(&[0; 4]).is_err());
+    }
+
+    #[test]
+    fn srtcp_unprotect_too_short_fails() {
+        let mk = [0x21u8; 16];
+        let ms = [0x22u8; 14];
+        let mut ctx = SrtpContext::new(&mk, &ms).unwrap();
+        // Need at least 22 bytes (8 + 4 + 10).
+        assert!(ctx.unprotect_rtcp(&[0; 21]).is_err());
+    }
+
+    #[test]
+    fn srtcp_key_derivation_differs_from_srtp() {
+        let mk = [0x23u8; 16];
+        let ms = [0x24u8; 14];
+
+        let srtp_ck = derive_session_key(&mk, &ms, LABEL_CIPHER_KEY, 16);
+        let srtcp_ck = derive_session_key(&mk, &ms, LABEL_SRTCP_CIPHER_KEY, 16);
+        assert_ne!(srtp_ck, srtcp_ck, "SRTP and SRTCP cipher keys must differ");
+
+        let srtp_ak = derive_session_key(&mk, &ms, LABEL_AUTH_KEY, 20);
+        let srtcp_ak = derive_session_key(&mk, &ms, LABEL_SRTCP_AUTH_KEY, 20);
+        assert_ne!(srtp_ak, srtcp_ak, "SRTP and SRTCP auth keys must differ");
+
+        let srtp_salt = derive_session_key(&mk, &ms, LABEL_SALT, 14);
+        let srtcp_salt = derive_session_key(&mk, &ms, LABEL_SRTCP_SALT, 14);
+        assert_ne!(srtp_salt, srtcp_salt, "SRTP and SRTCP salts must differ");
+    }
+
+    #[test]
+    fn srtcp_multiple_packets_round_trip() {
+        let mk = [0x25u8; 16];
+        let ms = [0x26u8; 14];
+
+        let mut sender = SrtpContext::new(&mk, &ms).unwrap();
+        let mut receiver = SrtpContext::new(&mk, &ms).unwrap();
+
+        for i in 0u32..20 {
+            let rtcp = make_rtcp_sr(0xAA000000 | i);
+            let protected = sender.protect_rtcp(&rtcp).unwrap();
+            let decrypted = receiver.unprotect_rtcp(&protected).unwrap();
+            assert_eq!(decrypted, rtcp, "mismatch at SRTCP index {}", i);
+        }
+    }
+
+    #[test]
+    fn srtcp_out_of_order_within_window() {
+        let mk = [0x27u8; 16];
+        let ms = [0x28u8; 14];
+
+        let mut sender = SrtpContext::new(&mk, &ms).unwrap();
+        let mut receiver = SrtpContext::new(&mk, &ms).unwrap();
+
+        // Protect 5 RTCP packets.
+        let rtcp = make_rtcp_sr(0xBBBBBBBB);
+        let mut protected = Vec::new();
+        for _ in 0..5 {
+            protected.push(sender.protect_rtcp(&rtcp).unwrap());
+        }
+
+        // Receive in reverse order — all should succeed within the replay window.
+        for (i, pkt) in protected.iter().rev().enumerate() {
+            let result = receiver.unprotect_rtcp(pkt);
+            assert!(result.is_ok(), "reverse packet {} should succeed", i);
+        }
     }
 }
