@@ -11,7 +11,7 @@ use crate::config::DialOptions;
 use crate::dialog::Dialog;
 use crate::dtmf;
 use crate::error::{Error, Result};
-use crate::media::{self, MediaChannels, MediaConfig, MediaHandle, MediaTransport};
+use crate::media::{self, MediaChannels, MediaConfig, MediaTransport};
 use crate::sdp;
 use crate::srtp::SrtpContext;
 use crate::types::*;
@@ -145,8 +145,7 @@ struct CallInner {
     srtp_remote_key: String,
 
     rtp_socket: Option<Arc<UdpSocket>>,
-    media_handle: Option<MediaHandle>,
-    media_channels: Option<Arc<MediaChannels>>,
+    media_streams: Vec<media::MediaStream>,
     media_shared: Option<Arc<media::MediaSharedState>>,
 
     on_ended_fn: Option<Arc<dyn Fn(EndReason) + Send + Sync>>,
@@ -198,8 +197,7 @@ impl Call {
                 srtp_local_key: String::new(),
                 srtp_remote_key: String::new(),
                 rtp_socket: None,
-                media_handle: None,
-                media_channels: None,
+                media_streams: Vec::new(),
                 media_shared: None,
                 on_ended_fn: None,
                 on_ended_internal: None,
@@ -243,8 +241,7 @@ impl Call {
                 srtp_local_key: String::new(),
                 srtp_remote_key: String::new(),
                 rtp_socket: None,
-                media_handle: None,
-                media_channels: None,
+                media_streams: Vec::new(),
                 media_shared: None,
                 on_ended_fn: None,
                 on_ended_internal: None,
@@ -649,6 +646,9 @@ impl Call {
             CallState::Dialing | CallState::RemoteRinging | CallState::EarlyMedia => {
                 let _ = self.dlg.send_cancel();
                 inner.state = CallState::Ended;
+                for s in &mut inner.media_streams {
+                    s.stop();
+                }
                 Self::fire_on_state(&inner, CallState::Ended);
                 Self::fire_on_ended(&mut inner, EndReason::Cancelled);
                 Ok(())
@@ -656,8 +656,8 @@ impl Call {
             CallState::Active | CallState::OnHold => {
                 let _ = self.dlg.send_bye();
                 inner.state = CallState::Ended;
-                if let Some(ref mut h) = inner.media_handle {
-                    h.stop();
+                for s in &mut inner.media_streams {
+                    s.stop();
                 }
                 Self::fire_on_state(&inner, CallState::Ended);
                 Self::fire_on_ended(&mut inner, EndReason::Local);
@@ -705,6 +705,9 @@ impl Call {
                 return Err(Error::AlreadyMuted);
             }
             inner.muted = true;
+            for s in &inner.media_streams {
+                s.muted.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
             on_mute = inner.on_mute_fn.clone();
         }
         if let Some(f) = on_mute {
@@ -725,6 +728,55 @@ impl Call {
                 return Err(Error::NotMuted);
             }
             inner.muted = false;
+            for s in &inner.media_streams {
+                s.muted.store(false, std::sync::atomic::Ordering::Relaxed);
+            }
+            on_unmute = inner.on_unmute_fn.clone();
+        }
+        if let Some(f) = on_unmute {
+            spawn_callback(move || f());
+        }
+        Ok(())
+    }
+
+    /// Mutes only the audio stream. Returns an error if already muted or not active.
+    pub fn mute_audio(&self) -> Result<()> {
+        let on_mute;
+        {
+            let mut inner = self.inner.lock();
+            if inner.state != CallState::Active {
+                return Err(Error::InvalidState);
+            }
+            if inner.muted {
+                return Err(Error::AlreadyMuted);
+            }
+            inner.muted = true;
+            if let Some(s) = inner.media_streams.first() {
+                s.muted.store(true, std::sync::atomic::Ordering::Relaxed);
+            }
+            on_mute = inner.on_mute_fn.clone();
+        }
+        if let Some(f) = on_mute {
+            spawn_callback(move || f());
+        }
+        Ok(())
+    }
+
+    /// Unmutes only the audio stream. Returns an error if not muted or not active.
+    pub fn unmute_audio(&self) -> Result<()> {
+        let on_unmute;
+        {
+            let mut inner = self.inner.lock();
+            if inner.state != CallState::Active {
+                return Err(Error::InvalidState);
+            }
+            if !inner.muted {
+                return Err(Error::NotMuted);
+            }
+            inner.muted = false;
+            if let Some(s) = inner.media_streams.first() {
+                s.muted.store(false, std::sync::atomic::Ordering::Relaxed);
+            }
             on_unmute = inner.on_unmute_fn.clone();
         }
         if let Some(f) = on_unmute {
@@ -818,8 +870,8 @@ impl Call {
             let _ = self.dlg.send_bye();
         }
         inner.state = CallState::Ended;
-        if let Some(ref mut h) = inner.media_handle {
-            h.stop();
+        for s in &mut inner.media_streams {
+            s.stop();
         }
         Self::fire_on_state(&inner, CallState::Ended);
         Self::fire_on_ended(&mut inner, reason);
@@ -898,8 +950,8 @@ impl Call {
             EndReason::Remote
         };
         inner.state = CallState::Ended;
-        if let Some(ref mut h) = inner.media_handle {
-            h.stop();
+        for s in &mut inner.media_streams {
+            s.stop();
         }
         Self::fire_on_state(&inner, CallState::Ended);
         Self::fire_on_ended(&mut inner, reason);
@@ -1030,7 +1082,7 @@ impl Call {
 
     /// Starts the media pipeline if an RTP socket is available and remote endpoint is known.
     fn start_media_pipeline(inner: &mut CallInner) {
-        if inner.media_handle.is_some() {
+        if !inner.media_streams.is_empty() {
             return; // already started
         }
         let socket = match inner.rtp_socket.as_ref() {
@@ -1108,14 +1160,15 @@ impl Call {
             rtcp_remote_addr,
             ..MediaConfig::default()
         };
-        let handle = media::start_media(
+        let muted = Arc::new(std::sync::atomic::AtomicBool::new(inner.muted));
+        let stream = media::start_media(
             config,
             Arc::clone(&channels),
             Arc::clone(&shared),
             Some(transport),
+            muted,
         );
-        inner.media_handle = Some(handle);
-        inner.media_channels = Some(channels);
+        inner.media_streams.push(stream);
         inner.media_shared = Some(shared);
     }
 
@@ -1212,45 +1265,45 @@ impl Call {
     pub fn rtp_writer(&self) -> Option<crossbeam_channel::Sender<RtpPacket>> {
         self.inner
             .lock()
-            .media_channels
-            .as_ref()
-            .map(|c| c.rtp_writer.tx.clone())
+            .media_streams
+            .first()
+            .map(|s| s.channels.rtp_writer.tx.clone())
     }
 
     /// Returns the RTP reader receiver (post-jitter-buffer, reordered).
     pub fn rtp_reader(&self) -> Option<crossbeam_channel::Receiver<RtpPacket>> {
         self.inner
             .lock()
-            .media_channels
-            .as_ref()
-            .map(|c| c.rtp_reader.rx.clone())
+            .media_streams
+            .first()
+            .map(|s| s.channels.rtp_reader.rx.clone())
     }
 
     /// Returns the RTP raw reader receiver (pre-jitter-buffer, wire order).
     pub fn rtp_raw_reader(&self) -> Option<crossbeam_channel::Receiver<RtpPacket>> {
         self.inner
             .lock()
-            .media_channels
-            .as_ref()
-            .map(|c| c.rtp_raw_reader.rx.clone())
+            .media_streams
+            .first()
+            .map(|s| s.channels.rtp_raw_reader.rx.clone())
     }
 
     /// Returns the PCM writer sender (for sending PCM samples for encoding + sending).
     pub fn pcm_writer(&self) -> Option<crossbeam_channel::Sender<Vec<i16>>> {
         self.inner
             .lock()
-            .media_channels
-            .as_ref()
-            .map(|c| c.pcm_writer.tx.clone())
+            .media_streams
+            .first()
+            .map(|s| s.channels.pcm_writer.tx.clone())
     }
 
     /// Returns the PCM reader receiver (decoded PCM from inbound RTP).
     pub fn pcm_reader(&self) -> Option<crossbeam_channel::Receiver<Vec<i16>>> {
         self.inner
             .lock()
-            .media_channels
-            .as_ref()
-            .map(|c| c.pcm_reader.rx.clone())
+            .media_streams
+            .first()
+            .map(|s| s.channels.pcm_reader.rx.clone())
     }
 }
 
