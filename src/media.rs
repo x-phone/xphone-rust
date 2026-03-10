@@ -113,6 +113,10 @@ pub struct MediaChannels {
     pub pcm_reader: ChannelPair<Vec<i16>>,
     /// PCM from user for encoding + sending.
     pub pcm_writer: ChannelPair<Vec<i16>>,
+    /// Assembled video frames from inbound RTP (after depacketization).
+    pub video_frame_reader: ChannelPair<VideoFrame>,
+    /// Video frames from user for packetization + sending.
+    pub video_frame_writer: ChannelPair<VideoFrame>,
     /// Test hook: outbound packets copied here.
     pub sent_rtp: Option<ChannelPair<RtpPacket>>,
 }
@@ -127,6 +131,8 @@ impl MediaChannels {
             rtp_writer: ChannelPair::new(),
             pcm_reader: ChannelPair::new(),
             pcm_writer: ChannelPair::new(),
+            video_frame_reader: ChannelPair::new(),
+            video_frame_writer: ChannelPair::new(),
             sent_rtp: None,
         }
     }
@@ -733,6 +739,10 @@ pub struct VideoMediaConfig {
     pub rtcp_socket: Option<Arc<UdpSocket>>,
     /// Remote RTCP address for video.
     pub rtcp_remote_addr: Option<SocketAddr>,
+    /// Negotiated video codec for frame assembly/fragmentation.
+    pub video_codec: Option<VideoCodec>,
+    /// RTP payload type for outbound video (from SDP negotiation).
+    pub video_payload_type: u8,
 }
 
 /// Start a video media pipeline on a dedicated std::thread.
@@ -813,12 +823,22 @@ pub fn start_video_media(
     let rtcp_socket_for_thread = rtcp_socket;
     let muted_for_thread = Arc::clone(&muted);
     let channels_for_thread = Arc::clone(&channels);
+    let video_codec = config.video_codec;
+    let video_pt = config.video_payload_type;
     let thread = std::thread::spawn(move || {
         let channels = channels_for_thread;
         let out_ssrc = rand_u32();
 
         let mut rtcp_stats = RtcpStats::new();
         let rtcp_tick = crossbeam_channel::tick(Duration::from_secs(rtcp::RTCP_INTERVAL_SECS));
+
+        // Create depacketizer/packetizer if a video codec is configured.
+        let mut depacketizer: Option<Box<dyn crate::video::VideoDepacketizer>> =
+            video_codec.map(crate::video::new_depacketizer);
+        let mut packetizer: Option<Box<dyn crate::video::VideoPacketizer>> =
+            video_codec.map(crate::video::new_packetizer);
+        let mut out_seq: u16 = rand_u32() as u16;
+        let out_pt: u8 = video_pt;
 
         loop {
             crossbeam_channel::select! {
@@ -836,6 +856,18 @@ pub fn start_video_media(
                         &channels.rtp_raw_reader.rx,
                         clone_packet(&pkt),
                     );
+
+                    // Run depacketizer to produce assembled frames.
+                    if let Some(ref mut depkt) = depacketizer {
+                        if let Some(frame) = depkt.depacketize(&pkt) {
+                            send_drop_oldest(
+                                &channels.video_frame_reader.tx,
+                                &channels.video_frame_reader.rx,
+                                frame,
+                            );
+                        }
+                    }
+
                     send_drop_oldest(
                         &channels.rtp_reader.tx,
                         &channels.rtp_reader.rx,
@@ -843,6 +875,7 @@ pub fn start_video_media(
                     );
                 },
 
+                // Raw RTP writer (bypass packetizer).
                 recv(channels.rtp_writer.rx) -> msg => {
                     let pkt = match msg {
                         Ok(p) => p,
@@ -857,6 +890,48 @@ pub fn start_video_media(
                     }
                     if let Some(ref tr) = transport_for_thread {
                         send_rtp_to_transport(pkt.to_bytes(), &srtp_out_for_thread, tr, None);
+                    }
+                },
+
+                // VideoFrame writer → packetize → send as RTP.
+                recv(channels.video_frame_writer.rx) -> msg => {
+                    let frame = match msg {
+                        Ok(f) => f,
+                        Err(_) => return,
+                    };
+                    if muted_for_thread.load(Ordering::Relaxed) {
+                        continue;
+                    }
+                    if let Some(ref mut pktizer) = packetizer {
+                        let payloads = pktizer.packetize(&frame, 1200);
+                        let num = payloads.len();
+                        for (i, payload) in payloads.into_iter().enumerate() {
+                            let marker = i == num - 1;
+                            let rtp = RtpPacket {
+                                header: RtpHeader {
+                                    version: 2,
+                                    marker,
+                                    payload_type: out_pt,
+                                    sequence_number: out_seq,
+                                    timestamp: frame.timestamp,
+                                    ssrc: out_ssrc,
+                                },
+                                payload,
+                            };
+                            out_seq = out_seq.wrapping_add(1);
+                            rtcp_stats.record_rtp_sent(rtp.payload.len(), rtp.header.timestamp);
+                            if let Some(ref sent) = channels.sent_rtp {
+                                send_drop_oldest(&sent.tx, &sent.rx, clone_packet(&rtp));
+                            }
+                            if let Some(ref tr) = transport_for_thread {
+                                send_rtp_to_transport(
+                                    rtp.to_bytes(),
+                                    &srtp_out_for_thread,
+                                    tr,
+                                    None,
+                                );
+                            }
+                        }
                     }
                 },
 
@@ -1512,6 +1587,8 @@ mod tests {
             srtp_outbound: None,
             rtcp_socket: None,
             rtcp_remote_addr: None,
+            video_codec: None, // no depacketizer/packetizer in basic tests
+            video_payload_type: 96,
         };
         start_video_media(config, ch, None, muted)
     }

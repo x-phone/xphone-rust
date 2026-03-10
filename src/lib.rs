@@ -27,6 +27,7 @@ pub mod subscription;
 pub mod transport;
 pub mod turn;
 pub mod types;
+pub mod video;
 
 // Re-export the primary public API at the crate root.
 pub use call::Call;

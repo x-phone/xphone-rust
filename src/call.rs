@@ -919,16 +919,22 @@ impl Call {
             .map(|s| s.channels.rtp_writer.tx.clone())
     }
 
-    /// Returns the assembled video frame reader. Returns `None` until
-    /// packetization is implemented (PR 4).
+    /// Returns the assembled video frame reader (depacketized from inbound RTP).
     pub fn video_reader(&self) -> Option<crossbeam_channel::Receiver<VideoFrame>> {
-        None
+        self.inner
+            .lock()
+            .media_streams
+            .get(1)
+            .map(|s| s.channels.video_frame_reader.rx.clone())
     }
 
-    /// Returns the assembled video frame writer. Returns `None` until
-    /// packetization is implemented (PR 4).
+    /// Returns the assembled video frame writer (packetized into outbound RTP).
     pub fn video_writer(&self) -> Option<crossbeam_channel::Sender<VideoFrame>> {
-        None
+        self.inner
+            .lock()
+            .media_streams
+            .get(1)
+            .map(|s| s.channels.video_frame_writer.tx.clone())
     }
 
     /// Sets the video RTP port (called during call setup).
@@ -1380,6 +1386,11 @@ impl Call {
             srtp_outbound: None,
             rtcp_socket: video_rtcp_socket,
             rtcp_remote_addr: video_rtcp_addr,
+            video_codec: inner.video_codec,
+            video_payload_type: inner
+                .video_codec
+                .map(|c| c.default_payload_type())
+                .unwrap_or(96),
         };
         let video_muted = Arc::new(std::sync::atomic::AtomicBool::new(inner.video_muted));
         let video_stream = media::start_video_media(
