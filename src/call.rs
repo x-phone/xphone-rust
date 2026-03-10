@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::net::UdpSocket;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -15,6 +16,62 @@ use crate::media::{self, MediaChannels, MediaConfig, MediaTransport};
 use crate::sdp;
 use crate::srtp::SrtpContext;
 use crate::types::*;
+
+/// A pending video upgrade request from the remote party.
+///
+/// Created when the remote sends a re-INVITE adding video to an existing audio call.
+/// The application must call [`accept()`](Self::accept) or [`reject()`](Self::reject)
+/// to respond. If dropped without responding, the request is automatically rejected
+/// (safe default — no video without explicit consent).
+pub struct VideoUpgradeRequest {
+    call: Arc<Call>,
+    reinvite_dlg: Arc<dyn Dialog>,
+    remote_sdp: String,
+    sess: sdp::Session,
+    video_socket: Option<(UdpSocket, u16)>,
+    responded: Arc<AtomicBool>,
+}
+
+// SAFETY: All fields are Send+Sync (Dialog is Send+Sync, UdpSocket is Send).
+unsafe impl Send for VideoUpgradeRequest {}
+unsafe impl Sync for VideoUpgradeRequest {}
+
+impl VideoUpgradeRequest {
+    /// Accepts the video upgrade. Allocates video resources, builds an SDP answer
+    /// with video, sends 200 OK, starts the video pipeline, and fires the `on_video` callback.
+    pub fn accept(&self) {
+        if self.responded.swap(true, Ordering::SeqCst) {
+            return; // already responded
+        }
+        self.call.accept_video_internal(
+            &self.reinvite_dlg,
+            &self.sess,
+            &self.remote_sdp,
+            &self.video_socket,
+        );
+    }
+
+    /// Rejects the video upgrade. Sends 200 OK with audio-only SDP (video m= line
+    /// set to port 0 per RFC 3264). The audio call continues unchanged.
+    pub fn reject(&self) {
+        if self.responded.swap(true, Ordering::SeqCst) {
+            return; // already responded
+        }
+        self.call
+            .reject_video_internal(&self.reinvite_dlg, &self.sess, &self.remote_sdp);
+    }
+}
+
+impl Drop for VideoUpgradeRequest {
+    fn drop(&mut self) {
+        // Auto-reject if the app didn't respond — safe default.
+        if !self.responded.load(Ordering::SeqCst) {
+            self.responded.store(true, Ordering::SeqCst);
+            self.call
+                .reject_video_internal(&self.reinvite_dlg, &self.sess, &self.remote_sdp);
+        }
+    }
+}
 
 /// Default codec preference order (payload types).
 const DEFAULT_CODEC_PREFS: &[i32] = &[8, 0, 9, 101, 111];
@@ -168,6 +225,8 @@ struct CallInner {
     on_resume_fn: Option<Arc<dyn Fn() + Send + Sync>>,
     on_mute_fn: Option<Arc<dyn Fn() + Send + Sync>>,
     on_unmute_fn: Option<Arc<dyn Fn() + Send + Sync>>,
+    on_video_fn: Option<Arc<dyn Fn() + Send + Sync>>,
+    on_video_request_fn: Option<Arc<dyn Fn(VideoUpgradeRequest) + Send + Sync>>,
 
     session_timer: Option<std::thread::JoinHandle<()>>,
     session_timer_cancel: Option<Arc<std::sync::atomic::AtomicBool>>,
@@ -226,6 +285,8 @@ impl Call {
                 on_resume_fn: None,
                 on_mute_fn: None,
                 on_unmute_fn: None,
+                on_video_fn: None,
+                on_video_request_fn: None,
                 session_timer: None,
                 session_timer_cancel: None,
             }),
@@ -277,6 +338,8 @@ impl Call {
                 on_resume_fn: None,
                 on_mute_fn: None,
                 on_unmute_fn: None,
+                on_video_fn: None,
+                on_video_request_fn: None,
                 session_timer: None,
                 session_timer_cancel: None,
             }),
@@ -482,6 +545,27 @@ impl Call {
             .map(|m| m.codecs.as_slice())
             .unwrap_or(&[]);
         let prefs = Self::resolve_codec_prefs(inner);
+
+        // If remote offers video and we have a video socket, build audio+video answer.
+        if remote.has_video() && inner.video_rtp_socket.is_some() {
+            let empty_rtpmap: Vec<(i32, String)> = Vec::new();
+            let remote_video_rtpmap = remote
+                .video_media()
+                .map(|vm| vm.rtpmap.as_slice())
+                .unwrap_or(&empty_rtpmap);
+            let local_video = &[VideoCodec::H264, VideoCodec::VP8];
+            return sdp::build_answer_video(
+                &inner.local_ip,
+                inner.rtp_port,
+                prefs,
+                remote_codecs,
+                inner.video_rtp_port,
+                local_video,
+                remote_video_rtpmap,
+                direction,
+            );
+        }
+
         if inner.srtp_enabled && !inner.srtp_local_key.is_empty() {
             sdp::build_answer_srtp(
                 &inner.local_ip,
@@ -577,6 +661,8 @@ impl Call {
         inner.on_resume_fn = None;
         inner.on_mute_fn = None;
         inner.on_unmute_fn = None;
+        inner.on_video_fn = None;
+        inner.on_video_request_fn = None;
     }
 
     // --- Session timer ---
@@ -819,6 +905,57 @@ impl Call {
             spawn_callback(move || f());
         }
         Ok(())
+    }
+
+    /// Sends a re-INVITE to add video to an existing audio call.
+    ///
+    /// Allocates a video RTP socket, builds an audio+video SDP offer, and sends
+    /// a re-INVITE. The remote party's response will negotiate the video codec
+    /// and start the video pipeline (handled via the re-INVITE response path).
+    pub fn add_video(
+        &self,
+        video_codecs: &[VideoCodec],
+        rtp_port_min: u16,
+        rtp_port_max: u16,
+    ) -> Result<()> {
+        if video_codecs.is_empty() {
+            return Err(Error::Other("no video codecs specified".into()));
+        }
+
+        // Allocate video socket outside the lock.
+        let (vsock, vport) = crate::media::listen_rtp_port(rtp_port_min, rtp_port_max)
+            .map_err(|e| Error::Other(format!("failed to allocate video port: {e}")))?;
+
+        let local_sdp;
+        {
+            let mut inner = self.inner.lock();
+            if inner.state != CallState::Active {
+                return Err(Error::InvalidState);
+            }
+            if inner.video_codec.is_some() {
+                return Err(Error::Other("video already active".into()));
+            }
+
+            inner.video_rtp_port = vport as i32;
+            inner.video_rtp_socket = Some(Arc::new(vsock));
+
+            if inner.local_ip.is_empty() {
+                inner.local_ip = "127.0.0.1".into();
+            }
+            let prefs = Self::resolve_codec_prefs(&inner);
+            inner.local_sdp = sdp::build_offer_video(
+                &inner.local_ip,
+                inner.rtp_port,
+                prefs,
+                inner.video_rtp_port,
+                video_codecs,
+                sdp::DIR_SEND_RECV,
+            );
+            local_sdp = inner.local_sdp.clone();
+        }
+
+        // Send re-INVITE with video SDP (outside the lock — network I/O).
+        self.dlg.send_reinvite(local_sdp.as_bytes())
     }
 
     /// Returns true if this call has a negotiated video stream.
@@ -1197,6 +1334,260 @@ impl Call {
         }
     }
 
+    /// Handles a mid-dialog re-INVITE (video upgrade, video downgrade, or hold/resume).
+    ///
+    /// - **Video upgrade** (remote adds video): fires `on_video_request` callback with a
+    ///   [`VideoUpgradeRequest`] the app must accept or reject. If no callback is registered,
+    ///   the upgrade is automatically rejected (safe default — no video without consent).
+    /// - **Video downgrade** (remote removes video, port 0): stops the video pipeline.
+    /// - **Hold/resume** (audio-only): delegates to `simulate_reinvite`.
+    pub(crate) fn handle_reinvite(
+        self: &Arc<Self>,
+        reinvite_dlg: &Arc<dyn Dialog>,
+        remote_sdp: &str,
+        rtp_port_min: u16,
+        rtp_port_max: u16,
+    ) {
+        let sess = match sdp::parse(remote_sdp) {
+            Ok(s) => s,
+            Err(e) => {
+                tracing::warn!("failed to parse re-INVITE SDP: {}", e);
+                return;
+            }
+        };
+
+        // Check for video downgrade (m=video 0).
+        if let Some(vm) = sess.video_media() {
+            if vm.port == 0 && self.has_video() {
+                info!(call_id = %self.call_id(), "Video downgrade via re-INVITE");
+                self.stop_video_pipeline();
+                // Respond with matching audio-only SDP + m=video 0.
+                self.reject_video_internal(reinvite_dlg, &sess, remote_sdp);
+                return;
+            }
+        }
+
+        if !sess.has_video() {
+            // Audio-only re-INVITE — delegate to hold/resume handling.
+            self.simulate_reinvite_parsed(&sess, remote_sdp);
+            return;
+        }
+
+        // Video upgrade request — check if app registered a handler.
+        let (request_fn, need_socket) = {
+            let inner = self.inner.lock();
+            if inner.state == CallState::Ended {
+                return;
+            }
+            (
+                inner.on_video_request_fn.clone(),
+                inner.video_rtp_socket.is_none(),
+            )
+        };
+
+        // Pre-allocate video RTP socket outside the lock (blocking I/O).
+        let video_socket = if need_socket && rtp_port_min > 0 && rtp_port_max > 0 {
+            match crate::media::listen_rtp_port(rtp_port_min, rtp_port_max) {
+                Ok((vsock, vport)) => Some((vsock, vport)),
+                Err(e) => {
+                    tracing::error!("failed to allocate video RTP socket: {}", e);
+                    return;
+                }
+            }
+        } else {
+            None
+        };
+
+        let request = VideoUpgradeRequest {
+            call: Arc::clone(self),
+            reinvite_dlg: Arc::clone(reinvite_dlg),
+            remote_sdp: remote_sdp.to_string(),
+            sess,
+            video_socket,
+            responded: Arc::new(AtomicBool::new(false)),
+        };
+
+        if let Some(f) = request_fn {
+            // App decides whether to accept or reject.
+            spawn_callback(move || f(request));
+        } else {
+            // No handler — auto-reject (safe default).
+            info!(call_id = %self.call_id(), "No on_video_request handler — rejecting video upgrade");
+            request.reject();
+        }
+    }
+
+    /// Internal: accepts a video upgrade (called by VideoUpgradeRequest::accept).
+    fn accept_video_internal(
+        &self,
+        reinvite_dlg: &Arc<dyn Dialog>,
+        sess: &sdp::Session,
+        remote_sdp: &str,
+        video_socket: &Option<(UdpSocket, u16)>,
+    ) {
+        let local_sdp;
+        {
+            let mut inner = self.inner.lock();
+            if inner.state == CallState::Ended {
+                return;
+            }
+
+            // Install pre-allocated video socket.
+            if let Some((ref vsock, vport)) = *video_socket {
+                match vsock.try_clone() {
+                    Ok(cloned) => {
+                        inner.video_rtp_port = vport as i32;
+                        inner.video_rtp_socket = Some(Arc::new(cloned));
+                    }
+                    Err(e) => {
+                        tracing::error!("failed to clone video socket: {}", e);
+                        return;
+                    }
+                }
+            }
+
+            // Update remote SDP and endpoint.
+            inner.remote_sdp = remote_sdp.to_string();
+            Self::set_remote_endpoint(&mut inner, sess);
+            Self::negotiate_codec(&mut inner, sess);
+
+            // Build SDP answer with video.
+            inner.local_sdp = Self::build_answer_sdp(&mut inner, sess, sdp::DIR_SEND_RECV);
+            local_sdp = inner.local_sdp.clone();
+
+            // Start the video media pipeline (fires on_video callback internally).
+            Self::start_video_pipeline(&mut inner);
+        }
+
+        // Send 200 OK via the re-INVITE dialog (outside the lock — network I/O).
+        if let Err(e) = reinvite_dlg.respond(200, "OK", local_sdp.as_bytes()) {
+            tracing::error!("failed to send 200 OK for video re-INVITE: {}", e);
+        }
+    }
+
+    /// Internal: rejects a video upgrade (called by VideoUpgradeRequest::reject/Drop).
+    /// Sends 200 OK with audio-only SDP + `m=video 0` (RFC 3264 rejection).
+    fn reject_video_internal(
+        &self,
+        reinvite_dlg: &Arc<dyn Dialog>,
+        sess: &sdp::Session,
+        remote_sdp: &str,
+    ) {
+        let local_sdp;
+        {
+            let mut inner = self.inner.lock();
+            if inner.state == CallState::Ended {
+                return;
+            }
+
+            // Update remote SDP and endpoint (audio may have changed).
+            // Only negotiate audio codec — we're rejecting video.
+            inner.remote_sdp = remote_sdp.to_string();
+            inner.remote_ip = sess.connection.clone();
+            if let Some(m) = sess.audio_media() {
+                inner.remote_port = m.port;
+            }
+            let remote_audio: &[i32] = sess
+                .audio_media()
+                .map(|m| m.codecs.as_slice())
+                .unwrap_or(&[]);
+            let prefs_for_negotiate = Self::resolve_codec_prefs(&inner);
+            let pt = sdp::negotiate_codec(prefs_for_negotiate, remote_audio);
+            if pt >= 0 {
+                if let Some(c) = Codec::from_payload_type(pt) {
+                    inner.codec = c;
+                }
+            }
+
+            // Build audio-only answer (build_answer_sdp won't include video
+            // because we haven't set a video socket for this call).
+            // Append explicit m=video 0 to match the remote's video m= line count.
+            let prefs = Self::resolve_codec_prefs(&inner);
+            let remote_codecs: &[i32] = sess
+                .audio_media()
+                .map(|m| m.codecs.as_slice())
+                .unwrap_or(&[]);
+            let mut answer = sdp::build_answer(
+                &inner.local_ip,
+                inner.rtp_port,
+                prefs,
+                remote_codecs,
+                sdp::DIR_SEND_RECV,
+            );
+            if sess.video_media().is_some() {
+                answer.push_str("m=video 0 RTP/AVP 0\r\n");
+            }
+            inner.local_sdp = answer.clone();
+            local_sdp = answer;
+        }
+
+        // Send 200 OK with audio-only SDP (outside the lock).
+        if let Err(e) = reinvite_dlg.respond(200, "OK", local_sdp.as_bytes()) {
+            tracing::error!("failed to send 200 OK rejecting video: {}", e);
+        }
+    }
+
+    /// Stops the video media pipeline (for video downgrade).
+    fn stop_video_pipeline(&self) {
+        let mut inner = self.inner.lock();
+        // Remove video stream (index 1) if present.
+        if inner.media_streams.len() >= 2 {
+            let mut video_stream = inner.media_streams.remove(1);
+            video_stream.stop();
+        }
+        inner.video_codec = None;
+        inner.video_rtp_socket = None;
+        inner.video_rtcp_socket = None;
+        inner.video_rtp_port = 0;
+        inner.video_remote_port = 0;
+    }
+
+    /// Internal: simulate_reinvite with an already-parsed SDP session (avoids double parse).
+    fn simulate_reinvite_parsed(&self, sess: &sdp::Session, raw_sdp: &str) {
+        let mut inner = self.inner.lock();
+        if inner.state == CallState::Ended {
+            return;
+        }
+
+        inner.remote_sdp = raw_sdp.to_string();
+        Self::set_remote_endpoint(&mut inner, sess);
+
+        let dir = sess.dir();
+        let mut hold_fn = None;
+        let mut resume_fn = None;
+        let mut new_state = None;
+
+        let is_hold_dir =
+            dir == sdp::DIR_SEND_ONLY || dir == sdp::DIR_RECV_ONLY || dir == sdp::DIR_INACTIVE;
+        match (is_hold_dir, inner.state) {
+            (true, CallState::Active) => {
+                inner.state = CallState::OnHold;
+                hold_fn = inner.on_hold_fn.clone();
+                new_state = Some(CallState::OnHold);
+            }
+            (false, CallState::OnHold) if dir == sdp::DIR_SEND_RECV => {
+                inner.state = CallState::Active;
+                resume_fn = inner.on_resume_fn.clone();
+                new_state = Some(CallState::Active);
+            }
+            _ => {}
+        }
+
+        Self::negotiate_codec(&mut inner, sess);
+
+        if let Some(s) = new_state {
+            Self::fire_on_state(&inner, s);
+        }
+        drop(inner);
+
+        if let Some(f) = hold_fn {
+            spawn_callback(move || f());
+        }
+        if let Some(f) = resume_fn {
+            spawn_callback(move || f());
+        }
+    }
+
     /// Sets the remote SDP, parsing it to extract remote endpoint and codec info.
     pub fn set_remote_sdp(&self, raw_sdp: &str) {
         let mut inner = self.inner.lock();
@@ -1381,9 +1772,25 @@ impl Call {
             None
         };
 
+        let (video_srtp_in, video_srtp_out) = if inner.srtp_enabled
+            && !inner.srtp_local_key.is_empty()
+            && !inner.srtp_remote_key.is_empty()
+        {
+            let inbound = SrtpContext::from_sdes_inline(&inner.srtp_remote_key)
+                .map_err(|e| tracing::error!("Video SRTP inbound context failed: {}", e))
+                .ok();
+            let outbound =
+                SrtpContext::from_sdes_inline(&format!("inline:{}", inner.srtp_local_key))
+                    .map_err(|e| tracing::error!("Video SRTP outbound context failed: {}", e))
+                    .ok();
+            (inbound, outbound)
+        } else {
+            (None, None)
+        };
+
         let video_config = media::VideoMediaConfig {
-            srtp_inbound: None, // Video SRTP deferred
-            srtp_outbound: None,
+            srtp_inbound: video_srtp_in,
+            srtp_outbound: video_srtp_out,
             rtcp_socket: video_rtcp_socket,
             rtcp_remote_addr: video_rtcp_addr,
             video_codec: inner.video_codec,
@@ -1400,6 +1807,12 @@ impl Call {
             video_muted,
         );
         inner.media_streams.push(video_stream);
+
+        // Fire on_video callback so the app can start rendering.
+        if let Some(ref f) = inner.on_video_fn {
+            let f = Arc::clone(f);
+            spawn_callback(move || f());
+        }
     }
 
     /// Sends a SIP response via the dialog (e.g., 180 Ringing for inbound calls).
@@ -1451,6 +1864,19 @@ impl Call {
     /// Registers a callback invoked when the call is unmuted.
     pub fn on_unmute(&self, f: impl Fn() + Send + Sync + 'static) {
         self.inner.lock().on_unmute_fn = Some(Arc::new(f));
+    }
+
+    /// Registers a callback invoked when video is added to the call (e.g., via re-INVITE).
+    pub fn on_video(&self, f: impl Fn() + Send + Sync + 'static) {
+        self.inner.lock().on_video_fn = Some(Arc::new(f));
+    }
+
+    /// Registers a callback invoked when the remote requests a video upgrade via re-INVITE.
+    ///
+    /// The callback receives a [`VideoUpgradeRequest`] which must be accepted or rejected.
+    /// If no callback is registered, video upgrades are automatically rejected (safe default).
+    pub fn on_video_request(&self, f: impl Fn(VideoUpgradeRequest) + Send + Sync + 'static) {
+        self.inner.lock().on_video_request_fn = Some(Arc::new(f));
     }
 
     pub(crate) fn on_ended_internal(&self, f: impl Fn(EndReason) + Send + Sync + 'static) {
@@ -2808,5 +3234,215 @@ mod tests {
         // Check that video remote port was extracted.
         let inner = call.inner.lock();
         assert_eq!(inner.video_remote_port, 5002);
+    }
+
+    fn video_reinvite_sdp() -> &'static str {
+        "v=0\r\n\
+            o=- 0 0 IN IP4 10.0.0.1\r\n\
+            s=-\r\n\
+            c=IN IP4 10.0.0.1\r\n\
+            t=0 0\r\n\
+            m=audio 5000 RTP/AVP 0\r\n\
+            a=rtpmap:0 PCMU/8000\r\n\
+            a=sendrecv\r\n\
+            m=video 5002 RTP/AVP 96\r\n\
+            a=rtpmap:96 H264/90000\r\n\
+            a=fmtp:96 profile-level-id=42e01f;packetization-mode=1\r\n\
+            a=sendrecv\r\n"
+    }
+
+    #[test]
+    fn handle_reinvite_accepts_video() {
+        let call = Call::new_inbound(mock_dlg());
+        call.set_local_media("192.168.1.100", 5000);
+        call.accept().unwrap();
+        assert!(!call.has_video());
+
+        // Register handler that accepts.
+        call.on_video_request(|req| req.accept());
+
+        let reinvite_mock = mock_dlg();
+        let reinvite_dlg: Arc<dyn Dialog> = Arc::clone(&reinvite_mock) as _;
+
+        call.handle_reinvite(&reinvite_dlg, video_reinvite_sdp(), 10000, 20000);
+
+        // Callback runs on spawn_callback thread — wait briefly.
+        std::thread::sleep(Duration::from_millis(100));
+
+        assert!(call.has_video());
+        assert_eq!(call.video_codec(), Some(VideoCodec::H264));
+        // 200 OK should be sent via the re-INVITE dialog.
+        assert_eq!(reinvite_mock.last_response_code(), 200);
+        let body_bytes = reinvite_mock.last_response_body();
+        let body = String::from_utf8_lossy(&body_bytes);
+        assert!(body.contains("m=video"), "SDP should contain video m= line");
+        assert!(
+            body.contains("H264/90000"),
+            "SDP should contain H264 rtpmap"
+        );
+    }
+
+    #[test]
+    fn handle_reinvite_rejects_video_by_default() {
+        let call = Call::new_inbound(mock_dlg());
+        call.set_local_media("192.168.1.100", 5000);
+        call.accept().unwrap();
+
+        // No on_video_request handler — should auto-reject.
+        let reinvite_mock = mock_dlg();
+        let reinvite_dlg: Arc<dyn Dialog> = Arc::clone(&reinvite_mock) as _;
+
+        call.handle_reinvite(&reinvite_dlg, video_reinvite_sdp(), 10000, 20000);
+
+        assert!(!call.has_video());
+        // Should still send 200 OK (with audio + m=video 0).
+        assert_eq!(reinvite_mock.last_response_code(), 200);
+        let body_bytes = reinvite_mock.last_response_body();
+        let body = String::from_utf8_lossy(&body_bytes);
+        assert!(
+            body.contains("m=video 0"),
+            "SDP should reject video with port 0"
+        );
+    }
+
+    #[test]
+    fn handle_reinvite_reject_explicit() {
+        let call = Call::new_inbound(mock_dlg());
+        call.set_local_media("192.168.1.100", 5000);
+        call.accept().unwrap();
+
+        call.on_video_request(|req| req.reject());
+
+        let reinvite_mock = mock_dlg();
+        let reinvite_dlg: Arc<dyn Dialog> = Arc::clone(&reinvite_mock) as _;
+
+        call.handle_reinvite(&reinvite_dlg, video_reinvite_sdp(), 10000, 20000);
+
+        std::thread::sleep(Duration::from_millis(100));
+
+        assert!(!call.has_video());
+        assert_eq!(reinvite_mock.last_response_code(), 200);
+        let body_bytes = reinvite_mock.last_response_body();
+        let body = String::from_utf8_lossy(&body_bytes);
+        assert!(
+            body.contains("m=video 0"),
+            "SDP should reject video with port 0"
+        );
+    }
+
+    #[test]
+    fn handle_reinvite_fires_on_video_callback() {
+        let call = Call::new_inbound(mock_dlg());
+        let reinvite_dlg: Arc<dyn Dialog> = mock_dlg();
+        call.set_local_media("192.168.1.100", 5000);
+        call.accept().unwrap();
+
+        let (tx_video, rx_video) = mpsc::channel();
+        call.on_video(move || {
+            let _ = tx_video.send(());
+        });
+        call.on_video_request(|req| req.accept());
+
+        call.handle_reinvite(&reinvite_dlg, video_reinvite_sdp(), 10000, 20000);
+
+        assert!(
+            rx_video.recv_timeout(Duration::from_secs(2)).is_ok(),
+            "on_video callback should have fired"
+        );
+    }
+
+    #[test]
+    fn handle_reinvite_hold_delegates() {
+        let call = Call::new_inbound(mock_dlg());
+        call.set_local_media("192.168.1.100", 5000);
+        call.accept().unwrap();
+
+        let reinvite_dlg: Arc<dyn Dialog> = mock_dlg();
+        let hold_sdp = "v=0\r\n\
+            o=- 0 0 IN IP4 10.0.0.1\r\n\
+            s=-\r\n\
+            c=IN IP4 10.0.0.1\r\n\
+            t=0 0\r\n\
+            m=audio 5000 RTP/AVP 0\r\n\
+            a=rtpmap:0 PCMU/8000\r\n\
+            a=sendonly\r\n";
+
+        call.handle_reinvite(&reinvite_dlg, hold_sdp, 10000, 20000);
+        assert_eq!(call.state(), CallState::OnHold);
+        assert!(!call.has_video());
+    }
+
+    #[test]
+    fn handle_reinvite_on_ended_call_is_noop() {
+        let call = Call::new_inbound(mock_dlg());
+        call.accept().unwrap();
+        call.end().unwrap();
+
+        let reinvite_dlg: Arc<dyn Dialog> = mock_dlg();
+        call.handle_reinvite(&reinvite_dlg, video_reinvite_sdp(), 10000, 20000);
+        assert!(!call.has_video());
+    }
+
+    #[test]
+    fn video_downgrade_stops_pipeline() {
+        let call = Call::new_inbound(mock_dlg());
+        call.set_local_media("192.168.1.100", 5000);
+        call.accept().unwrap();
+
+        // Set up video via direct mutation (simulates an active video call).
+        {
+            let mut inner = call.inner.lock();
+            inner.video_codec = Some(VideoCodec::H264);
+        }
+        assert!(call.has_video());
+
+        // Remote sends re-INVITE with m=video 0 (downgrade).
+        let reinvite_dlg: Arc<dyn Dialog> = mock_dlg();
+        let downgrade_sdp = "v=0\r\n\
+            o=- 0 0 IN IP4 10.0.0.1\r\n\
+            s=-\r\n\
+            c=IN IP4 10.0.0.1\r\n\
+            t=0 0\r\n\
+            m=audio 5000 RTP/AVP 0\r\n\
+            a=rtpmap:0 PCMU/8000\r\n\
+            a=sendrecv\r\n\
+            m=video 0 RTP/AVP 0\r\n";
+
+        call.handle_reinvite(&reinvite_dlg, downgrade_sdp, 10000, 20000);
+        assert!(!call.has_video());
+    }
+
+    #[test]
+    fn add_video_sends_reinvite() {
+        let dlg = mock_dlg();
+        let call = Call::new_inbound(dlg.clone());
+        call.set_local_media("192.168.1.100", 5000);
+        call.accept().unwrap();
+
+        call.add_video(&[VideoCodec::H264], 10000, 20000).unwrap();
+
+        let sdp = dlg.last_reinvite_sdp();
+        assert!(
+            sdp.contains("m=video"),
+            "re-INVITE SDP should have video m= line"
+        );
+        assert!(sdp.contains("H264/90000"), "re-INVITE SDP should have H264");
+    }
+
+    #[test]
+    fn add_video_requires_active() {
+        let call = Call::new_outbound(mock_dlg(), DialOptions::default());
+        assert!(matches!(
+            call.add_video(&[VideoCodec::H264], 10000, 20000),
+            Err(Error::InvalidState)
+        ));
+    }
+
+    #[test]
+    fn add_video_when_already_active_returns_error() {
+        let call = Call::new_inbound(mock_dlg());
+        call.accept().unwrap();
+        call.set_video_codec(VideoCodec::H264);
+        assert!(call.add_video(&[VideoCodec::VP8], 10000, 20000).is_err());
     }
 }

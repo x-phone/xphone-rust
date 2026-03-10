@@ -79,8 +79,17 @@ optional = true
 version = "0.1"
 optional = true
 
+[dependencies.openh264]
+version = "0.6"
+optional = true
+
+[dependencies.minifb]
+version = "0.28"
+optional = true
+
 [features]
 integration = []
 opus-codec = ["opus"]
 g729-codec = ["g729-sys"]
 cli = ["ratatui", "crossterm", "clap", "serde", "serde_yaml", "dirs-next", "cpal"]
+video-display = ["openh264", "minifb", "cli"]
