@@ -30,7 +30,7 @@ pub mod types;
 pub mod video;
 
 // Re-export the primary public API at the crate root.
-pub use call::Call;
+pub use call::{Call, VideoUpgradeRequest};
 pub use config::{Config, DialOptions, DtmfMode, PhoneBuilder};
 pub use error::{Error, Result};
 pub use phone::Phone;

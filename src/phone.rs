@@ -949,6 +949,15 @@ fn handle_dialog_incoming(
     rtp_port_min: u16,
     rtp_port_max: u16,
 ) {
+    // Check if this is a re-INVITE for an existing call (same Call-ID).
+    let call_id = dlg.call_id();
+    let existing_call = inner.lock().calls.get(&call_id).cloned();
+    if let Some(call) = existing_call {
+        info!(call_id = %call_id, "Phone handling re-INVITE for existing call");
+        handle_reinvite(&call, dlg, remote_sdp, rtp_port_min, rtp_port_max);
+        return;
+    }
+
     info!(from = _from, to = _to, "Phone handling incoming INVITE");
     let incoming_fn = inner.lock().incoming.clone();
 
@@ -1016,6 +1025,17 @@ fn handle_dialog_incoming(
     if let Some(f) = incoming_fn {
         f(call);
     }
+}
+
+/// Handles a mid-dialog re-INVITE for an existing call (e.g., video upgrade, hold/resume).
+fn handle_reinvite(
+    call: &Arc<Call>,
+    dlg: Arc<dyn Dialog>,
+    remote_sdp: &str,
+    rtp_port_min: u16,
+    rtp_port_max: u16,
+) {
+    call.handle_reinvite(&dlg, remote_sdp, rtp_port_min, rtp_port_max);
 }
 
 /// Handles an incoming BYE — looks up the call by Call-ID and simulates BYE.

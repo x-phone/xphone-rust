@@ -447,6 +447,32 @@ fn wire_call_events(call: &Arc<Call>, state: &SharedState) {
         let mut st = s.lock().unwrap();
         st.push_event(format!("[{}] resumed by remote", did));
     });
+
+    // When remote requests video upgrade, auto-accept and start the video handler.
+    #[cfg(feature = "video-display")]
+    {
+        let call_for_video = Arc::clone(call);
+        let s = Arc::clone(state);
+        let did3 = call.remote_did();
+
+        // on_video fires after the upgrade is accepted and the pipeline is started.
+        call.on_video(move || {
+            let mut st = s.lock().unwrap();
+            st.push_event(format!("[{}] video upgrade accepted", did3));
+            drop(st);
+            start_video_handler(&call_for_video);
+        });
+
+        // Auto-accept video upgrade requests when video-display feature is enabled.
+        let s2 = Arc::clone(state);
+        let did4 = call.remote_did();
+        call.on_video_request(move |req| {
+            let mut st = s2.lock().unwrap();
+            st.push_event(format!("[{}] video upgrade requested — accepting", did4));
+            drop(st);
+            req.accept();
+        });
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -903,10 +929,8 @@ fn do_dial(state: &SharedState, phone: &Phone, target: &str, video: bool) {
                     Arc::clone(&speaker_flag),
                     Arc::clone(&mic_flag),
                 );
-                #[cfg(feature = "video-display")]
-                if video {
-                    start_video_handler(&call);
-                }
+                // Video handler is started via on_video callback (wired in wire_call_events)
+                // when start_video_pipeline fires it — works for both vdial and mid-call upgrade.
                 let mut st = s.lock().unwrap();
                 let msg = if video {
                     format!("[{}] video connected", target)
@@ -1009,6 +1033,13 @@ fn exec_command(state: &SharedState, phone: &Phone, input: &str) {
         "unmute" => {
             let num = parse_call_num(&arg);
             call_action(state, "unmute", num, |c| c.unmute());
+        }
+
+        "video" => {
+            let num = parse_call_num(&arg);
+            call_action(state, "video", num, |c| {
+                c.add_video(&[xphone::VideoCodec::H264], 10000, 20000)
+            });
         }
 
         "dtmf" => {
@@ -1522,10 +1553,10 @@ fn draw(f: &mut ratatui::Frame, state: &SharedState) {
 
     #[cfg(feature = "video-display")]
     let help_text =
-        "dial(d) vdial(vd) accept(a) reject hangup(h) hold resume mute unmute dtmf transfer(xfer) msg watch(w) unwatch(uw) echo speaker mic quit(q)";
+        "dial(d) vdial(vd) accept(a) reject hangup(h) hold resume mute unmute video dtmf transfer(xfer) msg watch(w) unwatch(uw) echo speaker mic quit(q)";
     #[cfg(not(feature = "video-display"))]
     let help_text =
-        "dial(d) accept(a) reject hangup(h) hold resume mute unmute dtmf transfer(xfer) msg watch(w) unwatch(uw) echo speaker mic quit(q)";
+        "dial(d) accept(a) reject hangup(h) hold resume mute unmute video dtmf transfer(xfer) msg watch(w) unwatch(uw) echo speaker mic quit(q)";
 
     let cmd_lines = vec![
         Line::from(vec![
