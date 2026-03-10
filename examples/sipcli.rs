@@ -32,6 +32,13 @@ use tracing_subscriber::util::SubscriberInitExt;
 
 use xphone::{Call, CallState, EndReason, ExtensionState, Phone};
 
+#[cfg(feature = "video-display")]
+use minifb::{Window, WindowOptions};
+#[cfg(feature = "video-display")]
+use openh264::decoder::Decoder as H264Decoder;
+#[cfg(feature = "video-display")]
+use openh264::formats::YUVSource;
+
 // -- Accent colors ----------------------------------------------------------
 
 const ACCENT: Color = Color::Rgb(100, 149, 237); // cornflower blue
@@ -671,6 +678,119 @@ fn setup_mic_stream(active: Arc<AtomicBool>, pcm_tx: crossbeam_channel::Sender<V
     Box::leak(Box::new(stream));
 }
 
+// ---------------------------------------------------------------------------
+// Video: decode + display in a native window
+// ---------------------------------------------------------------------------
+
+/// Start the video handler thread. Decodes H.264 frames from `call.video_reader()`
+/// and displays them in a minifb window. No-op if the call has no video stream
+/// or if the codec is not H.264.
+#[cfg(feature = "video-display")]
+fn start_video_handler(call: &Arc<Call>) {
+    let video_rx = match call.video_reader() {
+        Some(rx) => rx,
+        None => return,
+    };
+    let codec = call.video_codec();
+    if codec != Some(xphone::VideoCodec::H264) {
+        tracing::warn!(
+            "video: codec {:?} not supported for display, skipping",
+            codec
+        );
+        return;
+    }
+    let remote = call.remote_did();
+
+    std::thread::Builder::new()
+        .name("video-handler".into())
+        .spawn(move || {
+            let mut decoder = match H264Decoder::new() {
+                Ok(d) => d,
+                Err(e) => {
+                    tracing::error!("video: failed to create H.264 decoder: {}", e);
+                    return;
+                }
+            };
+
+            // Lazy window creation — wait for first decoded frame to know resolution.
+            let mut window: Option<Window> = None;
+            let mut fb: Vec<u32> = Vec::new();
+            let mut rgb_buf: Vec<u8> = Vec::new();
+            let mut cur_w: usize = 0;
+            let mut cur_h: usize = 0;
+
+            loop {
+                match video_rx.recv_timeout(Duration::from_millis(16)) {
+                    Ok(frame) => {
+                        let yuv = match decoder.decode(&frame.data) {
+                            Ok(Some(yuv)) => yuv,
+                            Ok(None) => continue,
+                            Err(e) => {
+                                tracing::debug!("video: decode error: {}", e);
+                                continue;
+                            }
+                        };
+
+                        let (w, h) = yuv.dimensions();
+                        if w == 0 || h == 0 {
+                            continue;
+                        }
+
+                        // Handle resolution change — (re)create window.
+                        if w != cur_w || h != cur_h {
+                            cur_w = w;
+                            cur_h = h;
+                            fb.resize(w * h, 0);
+                            rgb_buf.resize(w * h * 3, 0);
+                            let title = format!("Video - {}", remote);
+                            let opts = WindowOptions {
+                                resize: true,
+                                ..WindowOptions::default()
+                            };
+                            match Window::new(&title, w, h, opts) {
+                                Ok(win) => window = Some(win),
+                                Err(e) => {
+                                    tracing::error!("video: failed to create window: {}", e);
+                                    return;
+                                }
+                            }
+                        }
+
+                        yuv.write_rgb8(&mut rgb_buf);
+                        rgb8_to_argb32(&rgb_buf, &mut fb);
+
+                        if let Some(ref mut win) = window {
+                            if !win.is_open() {
+                                tracing::info!("video: window closed by user");
+                                break;
+                            }
+                            let _ = win.update_with_buffer(&fb, cur_w, cur_h);
+                        }
+                    }
+                    Err(crossbeam_channel::RecvTimeoutError::Timeout) => {
+                        if let Some(ref mut win) = window {
+                            if !win.is_open() {
+                                break;
+                            }
+                            win.update();
+                        }
+                    }
+                    Err(crossbeam_channel::RecvTimeoutError::Disconnected) => break,
+                }
+            }
+            tracing::info!("video: handler stopped for {}", remote);
+        })
+        .expect("failed to spawn video handler");
+}
+
+/// Convert RGB8 triplets to 0x00RRGGBB u32 pixels for minifb.
+#[cfg(feature = "video-display")]
+fn rgb8_to_argb32(rgb: &[u8], out: &mut [u32]) {
+    for (chunk, pixel) in rgb.chunks_exact(3).zip(out.iter_mut()) {
+        *pixel = ((chunk[0] as u32) << 16) | ((chunk[1] as u32) << 8) | (chunk[2] as u32);
+    }
+}
+
 fn call_state_name(s: CallState) -> String {
     match s {
         CallState::Idle => "idle".into(),
@@ -747,6 +867,71 @@ fn resolve_call(st: &AppState, num: Option<usize>) -> Option<Arc<Call>> {
     st.calls.get(idx).map(|tc| Arc::clone(&tc.call))
 }
 
+fn do_dial(state: &SharedState, phone: &Phone, target: &str, video: bool) {
+    if target.is_empty() {
+        let cmd = if video { "vdial" } else { "dial" };
+        state.lock().unwrap().error = format!("usage: {} <target>", cmd);
+        return;
+    }
+    let label = if video { "video-dialing" } else { "dialing" };
+    state
+        .lock()
+        .unwrap()
+        .push_event(format!("{} {}...", label, target));
+
+    let phone = phone.clone();
+    let s = Arc::clone(state);
+    let target = target.to_string();
+    let echo_flag = Arc::clone(&state.lock().unwrap().echo_active);
+    let speaker_flag = Arc::clone(&state.lock().unwrap().speaker_active);
+    let mic_flag = Arc::clone(&state.lock().unwrap().mic_active);
+    std::thread::spawn(move || {
+        let mut opts = xphone::DialOptions {
+            timeout: Duration::from_secs(30),
+            ..Default::default()
+        };
+        if video {
+            opts.video = true;
+            opts.video_codecs = vec![xphone::VideoCodec::H264];
+        }
+        match phone.dial(&target, opts) {
+            Ok(call) => {
+                wire_call_events(&call, &s);
+                start_audio_handler(
+                    &call,
+                    Arc::clone(&echo_flag),
+                    Arc::clone(&speaker_flag),
+                    Arc::clone(&mic_flag),
+                );
+                #[cfg(feature = "video-display")]
+                if video {
+                    start_video_handler(&call);
+                }
+                let mut st = s.lock().unwrap();
+                let msg = if video {
+                    format!("[{}] video connected", target)
+                } else {
+                    format!("[{}] connected", target)
+                };
+                st.push_event(msg);
+                let is_first = st.calls.is_empty();
+                st.calls.push(TrackedCall {
+                    call,
+                    label: target,
+                    status: "active".into(),
+                });
+                if is_first {
+                    st.selected = 0;
+                }
+            }
+            Err(e) => {
+                let mut st = s.lock().unwrap();
+                st.push_event(format!("ERROR dial failed: {}", e));
+            }
+        }
+    });
+}
+
 fn exec_command(state: &SharedState, phone: &Phone, input: &str) {
     let parts: Vec<&str> = input.split_whitespace().collect();
     if parts.is_empty() {
@@ -772,53 +957,12 @@ fn exec_command(state: &SharedState, phone: &Phone, input: &str) {
         }
 
         "dial" | "d" => {
-            if arg.is_empty() {
-                state.lock().unwrap().error = "usage: dial <target>".into();
-                return;
-            }
-            state
-                .lock()
-                .unwrap()
-                .push_event(format!("dialing {}...", arg));
+            do_dial(state, phone, &arg, false);
+        }
 
-            let phone = phone.clone();
-            let s = Arc::clone(state);
-            let target = arg.clone();
-            let echo_flag = Arc::clone(&state.lock().unwrap().echo_active);
-            let speaker_flag = Arc::clone(&state.lock().unwrap().speaker_active);
-            let mic_flag = Arc::clone(&state.lock().unwrap().mic_active);
-            std::thread::spawn(move || {
-                let opts = xphone::DialOptions {
-                    timeout: Duration::from_secs(30),
-                    ..Default::default()
-                };
-                match phone.dial(&target, opts) {
-                    Ok(call) => {
-                        wire_call_events(&call, &s);
-                        start_audio_handler(
-                            &call,
-                            Arc::clone(&echo_flag),
-                            Arc::clone(&speaker_flag),
-                            Arc::clone(&mic_flag),
-                        );
-                        let mut st = s.lock().unwrap();
-                        st.push_event(format!("[{}] connected", target));
-                        let is_first = st.calls.is_empty();
-                        st.calls.push(TrackedCall {
-                            call,
-                            label: target,
-                            status: "active".into(),
-                        });
-                        if is_first {
-                            st.selected = 0;
-                        }
-                    }
-                    Err(e) => {
-                        let mut st = s.lock().unwrap();
-                        st.push_event(format!("ERROR dial failed: {}", e));
-                    }
-                }
-            });
+        #[cfg(feature = "video-display")]
+        "vdial" | "vd" => {
+            do_dial(state, phone, &arg, true);
         }
 
         "accept" | "a" => {
@@ -830,6 +974,8 @@ fn exec_command(state: &SharedState, phone: &Phone, input: &str) {
                 let result = c.accept();
                 if result.is_ok() {
                     start_audio_handler(c, echo_flag, speaker_flag, mic_flag);
+                    #[cfg(feature = "video-display")]
+                    start_video_handler(c);
                 }
                 result
             });
@@ -1374,6 +1520,10 @@ fn draw(f: &mut ratatui::Frame, state: &SharedState) {
         )
     };
 
+    #[cfg(feature = "video-display")]
+    let help_text =
+        "dial(d) vdial(vd) accept(a) reject hangup(h) hold resume mute unmute dtmf transfer(xfer) msg watch(w) unwatch(uw) echo speaker mic quit(q)";
+    #[cfg(not(feature = "video-display"))]
     let help_text =
         "dial(d) accept(a) reject hangup(h) hold resume mute unmute dtmf transfer(xfer) msg watch(w) unwatch(uw) echo speaker mic quit(q)";
 

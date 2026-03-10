@@ -39,5 +39,14 @@ install-sipcli:
 	cp target/release/examples/sipcli $(HOME)/bin/sipcli
 	@echo "Installed to $(HOME)/bin/sipcli"
 
+sipcli-video:
+	cargo build --example sipcli --features video-display --release
+	@echo "Binary: target/release/examples/sipcli"
+
+install-sipcli-video:
+	cargo build --example sipcli --features video-display --release
+	cp target/release/examples/sipcli $(HOME)/bin/sipcli
+	@echo "Installed to $(HOME)/bin/sipcli (with video)"
+
 # Full verification gate — run before committing.
 check: fmt clippy test

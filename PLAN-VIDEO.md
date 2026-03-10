@@ -90,50 +90,50 @@ Extract monolithic media pipeline into a per-stream `MediaStream` abstraction. C
 
 Wire up the video stream. Second RTP/RTCP socket pair, video MediaStream, channels on Call.
 
-- [ ] Allocate second RTP+RTCP socket pair when video negotiated
-- [ ] Create video `MediaStream` (stream index 1) with 90kHz clock
-- [ ] `VideoFrame` struct in `types.rs`
-- [ ] `video_reader()`/`video_writer()` channels on Call (assembled frames)
-- [ ] `video_rtp_reader()`/`video_rtp_writer()` channels on Call (raw RTP passthrough)
-- [ ] `has_video()`, `video_codec()` query methods
-- [ ] `mute_video()`/`unmute_video()` — stops sending on video stream
-- [ ] `request_keyframe()` — sends RTCP PLI (RFC 4585)
-- [ ] Add RTCP PLI/FIR packet building to `rtcp.rs`
-- [ ] Wire video in `phone.rs` dial/incoming paths (pass video option through)
-- [ ] Wire video SDP in call setup (offer with video, parse answer)
-- [ ] Tests: video stream creation, channel wiring, mute_video, PLI generation
-- [ ] Verify: `cargo fmt && cargo clippy -- -D warnings && cargo test` all pass
+- [x] Allocate second RTP+RTCP socket pair when video negotiated
+- [x] Create video `MediaStream` (stream index 1) with 90kHz clock
+- [x] `VideoFrame` struct in `types.rs`
+- [x] `video_reader()`/`video_writer()` channels on Call (assembled frames)
+- [x] `video_rtp_reader()`/`video_rtp_writer()` channels on Call (raw RTP passthrough)
+- [x] `has_video()`, `video_codec()` query methods
+- [x] `mute_video()`/`unmute_video()` — stops sending on video stream
+- [x] `request_keyframe()` — sends RTCP PLI (RFC 4585)
+- [x] Add RTCP PLI/FIR packet building to `rtcp.rs`
+- [x] Wire video in `phone.rs` dial/incoming paths (pass video option through)
+- [x] Wire video SDP in call setup (offer with video, parse answer)
+- [x] Tests: video stream creation, channel wiring, mute_video, PLI generation
+- [x] Verify: `cargo fmt && cargo clippy -- -D warnings && cargo test` all pass
 
 ## PR 4: H.264 + VP8 packetizers
 
 RTP-level frame assembly and fragmentation. This is the deepest work.
 
 ### H.264 (RFC 6184)
-- [ ] `VideoDepacketizer` trait: `fn depacketize(&mut self, pkt: &RtpPacket) -> Option<VideoFrame>`
-- [ ] `VideoPacketizer` trait: `fn packetize(&mut self, frame: &VideoFrame, mtu: usize) -> Vec<Vec<u8>>`
-- [ ] `H264Depacketizer`: Single NAL unit mode (type 1-23)
-- [ ] `H264Depacketizer`: STAP-A aggregation (type 24) — multiple NALs in one RTP
-- [ ] `H264Depacketizer`: FU-A fragmentation (type 28) — stateful reassembly across packets
-- [ ] `H264Depacketizer`: frame boundary detection (marker bit + timestamp change)
-- [ ] `H264Depacketizer`: keyframe detection (NAL type 5 = IDR)
-- [ ] `H264Depacketizer`: SPS/PPS parameter set handling
-- [ ] `H264Packetizer`: fragment NAL units > MTU into FU-A packets
-- [ ] `H264Packetizer`: small NALs sent as Single NAL unit
-- [ ] Tests: FU-A reassembly, STAP-A, single NAL, keyframe detect, fragmentation round-trip
+- [x] `VideoDepacketizer` trait: `fn depacketize(&mut self, pkt: &RtpPacket) -> Option<VideoFrame>`
+- [x] `VideoPacketizer` trait: `fn packetize(&mut self, frame: &VideoFrame, mtu: usize) -> Vec<Vec<u8>>`
+- [x] `H264Depacketizer`: Single NAL unit mode (type 1-23)
+- [x] `H264Depacketizer`: STAP-A aggregation (type 24) — multiple NALs in one RTP
+- [x] `H264Depacketizer`: FU-A fragmentation (type 28) — stateful reassembly across packets
+- [x] `H264Depacketizer`: frame boundary detection (marker bit + timestamp change)
+- [x] `H264Depacketizer`: keyframe detection (NAL type 5 = IDR)
+- [x] `H264Depacketizer`: SPS/PPS parameter set handling
+- [x] `H264Packetizer`: fragment NAL units > MTU into FU-A packets
+- [x] `H264Packetizer`: small NALs sent as Single NAL unit
+- [x] Tests: FU-A reassembly, STAP-A, single NAL, keyframe detect, fragmentation round-trip
 
 ### VP8 (RFC 7741)
-- [ ] `VP8Depacketizer`: VP8 payload descriptor parsing (S bit, PID, extensions)
-- [ ] `VP8Depacketizer`: frame assembly from multiple RTP packets
-- [ ] `VP8Depacketizer`: keyframe detection (VP8 frame header P bit)
-- [ ] `VP8Packetizer`: split frame into MTU-sized payloads with correct descriptors
-- [ ] Tests: VP8 depacketize/packetize round-trip, keyframe detection
+- [x] `VP8Depacketizer`: VP8 payload descriptor parsing (S bit, PID, extensions)
+- [x] `VP8Depacketizer`: frame assembly from multiple RTP packets
+- [x] `VP8Depacketizer`: keyframe detection (VP8 frame header P bit)
+- [x] `VP8Packetizer`: split frame into MTU-sized payloads with correct descriptors
+- [x] Tests: VP8 depacketize/packetize round-trip, keyframe detection
 
 ### Integration
-- [ ] Wire depacketizers into video `MediaStream` inbound path
-- [ ] Wire packetizers into video `MediaStream` outbound path
-- [ ] Register H264/VP8 by dynamic PT from SDP negotiation
+- [x] Wire depacketizers into video `MediaStream` inbound path
+- [x] Wire packetizers into video `MediaStream` outbound path
+- [x] Register H264/VP8 by dynamic PT from SDP negotiation
 - [ ] Integration test: video call through Docker Asterisk (if Asterisk supports video passthrough)
-- [ ] Verify: `cargo fmt && cargo clippy -- -D warnings && cargo test` all pass
+- [x] Verify: `cargo fmt && cargo clippy -- -D warnings && cargo test` all pass
 
 ---
 
