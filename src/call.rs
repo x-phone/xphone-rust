@@ -947,12 +947,6 @@ impl Call {
         self.inner.lock().video_codec = Some(codec);
     }
 
-    /// Sets the remote video RTP port (test helper — production path uses set_remote_endpoint).
-    #[cfg(test)]
-    pub(crate) fn set_video_remote_port(&self, port: i32) {
-        self.inner.lock().video_remote_port = port;
-    }
-
     /// Sends a DTMF digit (e.g., `"1"`, `"#"`, `"*"`).
     ///
     /// The transport method depends on the configured [`DtmfMode`](crate::config::DtmfMode):
