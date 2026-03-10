@@ -24,6 +24,8 @@ struct Inner {
     remote_sdp: String,
     start_time: Option<Instant>,
     muted: bool,
+    video_muted: bool,
+    video_codec: Option<VideoCodec>,
     sent_dtmf: Vec<String>,
     transfer_to: String,
     headers: HashMap<String, Vec<String>>,
@@ -87,6 +89,8 @@ impl MockCall {
                 remote_sdp: String::new(),
                 start_time: None,
                 muted: false,
+                video_muted: false,
+                video_codec: None,
                 sent_dtmf: Vec::new(),
                 transfer_to: String::new(),
                 headers: HashMap::new(),
@@ -357,6 +361,60 @@ impl MockCall {
         Ok(())
     }
 
+    /// Returns whether the call has an active video stream.
+    pub fn has_video(&self) -> bool {
+        self.inner.lock().video_codec.is_some()
+    }
+
+    /// Returns the negotiated video codec, if any.
+    pub fn video_codec(&self) -> Option<VideoCodec> {
+        self.inner.lock().video_codec
+    }
+
+    /// Mutes outbound video.
+    pub fn mute_video(&self) -> Result<()> {
+        let mut inner = self.inner.lock();
+        if inner.state != CallState::Active {
+            return Err(Error::InvalidState);
+        }
+        if inner.video_codec.is_none() {
+            return Err(Error::NoVideoStream);
+        }
+        if inner.video_muted {
+            return Err(Error::VideoAlreadyMuted);
+        }
+        inner.video_muted = true;
+        Ok(())
+    }
+
+    /// Unmutes outbound video.
+    pub fn unmute_video(&self) -> Result<()> {
+        let mut inner = self.inner.lock();
+        if inner.state != CallState::Active {
+            return Err(Error::InvalidState);
+        }
+        if inner.video_codec.is_none() {
+            return Err(Error::NoVideoStream);
+        }
+        if !inner.video_muted {
+            return Err(Error::VideoNotMuted);
+        }
+        inner.video_muted = false;
+        Ok(())
+    }
+
+    /// Requests a keyframe from the remote video sender (no-op in mock).
+    pub fn request_keyframe(&self) -> Result<()> {
+        let inner = self.inner.lock();
+        if inner.state != CallState::Active {
+            return Err(Error::InvalidState);
+        }
+        if inner.video_codec.is_none() {
+            return Err(Error::NoVideoStream);
+        }
+        Ok(())
+    }
+
     /// Returns the dialog identifiers `(call_id, local_tag, remote_tag)`.
     /// Tags are extracted from the From/To headers if set via [`set_header`](Self::set_header).
     pub fn dialog_id(&self) -> (String, String, String) {
@@ -495,6 +553,11 @@ impl MockCall {
         self.inner.lock().remote_sdp = sdp.into();
     }
 
+    /// Sets the video codec (test helper).
+    pub fn set_video_codec(&self, codec: VideoCodec) {
+        self.inner.lock().video_codec = Some(codec);
+    }
+
     /// Sets a SIP header value (test helper).
     pub fn set_header(&self, name: &str, value: &str) {
         self.inner
@@ -508,6 +571,11 @@ impl MockCall {
     /// Returns whether the call is currently muted.
     pub fn muted(&self) -> bool {
         self.inner.lock().muted
+    }
+
+    /// Returns whether video is currently muted.
+    pub fn video_muted(&self) -> bool {
+        self.inner.lock().video_muted
     }
 
     /// Returns all DTMF digits sent via [`send_dtmf`](Self::send_dtmf).
@@ -765,6 +833,62 @@ mod tests {
         let (_, local, remote) = c.dialog_id();
         assert_eq!(local, "local2");
         assert_eq!(remote, "remote1");
+    }
+
+    #[test]
+    fn has_video_default_false() {
+        let c = MockCall::new();
+        assert!(!c.has_video());
+        assert_eq!(c.video_codec(), None);
+    }
+
+    #[test]
+    fn set_video_codec_enables_video() {
+        let c = MockCall::new();
+        c.set_video_codec(VideoCodec::H264);
+        assert!(c.has_video());
+        assert_eq!(c.video_codec(), Some(VideoCodec::H264));
+    }
+
+    #[test]
+    fn mute_video_requires_active_and_video() {
+        let c = MockCall::new();
+        // Not active → InvalidState
+        assert!(matches!(c.mute_video(), Err(Error::InvalidState)));
+
+        c.accept().unwrap();
+        // No video → NoVideoStream
+        assert!(matches!(c.mute_video(), Err(Error::NoVideoStream)));
+
+        c.set_video_codec(VideoCodec::VP8);
+        c.mute_video().unwrap();
+        assert!(c.video_muted());
+
+        // Already muted
+        assert!(matches!(c.mute_video(), Err(Error::VideoAlreadyMuted)));
+    }
+
+    #[test]
+    fn unmute_video_requires_muted() {
+        let c = MockCall::new();
+        c.accept().unwrap();
+        c.set_video_codec(VideoCodec::H264);
+        // Not muted → VideoNotMuted
+        assert!(matches!(c.unmute_video(), Err(Error::VideoNotMuted)));
+
+        c.mute_video().unwrap();
+        c.unmute_video().unwrap();
+        assert!(!c.video_muted());
+    }
+
+    #[test]
+    fn request_keyframe_mock() {
+        let c = MockCall::new();
+        c.accept().unwrap();
+        assert!(matches!(c.request_keyframe(), Err(Error::NoVideoStream)));
+
+        c.set_video_codec(VideoCodec::H264);
+        c.request_keyframe().unwrap();
     }
 
     #[test]

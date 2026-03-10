@@ -357,6 +357,24 @@ fn parse_param(params: &str, name: &str) -> Option<String> {
     None
 }
 
+/// A reassembled video frame (one or more RTP packets).
+///
+/// The library handles RTP packetization/depacketization (FU-A, STAP-A for
+/// H.264; VP8 payload descriptors) but does NOT encode/decode video.
+/// Consumers provide raw encoded frames via [`Call::video_writer`](crate::Call)
+/// and receive them via [`Call::video_reader`](crate::Call).
+#[derive(Debug, Clone)]
+pub struct VideoFrame {
+    /// The video codec for this frame.
+    pub codec: VideoCodec,
+    /// Whether this is a keyframe (IDR for H.264, key for VP8).
+    pub keyframe: bool,
+    /// RTP timestamp of the first packet in this frame.
+    pub timestamp: u32,
+    /// The assembled NAL units (H.264 Annex-B) or raw frame data (VP8).
+    pub data: Vec<u8>,
+}
+
 /// Video codec for SDP negotiation and RTP packetization.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum VideoCodec {

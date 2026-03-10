@@ -299,6 +299,20 @@ impl Phone {
         } else {
             (None, 20000)
         };
+        // Allocate video RTP socket if video is requested.
+        let (video_rtp_socket, video_rtp_port) = if opts.video {
+            if self.cfg.rtp_port_min > 0 && self.cfg.rtp_port_max > 0 {
+                match crate::media::listen_rtp_port(self.cfg.rtp_port_min, self.cfg.rtp_port_max) {
+                    Ok((sock, port)) => (Some(sock), port as i32),
+                    Err(_) => (None, 0),
+                }
+            } else {
+                (None, 0)
+            }
+        } else {
+            (None, 0)
+        };
+
         // Generate SRTP keying material if enabled.
         let srtp_inline_key = if self.cfg.srtp {
             let (_material, encoded) = crate::srtp::generate_keying_material()?;
@@ -306,8 +320,44 @@ impl Phone {
         } else {
             None
         };
+        let video_srtp_inline_key = if self.cfg.srtp && opts.video {
+            let (_material, encoded) = crate::srtp::generate_keying_material()?;
+            Some(encoded)
+        } else {
+            None
+        };
 
-        let local_sdp = if let Some(ref key) = srtp_inline_key {
+        let video_codecs = if opts.video_codecs.is_empty() {
+            vec![
+                crate::types::VideoCodec::H264,
+                crate::types::VideoCodec::VP8,
+            ]
+        } else {
+            opts.video_codecs.clone()
+        };
+
+        let local_sdp = if opts.video {
+            match (&srtp_inline_key, &video_srtp_inline_key) {
+                (Some(audio_key), Some(video_key)) => crate::sdp::build_offer_video_srtp(
+                    &local_ip,
+                    rtp_port,
+                    &[8, 0, 9, 101],
+                    video_rtp_port,
+                    &video_codecs,
+                    crate::sdp::DIR_SEND_RECV,
+                    audio_key,
+                    video_key,
+                ),
+                _ => crate::sdp::build_offer_video(
+                    &local_ip,
+                    rtp_port,
+                    &[8, 0, 9, 101],
+                    video_rtp_port,
+                    &video_codecs,
+                    crate::sdp::DIR_SEND_RECV,
+                ),
+            }
+        } else if let Some(ref key) = srtp_inline_key {
             crate::sdp::build_offer_srtp(
                 &local_ip,
                 rtp_port,
@@ -339,6 +389,11 @@ impl Phone {
                 }
                 if let Some(sock) = rtp_socket {
                     call.set_rtp_socket(sock);
+                }
+                // Wire video socket if allocated.
+                if let Some(vsock) = video_rtp_socket {
+                    call.set_video_rtp_port(video_rtp_port);
+                    call.set_video_rtp_socket(vsock);
                 }
 
                 // Wire phone-level callbacks (incl. dtmf_mode) BEFORE simulate_response fires on_state.
@@ -907,22 +962,16 @@ fn handle_dialog_incoming(
         (None, rtp_port_min as i32)
     };
 
+    // Parse remote SDP once for SRTP detection and video detection.
+    let parsed_sdp = crate::sdp::parse(remote_sdp).ok();
+
     // Only use SRTP if the remote actually offers RTP/SAVP with a supported suite.
-    // Local config preference alone is not enough — the remote must also offer SRTP.
-    let use_srtp = if let Ok(sess) = crate::sdp::parse(remote_sdp) {
-        if sess.is_srtp() {
-            // Validate that the remote offers a supported cipher suite.
-            if let Some(crypto) = sess.first_crypto() {
-                crypto.suite == crate::srtp::SUPPORTED_SUITE
-            } else {
-                false
-            }
-        } else {
-            false
-        }
-    } else {
-        false
-    };
+    let use_srtp = parsed_sdp.as_ref().is_some_and(|sess| {
+        sess.is_srtp()
+            && sess
+                .first_crypto()
+                .is_some_and(|c| c.suite == crate::srtp::SUPPORTED_SUITE)
+    });
 
     // Create an inbound call with the real dialog.
     let call = Call::new_inbound(dlg);
@@ -939,6 +988,17 @@ fn handle_dialog_incoming(
     if let Some(sock) = rtp_socket {
         call.set_rtp_socket(sock);
     }
+
+    // Allocate video RTP socket if remote SDP offers video.
+    if let Some(ref sess) = parsed_sdp {
+        if sess.has_video() && rtp_port_min > 0 && rtp_port_max > 0 {
+            if let Ok((vsock, vport)) = crate::media::listen_rtp_port(rtp_port_min, rtp_port_max) {
+                call.set_video_rtp_port(vport as i32);
+                call.set_video_rtp_socket(vsock);
+            }
+        }
+    }
+
     if !remote_sdp.is_empty() {
         call.set_remote_sdp(remote_sdp);
     }
@@ -2011,5 +2071,51 @@ mod tests {
         phone.unsubscribe_event(id).unwrap();
 
         phone.disconnect().unwrap();
+    }
+
+    // --- Video ---
+
+    #[test]
+    fn dial_with_video_builds_video_sdp() {
+        let tr = Arc::new(MockTransport::new());
+        tr.respond_with(200, "OK"); // REGISTER
+
+        let phone = Phone::new(test_cfg());
+        phone.connect_with_transport(Arc::clone(&tr) as Arc<dyn SipTransport>);
+
+        tr.respond_with(200, "OK"); // INVITE
+        let opts = DialOptions {
+            video: true,
+            ..DialOptions::default()
+        };
+        let call = phone.dial("sip:1002@pbx.local", opts).unwrap();
+        assert_eq!(call.state(), crate::types::CallState::Active);
+
+        // The local SDP should contain a video m= line.
+        let sdp = call.local_sdp();
+        assert!(sdp.contains("m=video"), "SDP should contain video m= line");
+        assert!(
+            sdp.contains("m=audio"),
+            "SDP should still contain audio m= line"
+        );
+    }
+
+    #[test]
+    fn dial_without_video_no_video_sdp() {
+        let tr = Arc::new(MockTransport::new());
+        tr.respond_with(200, "OK"); // REGISTER
+
+        let phone = Phone::new(test_cfg());
+        phone.connect_with_transport(Arc::clone(&tr) as Arc<dyn SipTransport>);
+
+        tr.respond_with(200, "OK"); // INVITE
+        let call = phone
+            .dial("sip:1002@pbx.local", DialOptions::default())
+            .unwrap();
+        let sdp = call.local_sdp();
+        assert!(
+            !sdp.contains("m=video"),
+            "SDP should not contain video m= line"
+        );
     }
 }

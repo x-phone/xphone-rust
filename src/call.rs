@@ -148,6 +148,15 @@ struct CallInner {
     media_streams: Vec<media::MediaStream>,
     media_shared: Option<Arc<media::MediaSharedState>>,
 
+    video_muted: bool,
+    video_codec: Option<VideoCodec>,
+    video_rtp_port: i32,
+    video_rtp_socket: Option<Arc<UdpSocket>>,
+    video_rtcp_socket: Option<Arc<UdpSocket>>,
+    video_remote_port: i32,
+    /// FIR sequence counter, incremented per request_keyframe().
+    fir_seq_nr: u8,
+
     on_ended_fn: Option<Arc<dyn Fn(EndReason) + Send + Sync>>,
     on_ended_internal: Option<Arc<dyn Fn(EndReason) + Send + Sync>>,
     on_media_fn: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -199,6 +208,13 @@ impl Call {
                 rtp_socket: None,
                 media_streams: Vec::new(),
                 media_shared: None,
+                video_muted: false,
+                video_codec: None,
+                video_rtp_port: 0,
+                video_rtp_socket: None,
+                video_rtcp_socket: None,
+                video_remote_port: 0,
+                fir_seq_nr: 0,
                 on_ended_fn: None,
                 on_ended_internal: None,
                 on_media_fn: None,
@@ -243,6 +259,13 @@ impl Call {
                 rtp_socket: None,
                 media_streams: Vec::new(),
                 media_shared: None,
+                video_muted: false,
+                video_codec: None,
+                video_rtp_port: 0,
+                video_rtp_socket: None,
+                video_rtcp_socket: None,
+                video_remote_port: 0,
+                fir_seq_nr: 0,
                 on_ended_fn: None,
                 on_ended_internal: None,
                 on_media_fn: None,
@@ -480,9 +503,9 @@ impl Call {
     }
 
     fn negotiate_codec(inner: &mut CallInner, sess: &sdp::Session) {
+        // Audio codec negotiation.
         let remote_codecs: &[i32] = sess
-            .media
-            .first()
+            .audio_media()
             .map(|m| m.codecs.as_slice())
             .unwrap_or(&[]);
         let prefs = Self::resolve_codec_prefs(inner);
@@ -492,12 +515,25 @@ impl Call {
                 inner.codec = c;
             }
         }
+        // Video codec negotiation (skip if remote rejected video with port 0).
+        if let Some(vm) = sess.video_media() {
+            if vm.port > 0 {
+                if let Some(vc) = sess.video_codec() {
+                    inner.video_codec = Some(vc);
+                }
+            }
+        }
     }
 
     fn set_remote_endpoint(inner: &mut CallInner, sess: &sdp::Session) {
         inner.remote_ip = sess.connection.clone();
-        if let Some(m) = sess.media.first() {
+        if let Some(m) = sess.audio_media() {
             inner.remote_port = m.port;
+        }
+        if let Some(vm) = sess.video_media() {
+            if vm.port > 0 {
+                inner.video_remote_port = vm.port;
+            }
         }
     }
 
@@ -783,6 +819,132 @@ impl Call {
             spawn_callback(move || f());
         }
         Ok(())
+    }
+
+    /// Returns true if this call has a negotiated video stream.
+    pub fn has_video(&self) -> bool {
+        self.inner.lock().video_codec.is_some()
+    }
+
+    /// Returns the negotiated video codec, if any.
+    pub fn video_codec(&self) -> Option<VideoCodec> {
+        self.inner.lock().video_codec
+    }
+
+    /// Mutes the video stream. Returns an error if already muted or not active.
+    pub fn mute_video(&self) -> Result<()> {
+        let mut inner = self.inner.lock();
+        if inner.state != CallState::Active {
+            return Err(Error::InvalidState);
+        }
+        if inner.video_codec.is_none() {
+            return Err(Error::NoVideoStream);
+        }
+        if inner.video_muted {
+            return Err(Error::VideoAlreadyMuted);
+        }
+        inner.video_muted = true;
+        if let Some(s) = inner.media_streams.get(1) {
+            s.muted.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
+    /// Unmutes the video stream. Returns an error if not muted or not active.
+    pub fn unmute_video(&self) -> Result<()> {
+        let mut inner = self.inner.lock();
+        if inner.state != CallState::Active {
+            return Err(Error::InvalidState);
+        }
+        if inner.video_codec.is_none() {
+            return Err(Error::NoVideoStream);
+        }
+        if !inner.video_muted {
+            return Err(Error::VideoNotMuted);
+        }
+        inner.video_muted = false;
+        if let Some(s) = inner.media_streams.get(1) {
+            s.muted.store(false, std::sync::atomic::Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
+    /// Sends an RTCP PLI (Picture Loss Indication) to request a keyframe from
+    /// the remote video sender (RFC 4585).
+    pub fn request_keyframe(&self) -> Result<()> {
+        let mut inner = self.inner.lock();
+        if inner.state != CallState::Active {
+            return Err(Error::InvalidState);
+        }
+        if inner.video_codec.is_none() {
+            return Err(Error::NoVideoStream);
+        }
+        // Reuse the video RTCP socket created by start_video_pipeline.
+        let rtcp_addr: Option<std::net::SocketAddr> = if inner.video_remote_port > 0 {
+            format!("{}:{}", inner.remote_ip, inner.video_remote_port + 1)
+                .parse()
+                .ok()
+        } else {
+            None
+        };
+        if let (Some(ref sock), Some(addr)) = (&inner.video_rtcp_socket, rtcp_addr) {
+            let local_ssrc = 0; // We don't track our video SSRC here; 0 is acceptable.
+            let remote_ssrc = 0; // Will be populated from first inbound video RTP.
+                                 // Send PLI.
+            let pli = crate::rtcp::build_pli(local_ssrc, remote_ssrc);
+            let _ = sock.send_to(&pli, addr);
+            // Also send FIR as a fallback.
+            let fir = crate::rtcp::build_fir(local_ssrc, remote_ssrc, inner.fir_seq_nr);
+            let _ = sock.send_to(&fir, addr);
+            inner.fir_seq_nr = inner.fir_seq_nr.wrapping_add(1);
+        }
+        Ok(())
+    }
+
+    /// Returns the raw video RTP reader (post-jitter, but video has no jitter buffer).
+    pub fn video_rtp_reader(&self) -> Option<crossbeam_channel::Receiver<RtpPacket>> {
+        self.inner
+            .lock()
+            .media_streams
+            .get(1)
+            .map(|s| s.channels.rtp_reader.rx.clone())
+    }
+
+    /// Returns the raw video RTP writer (for sending encoded video RTP).
+    pub fn video_rtp_writer(&self) -> Option<crossbeam_channel::Sender<RtpPacket>> {
+        self.inner
+            .lock()
+            .media_streams
+            .get(1)
+            .map(|s| s.channels.rtp_writer.tx.clone())
+    }
+
+    /// Returns the assembled video frame reader. Returns `None` until
+    /// packetization is implemented (PR 4).
+    pub fn video_reader(&self) -> Option<crossbeam_channel::Receiver<VideoFrame>> {
+        None
+    }
+
+    /// Returns the assembled video frame writer. Returns `None` until
+    /// packetization is implemented (PR 4).
+    pub fn video_writer(&self) -> Option<crossbeam_channel::Sender<VideoFrame>> {
+        None
+    }
+
+    /// Sets the video RTP port (called during call setup).
+    pub(crate) fn set_video_rtp_port(&self, port: i32) {
+        self.inner.lock().video_rtp_port = port;
+    }
+
+    /// Sets the video RTP socket (called during call setup).
+    pub(crate) fn set_video_rtp_socket(&self, socket: UdpSocket) {
+        self.inner.lock().video_rtp_socket = Some(Arc::new(socket));
+    }
+
+    /// Sets the negotiated video codec (test helper — production path uses negotiate_codec).
+    #[cfg(test)]
+    pub(crate) fn set_video_codec(&self, codec: VideoCodec) {
+        self.inner.lock().video_codec = Some(codec);
     }
 
     /// Sends a DTMF digit (e.g., `"1"`, `"#"`, `"*"`).
@@ -1170,6 +1332,63 @@ impl Call {
         );
         inner.media_streams.push(stream);
         inner.media_shared = Some(shared);
+
+        // Start video stream (index 1) if video was negotiated.
+        Self::start_video_pipeline(inner);
+    }
+
+    /// Starts the video media pipeline if video was negotiated and a video socket is available.
+    fn start_video_pipeline(inner: &mut CallInner) {
+        if inner.video_codec.is_none() || inner.video_rtp_socket.is_none() {
+            return;
+        }
+        if inner.media_streams.len() >= 2 {
+            return; // video stream already started
+        }
+        let video_socket = inner.video_rtp_socket.as_ref().unwrap();
+        if inner.remote_ip.is_empty() || inner.video_remote_port <= 0 {
+            return;
+        }
+        let video_remote_addr: std::net::SocketAddr =
+            match format!("{}:{}", inner.remote_ip, inner.video_remote_port).parse() {
+                Ok(a) => a,
+                Err(_) => return,
+            };
+        let video_transport = Arc::new(MediaTransport::new(
+            video_socket
+                .try_clone()
+                .expect("failed to clone video RTP socket"),
+            video_remote_addr,
+        ));
+        let video_channels = Arc::new(MediaChannels::new());
+
+        // Video RTCP socket (video RTP port + 1).
+        let video_rtp_port = video_socket.local_addr().map(|a| a.port()).unwrap_or(0);
+        let video_rtcp_socket = media::listen_rtcp_port(video_rtp_port).ok().map(Arc::new);
+        // Store RTCP socket in CallInner so request_keyframe() can reuse it.
+        inner.video_rtcp_socket = video_rtcp_socket.clone();
+        let video_rtcp_addr: Option<std::net::SocketAddr> = if inner.video_remote_port > 0 {
+            format!("{}:{}", inner.remote_ip, inner.video_remote_port + 1)
+                .parse()
+                .ok()
+        } else {
+            None
+        };
+
+        let video_config = media::VideoMediaConfig {
+            srtp_inbound: None, // Video SRTP deferred
+            srtp_outbound: None,
+            rtcp_socket: video_rtcp_socket,
+            rtcp_remote_addr: video_rtcp_addr,
+        };
+        let video_muted = Arc::new(std::sync::atomic::AtomicBool::new(inner.video_muted));
+        let video_stream = media::start_video_media(
+            video_config,
+            video_channels,
+            Some(video_transport),
+            video_muted,
+        );
+        inner.media_streams.push(video_stream);
     }
 
     /// Sends a SIP response via the dialog (e.g., 180 Ringing for inbound calls).
@@ -2454,5 +2673,129 @@ mod tests {
             rx.recv_timeout(Duration::from_millis(200)).unwrap(),
             CallState::Ended
         );
+    }
+
+    // --- Video ---
+
+    #[test]
+    fn has_video_false_for_audio_only() {
+        let call = Call::new_outbound(mock_dlg(), DialOptions::default());
+        assert!(!call.has_video());
+        assert!(call.video_codec().is_none());
+    }
+
+    #[test]
+    fn has_video_true_when_set() {
+        let call = Call::new_outbound(mock_dlg(), DialOptions::default());
+        call.set_video_codec(VideoCodec::H264);
+        assert!(call.has_video());
+        assert_eq!(call.video_codec(), Some(VideoCodec::H264));
+    }
+
+    #[test]
+    fn video_rtp_reader_none_without_video_stream() {
+        let call = Call::new_outbound(mock_dlg(), DialOptions::default());
+        assert!(call.video_rtp_reader().is_none());
+        assert!(call.video_rtp_writer().is_none());
+    }
+
+    #[test]
+    fn video_reader_writer_none_pr3() {
+        let call = Call::new_outbound(mock_dlg(), DialOptions::default());
+        assert!(call.video_reader().is_none());
+        assert!(call.video_writer().is_none());
+    }
+
+    #[test]
+    fn mute_video_requires_active() {
+        let call = Call::new_outbound(mock_dlg(), DialOptions::default());
+        call.set_video_codec(VideoCodec::H264);
+        assert!(matches!(call.mute_video(), Err(Error::InvalidState)));
+    }
+
+    #[test]
+    fn mute_video_requires_video_stream() {
+        let call = Call::new_inbound(mock_dlg());
+        call.accept().unwrap();
+        assert!(matches!(call.mute_video(), Err(Error::NoVideoStream)));
+    }
+
+    #[test]
+    fn mute_video_double_returns_error() {
+        let call = Call::new_inbound(mock_dlg());
+        call.accept().unwrap();
+        call.set_video_codec(VideoCodec::VP8);
+        call.mute_video().unwrap();
+        assert!(matches!(call.mute_video(), Err(Error::VideoAlreadyMuted)));
+    }
+
+    #[test]
+    fn unmute_video_when_not_muted_returns_error() {
+        let call = Call::new_inbound(mock_dlg());
+        call.accept().unwrap();
+        call.set_video_codec(VideoCodec::VP8);
+        assert!(matches!(call.unmute_video(), Err(Error::VideoNotMuted)));
+    }
+
+    #[test]
+    fn mute_unmute_video_round_trip() {
+        let call = Call::new_inbound(mock_dlg());
+        call.accept().unwrap();
+        call.set_video_codec(VideoCodec::H264);
+        call.mute_video().unwrap();
+        call.unmute_video().unwrap();
+        // Should be able to mute again.
+        call.mute_video().unwrap();
+    }
+
+    #[test]
+    fn audio_and_video_mute_independent() {
+        let call = Call::new_inbound(mock_dlg());
+        call.accept().unwrap();
+        call.set_video_codec(VideoCodec::H264);
+
+        // Mute audio — video should still work.
+        call.mute().unwrap();
+        call.mute_video().unwrap();
+        call.unmute().unwrap();
+        // Video is still muted.
+        assert!(matches!(call.mute_video(), Err(Error::VideoAlreadyMuted)));
+        call.unmute_video().unwrap();
+    }
+
+    #[test]
+    fn request_keyframe_requires_active() {
+        let call = Call::new_outbound(mock_dlg(), DialOptions::default());
+        call.set_video_codec(VideoCodec::H264);
+        assert!(matches!(call.request_keyframe(), Err(Error::InvalidState)));
+    }
+
+    #[test]
+    fn request_keyframe_requires_video() {
+        let call = Call::new_inbound(mock_dlg());
+        call.accept().unwrap();
+        assert!(matches!(call.request_keyframe(), Err(Error::NoVideoStream)));
+    }
+
+    #[test]
+    fn video_codec_from_remote_sdp() {
+        let call = Call::new_inbound(mock_dlg());
+        // Build a remote SDP with video.
+        let sdp = "v=0\r\n\
+            o=- 0 0 IN IP4 10.0.0.1\r\n\
+            s=-\r\n\
+            c=IN IP4 10.0.0.1\r\n\
+            t=0 0\r\n\
+            m=audio 5000 RTP/AVP 0\r\n\
+            a=rtpmap:0 PCMU/8000\r\n\
+            m=video 5002 RTP/AVP 96\r\n\
+            a=rtpmap:96 H264/90000\r\n\
+            a=fmtp:96 profile-level-id=42e01f;packetization-mode=1\r\n";
+        call.set_remote_sdp(sdp);
+        assert!(call.has_video());
+        assert_eq!(call.video_codec(), Some(VideoCodec::H264));
+        // Check that video remote port was extracted.
+        let inner = call.inner.lock();
+        assert_eq!(inner.video_remote_port, 5002);
     }
 }
