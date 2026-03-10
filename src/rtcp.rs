@@ -12,8 +12,14 @@ use crate::types::RtpPacket;
 const RTCP_SR: u8 = 200;
 /// RTCP packet type: Receiver Report (RFC 3550 §6.4.2).
 const RTCP_RR: u8 = 201;
+/// RTCP packet type: Payload-Specific Feedback (RFC 4585 §6.3).
+const RTCP_PSFB: u8 = 206;
 /// RTCP version (always 2, matching RTP).
 const RTCP_VERSION: u8 = 2;
+/// PLI feedback message type (RFC 4585 §6.3.1).
+const PLI_FMT: u8 = 1;
+/// FIR feedback message type (RFC 5104 §4.3.1).
+const FIR_FMT: u8 = 4;
 /// NTP epoch offset: seconds between 1900-01-01 and 1970-01-01.
 const NTP_EPOCH_OFFSET: u64 = 2_208_988_800;
 /// Minimum RTCP send interval (RFC 3550 §6.2).
@@ -313,6 +319,47 @@ pub enum RtcpPacket {
         ssrc: u32,
         reports: Vec<ReportBlock>,
     },
+    /// Picture Loss Indication (RFC 4585 §6.3.1).
+    Pli { sender_ssrc: u32, media_ssrc: u32 },
+    /// Full Intra Request (RFC 5104 §4.3.1).
+    Fir {
+        sender_ssrc: u32,
+        media_ssrc: u32,
+        seq_nr: u8,
+    },
+}
+
+/// Builds an RTCP PLI (Picture Loss Indication) packet (RFC 4585 §6.3.1).
+///
+/// Requests the remote video sender to generate a keyframe.
+pub fn build_pli(sender_ssrc: u32, media_ssrc: u32) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(12);
+    // V=2, P=0, FMT=1, PT=206 (PSFB), length=2 (12 bytes / 4 - 1).
+    buf.push((RTCP_VERSION << 6) | PLI_FMT);
+    buf.push(RTCP_PSFB);
+    buf.extend_from_slice(&2u16.to_be_bytes()); // length
+    buf.extend_from_slice(&sender_ssrc.to_be_bytes());
+    buf.extend_from_slice(&media_ssrc.to_be_bytes());
+    buf
+}
+
+/// Builds an RTCP FIR (Full Intra Request) packet (RFC 5104 §4.3.1).
+///
+/// Alternative keyframe request mechanism. `seq_nr` should be incremented
+/// per request to allow the receiver to detect duplicates.
+pub fn build_fir(sender_ssrc: u32, media_ssrc: u32, seq_nr: u8) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(20);
+    // V=2, P=0, FMT=4, PT=206 (PSFB), length=4 (20 bytes / 4 - 1).
+    buf.push((RTCP_VERSION << 6) | FIR_FMT);
+    buf.push(RTCP_PSFB);
+    buf.extend_from_slice(&4u16.to_be_bytes()); // length
+    buf.extend_from_slice(&sender_ssrc.to_be_bytes());
+    buf.extend_from_slice(&0u32.to_be_bytes()); // media SSRC = 0 per RFC 5104
+                                                // FCI: target SSRC + seq_nr + 3 reserved bytes.
+    buf.extend_from_slice(&media_ssrc.to_be_bytes());
+    buf.push(seq_nr);
+    buf.extend_from_slice(&[0u8; 3]); // reserved
+    buf
 }
 
 /// Parses an RTCP packet from raw bytes. Returns `None` for unknown types or truncated data.
@@ -359,6 +406,35 @@ pub fn parse_rtcp(data: &[u8]) -> Option<RtcpPacket> {
         RTCP_RR => {
             let reports = parse_report_blocks(&data[8..], rc);
             Some(RtcpPacket::ReceiverReport { ssrc, reports })
+        }
+        RTCP_PSFB => {
+            let fmt = data[0] & 0x1F;
+            match fmt {
+                PLI_FMT => {
+                    if data.len() < 12 {
+                        return None;
+                    }
+                    let media_ssrc = u32::from_be_bytes([data[8], data[9], data[10], data[11]]);
+                    Some(RtcpPacket::Pli {
+                        sender_ssrc: ssrc,
+                        media_ssrc,
+                    })
+                }
+                FIR_FMT => {
+                    if data.len() < 20 {
+                        return None;
+                    }
+                    // FCI starts at offset 12: target SSRC (4) + seq_nr (1) + reserved (3).
+                    let target_ssrc = u32::from_be_bytes([data[12], data[13], data[14], data[15]]);
+                    let seq_nr = data[16];
+                    Some(RtcpPacket::Fir {
+                        sender_ssrc: ssrc,
+                        media_ssrc: target_ssrc,
+                        seq_nr,
+                    })
+                }
+                _ => None,
+            }
         }
         _ => None,
     }
@@ -711,6 +787,83 @@ mod tests {
     fn delay_since_last_sr_zero_when_no_sr() {
         let stats = RtcpStats::new();
         assert_eq!(stats.delay_since_last_sr(), 0);
+    }
+
+    #[test]
+    fn build_pli_format() {
+        let pli = build_pli(0x11111111, 0x22222222);
+        assert_eq!(pli.len(), 12);
+        // V=2, P=0, FMT=1.
+        assert_eq!((pli[0] >> 6) & 0x03, 2);
+        assert_eq!(pli[0] & 0x1F, 1);
+        assert_eq!(pli[1], 206); // PSFB
+        assert_eq!(u16::from_be_bytes([pli[2], pli[3]]), 2); // length
+        assert_eq!(
+            u32::from_be_bytes([pli[4], pli[5], pli[6], pli[7]]),
+            0x11111111
+        );
+        assert_eq!(
+            u32::from_be_bytes([pli[8], pli[9], pli[10], pli[11]]),
+            0x22222222
+        );
+    }
+
+    #[test]
+    fn build_fir_format() {
+        let fir = build_fir(0xAAAAAAAA, 0xBBBBBBBB, 42);
+        assert_eq!(fir.len(), 20);
+        assert_eq!((fir[0] >> 6) & 0x03, 2);
+        assert_eq!(fir[0] & 0x1F, 4); // FMT=4
+        assert_eq!(fir[1], 206);
+        assert_eq!(u16::from_be_bytes([fir[2], fir[3]]), 4); // length
+                                                             // Sender SSRC.
+        assert_eq!(
+            u32::from_be_bytes([fir[4], fir[5], fir[6], fir[7]]),
+            0xAAAAAAAA
+        );
+        // Media SSRC = 0 per RFC 5104.
+        assert_eq!(u32::from_be_bytes([fir[8], fir[9], fir[10], fir[11]]), 0);
+        // FCI: target SSRC.
+        assert_eq!(
+            u32::from_be_bytes([fir[12], fir[13], fir[14], fir[15]]),
+            0xBBBBBBBB
+        );
+        // FCI: seq_nr.
+        assert_eq!(fir[16], 42);
+    }
+
+    #[test]
+    fn parse_pli_round_trip() {
+        let pli = build_pli(0x12345678, 0xABCDEF01);
+        let parsed = parse_rtcp(&pli).unwrap();
+        match parsed {
+            RtcpPacket::Pli {
+                sender_ssrc,
+                media_ssrc,
+            } => {
+                assert_eq!(sender_ssrc, 0x12345678);
+                assert_eq!(media_ssrc, 0xABCDEF01);
+            }
+            _ => panic!("expected Pli"),
+        }
+    }
+
+    #[test]
+    fn parse_fir_round_trip() {
+        let fir = build_fir(0xDEADBEEF, 0xCAFEBABE, 7);
+        let parsed = parse_rtcp(&fir).unwrap();
+        match parsed {
+            RtcpPacket::Fir {
+                sender_ssrc,
+                media_ssrc,
+                seq_nr,
+            } => {
+                assert_eq!(sender_ssrc, 0xDEADBEEF);
+                assert_eq!(media_ssrc, 0xCAFEBABE);
+                assert_eq!(seq_nr, 7);
+            }
+            _ => panic!("expected Fir"),
+        }
     }
 
     #[test]

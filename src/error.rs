@@ -37,6 +37,15 @@ pub enum Error {
     /// Unmute was requested but the call is not muted.
     #[error("xphone: not muted")]
     NotMuted,
+    /// Video mute was requested but video is already muted.
+    #[error("xphone: video already muted")]
+    VideoAlreadyMuted,
+    /// Video unmute was requested but video is not muted.
+    #[error("xphone: video not muted")]
+    VideoNotMuted,
+    /// Operation requires a video stream but none is active.
+    #[error("xphone: no video stream")]
+    NoVideoStream,
     /// [`Phone::connect`](crate::Phone) called while already connected.
     #[error("xphone: already connected")]
     AlreadyConnected,

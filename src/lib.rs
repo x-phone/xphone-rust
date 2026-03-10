@@ -37,5 +37,5 @@ pub use sip::conn::TlsConfig;
 pub use subscription::SubId;
 pub use types::{
     CallState, Codec, Direction, EndReason, ExtensionState, ExtensionStatus, NotifyEvent,
-    PhoneState, SipMessage, SubState, VideoCodec, VoicemailStatus,
+    PhoneState, SipMessage, SubState, VideoCodec, VideoFrame, VoicemailStatus,
 };

@@ -723,6 +723,191 @@ fn drain_jb_inline(
     }
 }
 
+/// Configuration for the video media pipeline.
+pub struct VideoMediaConfig {
+    /// Optional SRTP context for decrypting inbound video RTP.
+    pub srtp_inbound: Option<SrtpContext>,
+    /// Optional SRTP context for encrypting outbound video RTP.
+    pub srtp_outbound: Option<SrtpContext>,
+    /// RTCP socket for sending/receiving video RTCP packets.
+    pub rtcp_socket: Option<Arc<UdpSocket>>,
+    /// Remote RTCP address for video.
+    pub rtcp_remote_addr: Option<SocketAddr>,
+}
+
+/// Start a video media pipeline on a dedicated std::thread.
+///
+/// Unlike the audio pipeline, the video pipeline has no jitter buffer, no codec
+/// processing, no PCM channels, and no DTMF handling. It is a simple RTP
+/// passthrough: inbound packets are fanned out to readers, outbound packets are
+/// sent via the transport.
+pub fn start_video_media(
+    config: VideoMediaConfig,
+    channels: Arc<MediaChannels>,
+    transport: Option<Arc<MediaTransport>>,
+    muted: Arc<AtomicBool>,
+) -> MediaStream {
+    let (done_tx, done_rx) = bounded::<()>(1);
+
+    let srtp_in = config.srtp_inbound.map(|ctx| Arc::new(Mutex::new(ctx)));
+    let srtp_out = config.srtp_outbound.map(|ctx| Arc::new(Mutex::new(ctx)));
+    let rtcp_socket = config.rtcp_socket;
+    let rtcp_remote_addr = config.rtcp_remote_addr;
+
+    // Spawn inbound UDP reader thread (identical to audio reader).
+    let (reader_done_tx, reader_done_rx) = bounded::<()>(1);
+    let rtcp_socket_for_reader = rtcp_socket.as_ref().map(Arc::clone);
+    let (rtcp_recv_tx, rtcp_recv_rx) = bounded::<Vec<u8>>(16);
+
+    let reader_thread = transport.as_ref().map(|tr| {
+        let socket = Arc::clone(&tr.socket);
+        let inbound_tx = channels.rtp_inbound.tx.clone();
+        let inbound_rx = channels.rtp_inbound.rx.clone();
+        let done = reader_done_rx;
+        let srtp_in_clone = srtp_in.clone();
+        let rtcp_sock = rtcp_socket_for_reader;
+        let rtcp_tx = rtcp_recv_tx;
+        debug!("video: starting UDP reader thread");
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 2048];
+            let mut rtcp_buf = [0u8; 512];
+            socket
+                .set_read_timeout(Some(Duration::from_millis(50)))
+                .ok();
+            if let Some(ref rsock) = rtcp_sock {
+                rsock.set_read_timeout(Some(Duration::from_millis(1))).ok();
+            }
+            loop {
+                if done.try_recv().is_ok() {
+                    return;
+                }
+                if let Ok((n, _addr)) = socket.recv_from(&mut buf) {
+                    if n < 12 {
+                        continue;
+                    }
+                    let raw = &buf[..n];
+                    let data = if let Some(ref ctx) = srtp_in_clone {
+                        match ctx.lock().unprotect(raw) {
+                            Ok(d) => d,
+                            Err(_) => continue,
+                        }
+                    } else {
+                        raw.to_vec()
+                    };
+                    if let Some(pkt) = crate::types::RtpPacket::parse(&data) {
+                        send_drop_oldest(&inbound_tx, &inbound_rx, pkt);
+                    }
+                }
+                // RTCP read.
+                if let Some(ref rsock) = rtcp_sock {
+                    if let Ok((n, _)) = rsock.recv_from(&mut rtcp_buf) {
+                        let _ = rtcp_tx.try_send(rtcp_buf[..n].to_vec());
+                    }
+                }
+            }
+        })
+    });
+
+    let transport_for_thread = transport.clone();
+    let srtp_out_for_thread = srtp_out;
+    let rtcp_socket_for_thread = rtcp_socket;
+    let muted_for_thread = Arc::clone(&muted);
+    let channels_for_thread = Arc::clone(&channels);
+    let thread = std::thread::spawn(move || {
+        let channels = channels_for_thread;
+        let out_ssrc = rand_u32();
+
+        let mut rtcp_stats = RtcpStats::new();
+        let rtcp_tick = crossbeam_channel::tick(Duration::from_secs(rtcp::RTCP_INTERVAL_SECS));
+
+        loop {
+            crossbeam_channel::select! {
+                recv(done_rx) -> _ => return,
+
+                recv(channels.rtp_inbound.rx) -> msg => {
+                    let pkt = match msg {
+                        Ok(p) => p,
+                        Err(_) => return,
+                    };
+                    // Fan out to raw reader and reordered reader (no jitter buffer for video).
+                    rtcp_stats.record_rtp_received(&pkt, 90000);
+                    send_drop_oldest(
+                        &channels.rtp_raw_reader.tx,
+                        &channels.rtp_raw_reader.rx,
+                        clone_packet(&pkt),
+                    );
+                    send_drop_oldest(
+                        &channels.rtp_reader.tx,
+                        &channels.rtp_reader.rx,
+                        pkt,
+                    );
+                },
+
+                recv(channels.rtp_writer.rx) -> msg => {
+                    let pkt = match msg {
+                        Ok(p) => p,
+                        Err(_) => return,
+                    };
+                    if muted_for_thread.load(Ordering::Relaxed) {
+                        continue;
+                    }
+                    rtcp_stats.record_rtp_sent(pkt.payload.len(), pkt.header.timestamp);
+                    if let Some(ref sent) = channels.sent_rtp {
+                        send_drop_oldest(&sent.tx, &sent.rx, clone_packet(&pkt));
+                    }
+                    if let Some(ref tr) = transport_for_thread {
+                        send_rtp_to_transport(pkt.to_bytes(), &srtp_out_for_thread, tr, None);
+                    }
+                },
+
+                recv(rtcp_tick) -> _ => {
+                    if let Some(ref rsock) = rtcp_socket_for_thread {
+                        if let Some(addr) = rtcp_remote_addr {
+                            let sr = rtcp::build_sr(out_ssrc, &mut rtcp_stats);
+                            let data = if let Some(ref ctx) = srtp_out_for_thread {
+                                match ctx.lock().protect_rtcp(&sr) {
+                                    Ok(encrypted) => encrypted,
+                                    Err(e) => {
+                                        warn!(error = %e, "video: SRTCP protect failed");
+                                        continue;
+                                    }
+                                }
+                            } else {
+                                sr
+                            };
+                            let _ = rsock.send_to(&data, addr);
+                        }
+                    }
+                },
+
+                recv(rtcp_recv_rx) -> msg => {
+                    if let Ok(data) = msg {
+                        if let Some(rtcp::RtcpPacket::SenderReport { ntp_sec, ntp_frac, .. }) = rtcp::parse_rtcp(&data) {
+                            rtcp_stats.process_incoming_sr(ntp_sec, ntp_frac);
+                        }
+                    }
+                },
+            }
+        }
+    });
+
+    let handle = MediaHandle {
+        done_tx,
+        reader_done_tx: if reader_thread.is_some() {
+            Some(reader_done_tx)
+        } else {
+            None
+        },
+        thread: Some(thread),
+        reader_thread,
+    };
+    MediaStream {
+        handle,
+        channels,
+        muted,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1316,6 +1501,95 @@ mod tests {
 
         stream.stop();
         // Thread should have joined. If not, test would hang.
+        assert!(stream.is_stopped());
+    }
+
+    // --- Video pipeline tests ---
+
+    fn start_video(ch: Arc<MediaChannels>, muted: Arc<AtomicBool>) -> MediaStream {
+        let config = VideoMediaConfig {
+            srtp_inbound: None,
+            srtp_outbound: None,
+            rtcp_socket: None,
+            rtcp_remote_addr: None,
+        };
+        start_video_media(config, ch, None, muted)
+    }
+
+    #[test]
+    fn video_stream_rtp_passthrough() {
+        let ch = test_channels();
+        let mut stream = start_video(ch.clone(), test_muted());
+
+        inject(&ch, make_rtp(1, 96, vec![0xAB; 100]));
+
+        let raw = read_pkt(&ch.rtp_raw_reader.rx, 200).unwrap();
+        assert_eq!(raw.header.sequence_number, 1);
+        assert_eq!(raw.header.payload_type, 96);
+
+        let ordered = read_pkt(&ch.rtp_reader.rx, 200).unwrap();
+        assert_eq!(ordered.header.sequence_number, 1);
+
+        stream.stop();
+    }
+
+    #[test]
+    fn video_stream_rtp_writer() {
+        let ch = test_channels();
+        let mut stream = start_video(ch.clone(), test_muted());
+
+        let pkt = make_rtp(42, 96, vec![0xDE; 200]);
+        ch.rtp_writer.tx.send(pkt).unwrap();
+
+        let sent = read_pkt(&ch.sent_rtp.as_ref().unwrap().rx, 200).unwrap();
+        assert_eq!(sent.header.sequence_number, 42);
+        assert_eq!(sent.payload.len(), 200);
+
+        stream.stop();
+    }
+
+    #[test]
+    fn video_stream_mute_suppresses_send() {
+        let ch = test_channels();
+        let muted = test_muted();
+        let mut stream = start_video(ch.clone(), muted.clone());
+
+        muted.store(true, Ordering::Relaxed);
+
+        let _ = ch.rtp_writer.tx.try_send(make_rtp(1, 96, vec![0; 100]));
+        std::thread::sleep(Duration::from_millis(50));
+
+        let sent_rx = &ch.sent_rtp.as_ref().unwrap().rx;
+        assert!(
+            sent_rx.try_recv().is_err(),
+            "video RTP must be suppressed while muted"
+        );
+
+        stream.stop();
+    }
+
+    #[test]
+    fn video_stream_no_pcm_decode() {
+        let ch = test_channels();
+        let mut stream = start_video(ch.clone(), test_muted());
+
+        // Inject video RTP — PCM reader should remain empty (no codec processing).
+        inject(&ch, make_rtp(1, 96, vec![0; 100]));
+        std::thread::sleep(Duration::from_millis(50));
+
+        assert!(
+            ch.pcm_reader.rx.try_recv().is_err(),
+            "video stream must not produce PCM output"
+        );
+
+        stream.stop();
+    }
+
+    #[test]
+    fn video_stream_stop() {
+        let ch = test_channels();
+        let mut stream = start_video(ch, test_muted());
+        stream.stop();
         assert!(stream.is_stopped());
     }
 }
