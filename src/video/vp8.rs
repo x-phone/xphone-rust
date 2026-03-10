@@ -105,17 +105,17 @@ impl VideoDepacketizer for Vp8Depacketizer {
             }
 
             // TL0PICIDX
-            if l {
+            if l && offset < pkt.payload.len() {
                 offset += 1;
             }
 
             // TID/Y/KEYIDX
-            if t_or_k {
+            if t_or_k && offset < pkt.payload.len() {
                 offset += 1;
             }
         }
 
-        if offset > pkt.payload.len() {
+        if offset >= pkt.payload.len() {
             return result;
         }
 

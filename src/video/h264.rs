@@ -146,8 +146,15 @@ impl VideoDepacketizer for H264Depacketizer {
 
         // Detect timestamp change → emit buffered frame.
         let mut result = None;
-        if self.started && pkt.header.timestamp != self.current_ts && !self.nals.is_empty() {
-            result = self.emit_frame();
+        if self.started && pkt.header.timestamp != self.current_ts {
+            if !self.nals.is_empty() {
+                result = self.emit_frame();
+            }
+            // Discard incomplete FU-A reassembly from previous frame.
+            if self.fua_active {
+                self.fua_buf.clear();
+                self.fua_active = false;
+            }
         }
         self.current_ts = pkt.header.timestamp;
         self.started = true;
@@ -168,7 +175,7 @@ impl VideoDepacketizer for H264Depacketizer {
                     let size =
                         u16::from_be_bytes([pkt.payload[offset], pkt.payload[offset + 1]]) as usize;
                     offset += 2;
-                    if offset + size > pkt.payload.len() {
+                    if size == 0 || offset + size > pkt.payload.len() {
                         break;
                     }
                     self.process_nal(&pkt.payload[offset..offset + size]);
@@ -198,8 +205,8 @@ impl VideoDepacketizer for H264Depacketizer {
                 }
 
                 if end && self.fua_active {
-                    let nal = std::mem::take(&mut self.fua_buf);
-                    self.process_nal(&nal);
+                    self.process_nal(&self.fua_buf.clone());
+                    self.fua_buf.clear(); // retain capacity for next FU-A
                     self.fua_active = false;
                 }
             }
@@ -251,7 +258,7 @@ impl VideoPacketizer for H264Packetizer {
             }
             if nal.len() <= mtu {
                 // Single NAL unit — payload is just the NAL.
-                payloads.push(nal.clone());
+                payloads.push(nal.to_vec());
             } else {
                 // FU-A fragmentation.
                 let nri = nal[0] & 0xE0;
@@ -293,7 +300,8 @@ impl VideoPacketizer for H264Packetizer {
 
 /// Extracts individual NAL units from an Annex-B byte stream.
 /// Handles both 3-byte (00 00 01) and 4-byte (00 00 00 01) start codes.
-fn extract_nals(data: &[u8]) -> Vec<Vec<u8>> {
+/// Returns slices borrowing from the input data to avoid allocations.
+fn extract_nals(data: &[u8]) -> Vec<&[u8]> {
     let mut nals = Vec::new();
     let mut i = 0;
     let len = data.len();
@@ -320,7 +328,7 @@ fn extract_nals(data: &[u8]) -> Vec<Vec<u8>> {
             if data[i + 2] == 1 {
                 // 3-byte start code.
                 if i > nal_start {
-                    nals.push(data[nal_start..i].to_vec());
+                    nals.push(&data[nal_start..i]);
                 }
                 i += 3;
                 nal_start = i;
@@ -329,7 +337,7 @@ fn extract_nals(data: &[u8]) -> Vec<Vec<u8>> {
             if i + 4 <= len && data[i + 2] == 0 && data[i + 3] == 1 {
                 // 4-byte start code.
                 if i > nal_start {
-                    nals.push(data[nal_start..i].to_vec());
+                    nals.push(&data[nal_start..i]);
                 }
                 i += 4;
                 nal_start = i;
@@ -341,7 +349,7 @@ fn extract_nals(data: &[u8]) -> Vec<Vec<u8>> {
 
     // Remaining data after last start code.
     if nal_start < len {
-        nals.push(data[nal_start..len].to_vec());
+        nals.push(&data[nal_start..len]);
     }
 
     nals
@@ -445,6 +453,27 @@ mod tests {
         assert_eq!(frame.timestamp, 3000);
         // Should contain start_code + SPS + start_code + PPS + start_code + IDR.
         assert!(frame.data.len() > 12);
+    }
+
+    #[test]
+    fn stap_a_zero_length_nal_does_not_loop() {
+        let mut depkt = H264Depacketizer::new();
+        // STAP-A with a zero-length NAL size field — must not infinite loop.
+        let payload = vec![
+            NAL_TYPE_STAP_A, // STAP-A indicator
+            0x00,
+            0x00, // NAL size = 0 (malformed)
+            0x00,
+            0x03, // next NAL size = 3
+            0x41,
+            0x01,
+            0x02, // NAL data
+        ];
+        let pkt = make_rtp(payload, 9000, true, 1);
+        // Should not hang — breaks on zero-length NAL.
+        let frame = depkt.depacketize(&pkt);
+        // The zero-length NAL breaks parsing, so we get no NALs from this packet.
+        assert!(frame.is_none());
     }
 
     // --- FU-A ---
