@@ -101,7 +101,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-xphone = "0.2"
+xphone = "0.3"
 ```
 
 Requires Rust 1.87+.
@@ -186,34 +186,62 @@ if let Some(pcm_rx) = call.pcm_reader() {
 
 | Feature | Status |
 |---|---|
+| **Calling** | |
 | SIP Registration (auth, keepalive, auto-reconnect) | Done |
 | Inbound & outbound calls | Done |
 | Hold / Resume (re-INVITE) | Done |
 | Blind transfer (REFER) | Done |
-| DTMF send/receive (RFC 4733) | Done |
+| Attended transfer (REFER with Replaces, RFC 3891) | Done |
+| Call waiting (`Phone.calls()` API) | Done |
 | Session timers (RFC 4028) | Done |
 | Mute / Unmute | Done |
+| 302 redirect following | Done |
+| Early media (183 Session Progress) | Done |
+| **DTMF** | |
+| RFC 4733 (RTP telephone-events) | Done |
+| SIP INFO (RFC 2976) | Done |
+| **Audio codecs** | |
 | G.711 u-law (PCMU), G.711 A-law (PCMA) | Done |
-| G.722 wideband codec | Done |
-| Opus codec (optional `opus-codec` feature) | Done |
+| G.722 wideband | Done |
+| Opus (optional `opus-codec` feature, requires libopus) | Done |
+| G.729 (optional `g729-codec` feature, pure Rust) | Done |
 | PCM audio frames (`Vec<i16>`) and raw RTP access | Done |
 | Jitter buffer | Done |
-| SRTP (encrypted media, AES_CM_128_HMAC_SHA1_80) | Done |
+| **Video** | |
+| H.264 (RFC 6184) and VP8 (RFC 7741) | Done |
+| Video RTP pipeline with depacketizer/packetizer | Done |
+| Mid-call video upgrade/downgrade (re-INVITE) | Done |
+| Video upgrade accept/reject API (privacy-safe) | Done |
+| VideoReader / VideoWriter / VideoRTPReader / VideoRTPWriter | Done |
+| RTCP PLI/FIR for keyframe requests | Done |
+| **Security** | |
+| SRTP (AES_CM_128_HMAC_SHA1_80) with SDES key exchange | Done |
 | SRTP replay protection (RFC 3711) | Done |
-| RTCP sender/receiver reports (RFC 3550) | Done |
+| SRTCP encryption (RFC 3711 §3.4) | Done |
+| Key material zeroization | Done |
+| Video SRTP (separate contexts for audio/video) | Done |
+| **Network** | |
 | TCP and TLS SIP transport | Done |
-| Early media (183 Session Progress) | Done |
 | STUN NAT traversal (RFC 5389) | Done |
-| 302 redirect following (RFC 3261) | Done |
+| TURN relay for symmetric NAT (RFC 5766) | Done |
+| ICE-Lite (RFC 8445 §2.2) | Done |
+| RTCP Sender/Receiver Reports (RFC 3550) | Done |
+| **Messaging** | |
+| SIP MESSAGE instant messaging (RFC 3428) | Done |
+| SIP SUBSCRIBE/NOTIFY (RFC 6665) | Done |
+| Generic event subscriptions (presence, dialog, etc.) | Done |
+| MWI / voicemail notification (RFC 3842) | Done |
+| BLF / Busy Lamp Field monitoring | Done |
+| **Testing** | |
 | MockPhone & MockCall for unit testing | Done |
-| Attended transfer | Planned |
 
 ---
 
 ## Configuration
 
 ```rust
-use xphone::{Config, PhoneBuilder, Phone};
+use xphone::{Config, PhoneBuilder, Phone, DtmfMode};
+use xphone::types::Codec;
 use std::time::Duration;
 
 // Direct struct construction:
@@ -222,27 +250,51 @@ let phone = Phone::new(Config {
     password: "secret".into(),
     host: "pbx.example.com".into(),
     port: 5060,
-    transport: "udp".into(),
+    transport: "udp".into(),                              // "udp" | "tcp" | "tls"
     rtp_port_min: 10000,
     rtp_port_max: 20000,
-    nat_keepalive_interval: Some(Duration::from_secs(25)),
-    media_timeout: Duration::from_secs(30),
+    codec_prefs: vec![Codec::Opus, Codec::PCMU],          // codec preference order
     jitter_buffer: Duration::from_millis(50),
+    media_timeout: Duration::from_secs(30),
+    nat_keepalive_interval: Some(Duration::from_secs(25)),
+    stun_server: Some("stun.l.google.com:19302".into()),
+    srtp: true,
+    dtmf_mode: DtmfMode::Rfc4733,                        // or SipInfo, Both
+    ice: true,
+    turn_server: Some("turn.example.com:3478".into()),
+    turn_username: Some("user".into()),
+    turn_password: Some("pass".into()),
     ..Config::default()
 });
 
 // Or use the builder:
-let phone = PhoneBuilder::new()
-    .credentials("1001", "secret", "pbx.example.com")
-    .rtp_ports(10000, 20000)
-    .build();
+let phone = Phone::new(
+    PhoneBuilder::new()
+        .credentials("1001", "secret", "pbx.example.com")
+        .rtp_ports(10000, 20000)
+        .codecs(vec![Codec::Opus, Codec::PCMU])
+        .srtp(true)
+        .dtmf_mode(DtmfMode::Rfc4733)
+        .stun_server("stun.l.google.com:19302")
+        .ice(true)
+        .turn_server("turn.example.com:3478")
+        .turn_credentials("user", "pass")
+        .nat_keepalive(Duration::from_secs(25))
+        .build(),
+);
 ```
+
+See the [API documentation](https://docs.rs/xphone) for all options.
 
 ---
 
-## NAT Traversal (STUN)
+## NAT Traversal
 
-If your application runs behind NAT (most deployments), configure a STUN server so xphone can discover your public IP and advertise it correctly in SIP and SDP:
+xphone supports three levels of NAT traversal, depending on your network environment:
+
+### STUN (most deployments)
+
+Discovers your public IP via a STUN Binding Request. Sufficient when your NAT allows direct UDP:
 
 ```rust
 let phone = Phone::new(Config {
@@ -252,22 +304,112 @@ let phone = Phone::new(Config {
     stun_server: Some("stun.l.google.com:19302".into()),
     ..Config::default()
 });
-
-// Or with the builder:
-let phone = Phone::new(
-    PhoneBuilder::new()
-        .credentials("1001", "secret", "sip.telnyx.com")
-        .stun_server("stun.l.google.com:19302")
-        .build(),
-);
 ```
 
-When `stun_server` is set, xphone sends a STUN Binding Request at startup to learn your external IP. If the STUN server is unreachable, it falls back to local IP detection automatically.
+Common public STUN servers: `stun.l.google.com:19302`, `stun1.l.google.com:19302`, `stun.cloudflare.com:3478`
 
-Common public STUN servers:
-- `stun.l.google.com:19302`
-- `stun1.l.google.com:19302`
-- `stun.cloudflare.com:3478`
+### TURN (symmetric NAT)
+
+For environments where STUN alone fails (cloud VMs, corporate firewalls with symmetric NAT), TURN relays media through an intermediary:
+
+```rust
+let phone = Phone::new(Config {
+    username: "1001".into(),
+    password: "secret".into(),
+    host: "sip.telnyx.com".into(),
+    turn_server: Some("turn.example.com:3478".into()),
+    turn_username: Some("user".into()),
+    turn_password: Some("pass".into()),
+    ..Config::default()
+});
+```
+
+### ICE-Lite
+
+Enables ICE-Lite (RFC 8445 §2.2) for SDP-level candidate negotiation:
+
+```rust
+let phone = Phone::new(Config {
+    username: "1001".into(),
+    password: "secret".into(),
+    host: "sip.telnyx.com".into(),
+    ice: true,
+    stun_server: Some("stun.l.google.com:19302".into()),
+    ..Config::default()
+});
+```
+
+> Only enable STUN/TURN/ICE when the SIP server is on the public internet. Do not enable it when connecting via VPN or private network, as the discovered address will be unreachable from the server.
+
+---
+
+## Opus Codec
+
+Opus support is optional and requires `libopus` installed on the system. The default build needs no external C libraries.
+
+### Install libopus
+
+```bash
+# Debian / Ubuntu
+sudo apt-get install libopus-dev
+
+# macOS
+brew install opus
+```
+
+### Build with Opus
+
+```bash
+cargo build --features opus-codec
+cargo test --features opus-codec
+```
+
+### Usage
+
+```rust
+use xphone::types::Codec;
+
+let phone = Phone::new(Config {
+    username: "1001".into(),
+    password: "secret".into(),
+    host: "sip.telnyx.com".into(),
+    codec_prefs: vec![Codec::Opus, Codec::PCMU], // prefer Opus, fall back to PCMU
+    ..Config::default()
+});
+```
+
+Opus runs at 8kHz natively — no resampling needed. PCM frames remain `Vec<i16>`, mono, 160 samples (20ms), same as G.711. RTP timestamps use 48kHz clock per RFC 7587.
+
+Without the `opus-codec` feature, `Codec::Opus` is accepted in configuration but will not be negotiated (the codec processor returns `None`, so SDP negotiation falls through to the next preferred codec).
+
+---
+
+## G.729 Codec
+
+G.729 support is optional via the `g729-codec` feature. Unlike Opus, it uses a pure Rust implementation (`g729-sys`) — no system libraries required.
+
+### Build with G.729
+
+```bash
+cargo build --features g729-codec
+cargo test --features g729-codec
+```
+
+### Usage
+
+```rust
+use xphone::types::Codec;
+
+let phone = Phone::new(Config {
+    username: "1001".into(),
+    password: "secret".into(),
+    host: "sip.telnyx.com".into(),
+    codec_prefs: vec![Codec::G729, Codec::PCMU],
+    ..Config::default()
+});
+```
+
+G.729 runs at 8kHz, 8 kbps CS-ACELP. SDP advertises `annexb=no` — Annex B (VAD/CNG) is not supported.
 
 ---
 
@@ -387,6 +529,8 @@ if let Some(rtp_tx) = call.rtp_writer() {
 
 ## Media Pipeline
 
+### Audio
+
 ```
 Inbound:
   SIP Trunk -> RTP/UDP -> Jitter Buffer -> Codec Decode -> pcm_reader (Vec<i16>)
@@ -396,9 +540,23 @@ Outbound:
   rtp_writer             -> RTP/UDP -> SIP Trunk       (raw mode)
 ```
 
-All channels are buffered (256 entries). Inbound drops oldest on overflow; outbound drops newest. Each frame is 160 samples at 8000 Hz = 20ms of audio.
+### Video
 
-The media pipeline runs on a dedicated `std::thread` (not async), bridged to the rest of the application via `crossbeam-channel`.
+```
+Inbound:
+  SIP Trunk -> RTP/UDP -> Depacketizer (H.264/VP8) -> video_reader (VideoFrame)
+                        -> video_rtp_reader (raw video RTP packets)
+
+Outbound:
+  video_writer (VideoFrame) -> Packetizer (H.264/VP8) -> RTP/UDP -> SIP Trunk
+  video_rtp_writer          -> RTP/UDP -> SIP Trunk   (raw mode)
+```
+
+Video uses a separate RTP port and independent SRTP contexts. RTCP PLI/FIR requests trigger keyframe generation on the sender side.
+
+All channels are buffered (256 entries). Inbound taps drop oldest on overflow; outbound writers drop newest. Audio frames are 160 samples at 8000 Hz = 20ms. Video frames carry codec-specific NAL units (H.264) or encoded frames (VP8).
+
+Each pipeline runs on a dedicated `std::thread` per call, bridged to the application via `crossbeam-channel`.
 
 ---
 
@@ -412,6 +570,9 @@ call.resume()?;
 // Blind transfer
 call.blind_transfer("sip:1003@pbx.example.com")?;
 
+// Attended transfer (consult call_b, then bridge)
+phone.attended_transfer(&call_a, &call_b)?;
+
 // Mute (suppresses outbound audio, inbound still flows)
 call.mute()?;
 call.unmute()?;
@@ -421,6 +582,18 @@ call.send_dtmf("5")?;
 call.on_dtmf(|digit| {
     println!("Received: {}", digit);
 });
+
+// Mid-call video upgrade
+call.add_video(&[VideoCodec::H264, VideoCodec::VP8], 10000, 20000)?;
+call.on_video_request(|req: VideoUpgradeRequest| {
+    req.accept(); // or req.reject()
+});
+call.on_video(|| {
+    // Video is now active — read frames from call.video_reader()
+});
+
+// Instant messaging
+phone.send_message("sip:1002@pbx", "Hello!")?;
 ```
 
 ---
@@ -491,14 +664,14 @@ All SIP messages, RTP stats, media events, and call state transitions are instru
 
 ## Example App
 
-`examples/sipcli` is a fully interactive terminal SIP client — registration, inbound/outbound calls, hold, resume, DTMF, mute, transfer, echo mode, and system speaker output:
+`examples/sipcli` is a fully interactive terminal SIP client — registration, inbound/outbound calls, hold, resume, DTMF, mute, transfer, video calls, echo mode, and system speaker output:
 
 ```bash
-# Using a profile from ~/.sipcli.yaml
+# Audio-only
 cargo run --example sipcli --features cli -- --profile myserver
 
-# Direct flags
-cargo run --example sipcli --features cli -- --server pbx.example.com --user 1001 --pass secret
+# With video display (H.264 decoding + window)
+cargo run --example sipcli --features video-display -- --profile myserver
 ```
 
 ---
@@ -507,73 +680,41 @@ cargo run --example sipcli --features cli -- --server pbx.example.com --user 100
 
 | Layer | Implementation |
 |---|---|
-| SIP Signaling | Custom (message parsing, digest auth, transactions, UDP/TCP/TLS, STUN) |
-| RTP / SRTP | Custom (`std::net::UdpSocket`, AES_CM_128_HMAC_SHA1_80) |
-| G.711 / G.722 / Opus | Built-in (PCMU, PCMA, G.722); Opus via optional `opus-codec` feature |
+| SIP Signaling | Built-in (message parsing, digest auth, transactions, UDP/TCP/TLS) |
+| RTP / SRTP / SRTCP | Built-in (`std::net::UdpSocket`, AES_CM_128_HMAC_SHA1_80, replay protection) |
+| G.711 / G.722 | Built-in (PCMU, PCMA, G.722 ADPCM) |
+| G.729 | [g729-sys](https://crates.io/crates/g729-sys) (optional, `g729-codec` feature, pure Rust) |
+| Opus | [opus](https://crates.io/crates/opus) (optional, `opus-codec` feature, libopus FFI) |
+| H.264 / VP8 | Built-in packetizer/depacketizer (RFC 6184, RFC 7741) |
+| RTCP | Built-in (RFC 3550 SR/RR + PLI/FIR) |
 | Jitter Buffer | Built-in |
+| STUN | Built-in (RFC 5389) |
+| TURN | Built-in (RFC 5766) |
+| ICE-Lite | Built-in (RFC 8445 §2.2) |
 | TUI (sipcli) | [ratatui](https://github.com/ratatui/ratatui) + [cpal](https://github.com/RustAudio/cpal) |
 
-No external SIP or RTP crate dependencies — the entire SIP stack is implemented from scratch.
+No external SIP or RTP crate dependencies — the entire protocol stack is implemented from scratch.
 
 ---
 
 ## Known Limitations
 
-This library is actively developed but not yet feature-complete. The gaps below are worth understanding before committing to it for a production deployment.
-
 ### Security
 
-**SRTP is implemented with replay protection.** The `AES_CM_128_HMAC_SHA1_80` cipher suite is supported with SDES key exchange and a 128-packet sliding window for replay protection (RFC 3711). Crypto uses audited RustCrypto crates (`aes`, `sha1`, `hmac`). Key material zeroization, SRTCP encryption, and per-SSRC crypto state tracking are not yet implemented. DTLS-SRTP key exchange is not supported (SDES only). Evaluate accordingly for high-security environments.
+**SRTP uses SDES key exchange only.** DTLS-SRTP key exchange is not supported. SDES works well with most SIP trunks but is not suitable for WebRTC interop, which requires DTLS-SRTP.
 
 ### Codec coverage
 
-**Opus is supported as an optional feature.** Enable the `opus-codec` feature to add Opus codec support (PT 111). This requires `libopus` to be installed on the system. G.711 (PCMU/PCMA) and G.722 are always available with no external dependencies.
+**Opus requires libopus (C library).** G.729 uses a pure Rust implementation with no system dependencies. G.711 and G.722 are always available with no external dependencies.
 
-**G.729 is not supported.** G.729 remains widely deployed in enterprise PBX environments (Cisco, Avaya, Mitel). If your SIP trunk or PBX requires G.729, xphone cannot currently interoperate with it.
-
-**PCM sample rate is fixed at 8 kHz (narrowband) or 16 kHz (G.722 wideband).** There is no configurable sample rate — codec selection determines the rate.
-
-### Call control
-
-**Attended (consultative) transfer is not implemented.** Only blind transfer via REFER is supported. Attended transfer requires coordinating two simultaneous call legs with a REFER/Replaces header.
-
-**DTMF is RFC 4733 (RTP telephone-events) only.** Some legacy PBXes use SIP INFO (RFC 2976) for DTMF instead. If your system requires SIP INFO DTMF, tones may not be received.
-
-**No call parking.** Park/retrieve functionality (common in office deployments) is not implemented.
-
-### Enterprise features
-
-**No MWI (Message Waiting Indicator).** SIP SUBSCRIBE/NOTIFY for the `message-summary` event package (RFC 3842) is not implemented. Applications cannot detect voicemail presence.
-
-**No presence or BLF.** SIP SUBSCRIBE/NOTIFY for presence (RFC 3856) and dialog state (RFC 4235 — Busy Lamp Field) are not implemented.
-
-**No SIP MESSAGE (RFC 3428).** Instant messaging over SIP is not supported.
-
-### Network & NAT
-
-**STUN is supported for NAT-mapped address discovery.** Configure `stun_server` to use a public STUN server (e.g. `stun.l.google.com:19302`) for discovering your external IP. STUN should only be used when the SIP server is on the public internet — do not enable it when connecting via VPN or private network, as the STUN-mapped address will be unreachable from the server.
-
-**No TURN or ICE.** TURN relay (RFC 5766) and full ICE (RFC 5245) are not implemented. In environments with symmetric NAT (common in cloud VMs and corporate firewalls), STUN alone may not be sufficient and RTP media may fail to flow.
-
-### Media
-
-**No video.** Only audio media (single `m=audio` line in SDP) is supported. H.264, VP8, and other video codecs are not implemented.
-
-**Basic RTCP only.** Sender/receiver reports (SR/RR) are sent periodically and incoming SR packets are processed for jitter and loss stats. Extended RTCP features (SDES, BYE, APP, RTCP-XR) are not implemented.
-
-### Project maturity
-
-This is an early-stage project. The API may change between releases. Evaluate accordingly for critical production workloads.
+**PCM sample rate is fixed at 8 kHz (narrowband) or 16 kHz (G.722 wideband).** Codec selection determines the rate — there is no configurable sample rate.
 
 ---
 
 ## Roadmap
 
-- SRTP hardening — DTLS-SRTP, key zeroization, SRTCP encryption
-- Attended (consultative) transfer
-- SIP INFO DTMF (RFC 2976) for legacy PBX compatibility
-- TURN relay and full ICE for symmetric NAT
-- MWI (voicemail notification)
+- DTLS-SRTP key exchange (WebRTC interop)
+- Full ICE (connectivity checks, nomination)
 
 ---
 

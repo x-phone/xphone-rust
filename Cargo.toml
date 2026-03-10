@@ -1,6 +1,6 @@
 [package]
 name = "xphone"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 rust-version = "1.87"
 description = "SIP telephony library with event-driven API — handles SIP signaling, RTP media, codecs, and call state"

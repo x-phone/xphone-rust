@@ -2,6 +2,37 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.0] - 2026-03-10
+
+### Added
+
+- **Attended transfer** — consultative transfer via REFER with Replaces (RFC 3891)
+- **SIP INFO DTMF** — send/receive DTMF via SIP INFO `application/dtmf-relay` (RFC 2976), configurable via `DtmfMode::SipInfo` or `DtmfMode::Both`
+- **Call waiting** — multiple simultaneous calls with `Phone.calls()` API
+- **G.729 codec** — optional `g729-codec` feature (PT 18, pure Rust via `g729-sys`, no system deps). SDP advertises `annexb=no`.
+- **SRTCP encryption** — RTCP packets encrypted per RFC 3711 §3.4
+- **Key material zeroization** — SRTP keys zeroed on drop
+- **TURN relay** — NAT traversal for symmetric NAT environments (RFC 5766) with long-term credentials
+- **ICE-Lite** — SDP candidate gathering and STUN responder (RFC 8445 §2.2)
+- **SIP MESSAGE** — instant messaging over SIP (RFC 3428) via `Phone.send_message()`
+- **SUBSCRIBE/NOTIFY** — generic event subscription framework (RFC 6665) via `Phone.subscribe_event()`
+- **BLF** — Busy Lamp Field monitoring via dialog event package (RFC 4235)
+- **MWI** — voicemail notification via `message-summary` event package (RFC 3842)
+- **H.264 RTP packetizer/depacketizer** — Single NAL, STAP-A, FU-A modes (RFC 6184)
+- **VP8 RTP packetizer/depacketizer** — RFC 7741
+- **Video RTP pipeline** — separate video media stream with `video_reader()`, `video_writer()`, `video_rtp_reader()`, `video_rtp_writer()`
+- **Mid-call video upgrade/downgrade** — re-INVITE to add or remove video
+- **Video upgrade accept/reject API** — privacy-safe `VideoUpgradeRequest` with `accept()`/`reject()` and auto-reject on drop
+- **Video SRTP** — separate SRTP contexts for audio and video streams
+- **RTCP PLI/FIR** — keyframe requests for video (RFC 4585)
+- **`video-display` feature** — sipcli with H.264 decoding (openh264) and video window (minifb)
+
+### Changed
+
+- `DialOptions` now supports `video: bool` and `video_codecs` for outbound video calls
+- `Call::add_video()` for upgrading an existing audio call to video
+- Features table in README fully categorized (Calling, DTMF, Audio, Video, Security, Network, Messaging, Testing)
+
 ## [0.2.0] - 2026-03-08
 
 ### Added
