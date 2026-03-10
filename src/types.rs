@@ -115,7 +115,7 @@ impl fmt::Display for Direction {
 }
 
 /// Fixed portion of an RTP packet header (no CSRC or extensions).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, Default)]
 pub struct RtpHeader {
     /// RTP version, typically `2`.
     pub version: u8,
@@ -132,7 +132,7 @@ pub struct RtpHeader {
 }
 
 /// An RTP packet consisting of a header and a media payload.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct RtpPacket {
     /// Parsed RTP header fields.
     pub header: RtpHeader,
