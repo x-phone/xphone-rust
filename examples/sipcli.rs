@@ -1035,6 +1035,7 @@ fn exec_command(state: &SharedState, phone: &Phone, input: &str) {
             call_action(state, "unmute", num, |c| c.unmute());
         }
 
+        #[cfg(feature = "video-display")]
         "video" => {
             let num = parse_call_num(&arg);
             call_action(state, "video", num, |c| {
@@ -1556,7 +1557,7 @@ fn draw(f: &mut ratatui::Frame, state: &SharedState) {
         "dial(d) vdial(vd) accept(a) reject hangup(h) hold resume mute unmute video dtmf transfer(xfer) msg watch(w) unwatch(uw) echo speaker mic quit(q)";
     #[cfg(not(feature = "video-display"))]
     let help_text =
-        "dial(d) accept(a) reject hangup(h) hold resume mute unmute video dtmf transfer(xfer) msg watch(w) unwatch(uw) echo speaker mic quit(q)";
+        "dial(d) accept(a) reject hangup(h) hold resume mute unmute dtmf transfer(xfer) msg watch(w) unwatch(uw) echo speaker mic quit(q)";
 
     let cmd_lines = vec![
         Line::from(vec![
