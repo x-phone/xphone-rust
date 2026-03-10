@@ -482,7 +482,7 @@ mod tests {
     fn fua_reassembly() {
         let mut depkt = H264Depacketizer::new();
         // Fragment a NAL type 5 (IDR) into 3 FU-A packets.
-        let original_nal = vec![0x65, 0x01, 0x02, 0x03, 0x04, 0x05]; // IDR
+        let original_nal = [0x65, 0x01, 0x02, 0x03, 0x04, 0x05]; // IDR
         let nri = original_nal[0] & 0xE0; // 0x60
         let nal_type = original_nal[0] & 0x1F; // 5
 
@@ -540,7 +540,7 @@ mod tests {
         let mut data = Vec::new();
         data.extend_from_slice(START_CODE);
         let mut nal = vec![0x65]; // IDR
-        nal.extend_from_slice(&vec![0xAA; 100]); // 101 bytes total
+        nal.extend_from_slice(&[0xAA; 100]); // 101 bytes total
         data.extend_from_slice(&nal);
 
         let frame = VideoFrame {
@@ -581,7 +581,7 @@ mod tests {
         data.extend_from_slice(&[0x68, 0xce, 0x38, 0x80]); // PPS
         data.extend_from_slice(START_CODE);
         let mut idr = vec![0x65]; // IDR
-        idr.extend_from_slice(&vec![0xBB; 50]);
+        idr.extend_from_slice(&[0xBB; 50]);
         data.extend_from_slice(&idr);
 
         let frame = VideoFrame {
