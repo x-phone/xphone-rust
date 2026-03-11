@@ -46,6 +46,13 @@ pub struct Config {
     /// If empty, the address is auto-detected.
     pub local_ip: String,
     /// Minimum port in the RTP port range (0 = OS-assigned).
+    ///
+    /// Each concurrent call requires one RTP port (even-numbered). The maximum
+    /// number of concurrent calls is `(rtp_port_max - rtp_port_min) / 2`.
+    ///
+    /// **Production recommendation:** `10000–20000` (5,000 concurrent calls).
+    /// The default (0) lets the OS assign ports, which works for development
+    /// but gives no control over firewall rules or concurrency limits.
     pub rtp_port_min: u16,
     /// Maximum port in the RTP port range (0 = OS-assigned).
     pub rtp_port_max: u16,
@@ -155,7 +162,18 @@ impl PhoneBuilder {
         self
     }
 
-    /// Sets the RTP port range.
+    /// Sets the RTP port range for media sockets.
+    ///
+    /// Each concurrent call needs one even-numbered RTP port.
+    /// Max concurrent calls = `(max - min) / 2`.
+    ///
+    /// ```rust
+    /// # use xphone::PhoneBuilder;
+    /// let cfg = PhoneBuilder::new()
+    ///     .credentials("alice", "secret", "sip.example.com")
+    ///     .rtp_ports(10000, 20000) // 5,000 concurrent calls
+    ///     .build();
+    /// ```
     pub fn rtp_ports(mut self, min: u16, max: u16) -> Self {
         self.config.rtp_port_min = min;
         self.config.rtp_port_max = max;

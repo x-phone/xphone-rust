@@ -248,8 +248,11 @@ pub fn listen_rtp_port(min: u16, max: u16) -> crate::error::Result<(UdpSocket, u
         }
     }
     Err(crate::error::Error::Other(format!(
-        "no available RTP port in range {}-{}",
-        min, max
+        "RTP port exhaustion: no available port in range {}-{} (max {} concurrent calls). \
+         Widen the range with rtp_ports() or check for leaked sockets.",
+        min,
+        max,
+        (max - min) / 2
     )))
 }
 

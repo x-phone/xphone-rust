@@ -286,6 +286,24 @@ let phone = Phone::new(
 
 See the [API documentation](https://docs.rs/xphone) for all options.
 
+### RTP port range
+
+Each concurrent call requires one even-numbered UDP port for RTP media. The `rtp_ports(min, max)` setting controls the range:
+
+| Range | Concurrent calls | Use case |
+|-------|-----------------|----------|
+| `0, 0` (default) | OS-assigned | Development / single call |
+| `10000, 10100` | 50 | Small deployment |
+| `10000, 20000` | 5,000 | Production |
+
+```rust
+ConfigBuilder::new("sip.example.com", "alice", "secret")
+    .rtp_ports(10000, 20000)
+    .build();
+```
+
+> **Note:** When the port range is exhausted, new inbound calls receive a 500 error and new outbound calls fail. The error is not always obvious — if you're seeing intermittent call failures under load, check your port range first.
+
 ---
 
 ## NAT Traversal
