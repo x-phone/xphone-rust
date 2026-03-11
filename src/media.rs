@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -23,6 +24,9 @@ const DEFAULT_MEDIA_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_JITTER_DEPTH: Duration = Duration::from_millis(50);
 const DEFAULT_PCM_RATE: i32 = 8000;
 const CHANNEL_CAPACITY: usize = 256;
+
+/// Maximum number of frames held in the paced writer buffer (30 seconds at 20ms/frame).
+const MAX_PACED_FRAMES: usize = 1500;
 
 /// Deep-clone an RtpPacket so each tap is independent.
 pub fn clone_packet(pkt: &RtpPacket) -> RtpPacket {
@@ -111,8 +115,11 @@ pub struct MediaChannels {
     pub rtp_writer: ChannelPair<RtpPacket>,
     /// Decoded PCM from inbound RTP.
     pub pcm_reader: ChannelPair<Vec<i16>>,
-    /// PCM from user for encoding + sending.
+    /// PCM from user for encoding + sending (real-time, no pacing).
     pub pcm_writer: ChannelPair<Vec<i16>>,
+    /// Paced PCM from user — accepts arbitrary-length buffers (e.g. from TTS),
+    /// internally split into codec-frame-sized chunks and sent at 20ms intervals.
+    pub paced_pcm_writer: ChannelPair<Vec<i16>>,
     /// Assembled video frames from inbound RTP (after depacketization).
     pub video_frame_reader: ChannelPair<VideoFrame>,
     /// Video frames from user for packetization + sending.
@@ -131,6 +138,7 @@ impl MediaChannels {
             rtp_writer: ChannelPair::new(),
             pcm_reader: ChannelPair::new(),
             pcm_writer: ChannelPair::new(),
+            paced_pcm_writer: ChannelPair::new(),
             video_frame_reader: ChannelPair::new(),
             video_frame_writer: ChannelPair::new(),
             sent_rtp: None,
@@ -478,11 +486,19 @@ pub fn start_media(
         let mut out_timestamp: u32 = 0;
         let out_ssrc = rand_u32();
         let mut rtp_writer_used = false;
+        let mut paced_writer_used = false;
         let mut last_dtmf_timestamp: u32 = 0;
         let mut last_dtmf_seen = false;
 
         let mut last_rtp_time = Instant::now();
         let jitter_tick = crossbeam_channel::tick(Duration::from_millis(5));
+
+        // Paced outbound PCM state. Uses VecDeque for O(1) drain from front.
+        let frame_size = (pcm_rate / 50) as usize; // 160 samples for 8kHz (20ms frame)
+        let mut paced_residual: VecDeque<i16> = VecDeque::new();
+        let mut paced_buffer: VecDeque<Vec<i16>> = VecDeque::new();
+        // 20ms tick is negligible overhead on top of the 5ms jitter tick (200/sec).
+        let pacing_tick = crossbeam_channel::tick(Duration::from_millis(20));
 
         // RTCP state.
         let mut rtcp_stats = RtcpStats::new();
@@ -595,35 +611,58 @@ pub fn start_media(
                         Ok(f) => f,
                         Err(_) => return,
                     };
-                    if rtp_writer_used || cp.is_none() {
+                    if rtp_writer_used || paced_writer_used || muted_for_thread.load(Ordering::Relaxed) {
                         continue;
                     }
-                    if muted_for_thread.load(Ordering::Relaxed) {
-                        continue;
+                    if let Some(ref mut proc) = cp {
+                        encode_and_send_pcm(
+                            &pcm_frame, proc.as_mut(), &mut out_seq, &mut out_timestamp,
+                            out_ssrc, &mut rtcp_stats, &channels.sent_rtp,
+                            &transport_for_thread, &srtp_out_for_thread, turn_relay,
+                        );
                     }
-                    let Some(proc) = cp.as_mut() else {
-                        continue;
+                },
+
+                // Paced PCM writer: accept arbitrary-length buffers, split into frames.
+                recv(channels.paced_pcm_writer.rx) -> msg => {
+                    let pcm_data = match msg {
+                        Ok(f) => f,
+                        Err(_) => return,
                     };
-                    let encoded = proc.encode(&pcm_frame);
-                    let out_pkt = RtpPacket {
-                        header: RtpHeader {
-                            version: 2,
-                            payload_type: proc.payload_type(),
-                            sequence_number: out_seq,
-                            timestamp: out_timestamp,
-                            ssrc: out_ssrc,
-                            marker: false,
-                        },
-                        payload: encoded,
-                    };
-                    out_seq = out_seq.wrapping_add(1);
-                    out_timestamp = out_timestamp.wrapping_add(proc.samples_per_frame());
-                    rtcp_stats.record_rtp_sent(out_pkt.payload.len(), out_pkt.header.timestamp);
-                    if let Some(ref sent) = channels.sent_rtp {
-                        send_drop_oldest(&sent.tx, &sent.rx, clone_packet(&out_pkt));
+                    if rtp_writer_used {
+                        continue; // raw RTP mode active, discard paced input
                     }
-                    if let Some(ref tr) = transport_for_thread {
-                        send_rtp_to_transport(out_pkt.to_bytes(), &srtp_out_for_thread, tr, turn_relay);
+                    paced_writer_used = true;
+                    paced_residual.extend(pcm_data);
+                    while paced_residual.len() >= frame_size {
+                        let frame: Vec<i16> = paced_residual.drain(..frame_size).collect();
+                        if paced_buffer.len() >= MAX_PACED_FRAMES {
+                            paced_buffer.pop_front();
+                        }
+                        paced_buffer.push_back(frame);
+                    }
+                },
+
+                // Pacing ticker: send one buffered frame every 20ms.
+                // Muted frames are consumed and discarded (not paused) to keep
+                // pacing aligned — resuming after unmute plays from current position.
+                recv(pacing_tick) -> _ => {
+                    if let Some(pcm_frame) = paced_buffer.pop_front() {
+                        if rtp_writer_used {
+                            paced_buffer.clear();
+                            paced_residual.clear();
+                            continue;
+                        }
+                        if muted_for_thread.load(Ordering::Relaxed) {
+                            continue;
+                        }
+                        if let Some(ref mut proc) = cp {
+                            encode_and_send_pcm(
+                                &pcm_frame, proc.as_mut(), &mut out_seq, &mut out_timestamp,
+                                out_ssrc, &mut rtcp_stats, &channels.sent_rtp,
+                                &transport_for_thread, &srtp_out_for_thread, turn_relay,
+                            );
+                        }
                     }
                 },
 
@@ -701,6 +740,46 @@ fn send_rtp_to_transport(
     } else {
         let remote = *transport.remote_addr.lock();
         let _ = transport.socket.send_to(&data, remote);
+    }
+}
+
+/// Encodes a PCM frame and sends it as an outbound RTP packet.
+///
+/// Shared between the immediate `pcm_writer` path and the paced writer's tick path.
+#[inline]
+#[allow(clippy::too_many_arguments)]
+fn encode_and_send_pcm(
+    pcm_frame: &[i16],
+    proc: &mut dyn codec::CodecProcessor,
+    out_seq: &mut u16,
+    out_timestamp: &mut u32,
+    out_ssrc: u32,
+    rtcp_stats: &mut RtcpStats,
+    sent_rtp: &Option<ChannelPair<RtpPacket>>,
+    transport: &Option<Arc<MediaTransport>>,
+    srtp_out: &Option<Arc<Mutex<SrtpContext>>>,
+    turn_relay: Option<(u16, SocketAddr)>,
+) {
+    let encoded = proc.encode(pcm_frame);
+    let out_pkt = RtpPacket {
+        header: RtpHeader {
+            version: 2,
+            payload_type: proc.payload_type(),
+            sequence_number: *out_seq,
+            timestamp: *out_timestamp,
+            ssrc: out_ssrc,
+            marker: false,
+        },
+        payload: encoded,
+    };
+    *out_seq = out_seq.wrapping_add(1);
+    *out_timestamp = out_timestamp.wrapping_add(proc.samples_per_frame());
+    rtcp_stats.record_rtp_sent(out_pkt.payload.len(), out_pkt.header.timestamp);
+    if let Some(ref sent) = sent_rtp {
+        send_drop_oldest(&sent.tx, &sent.rx, clone_packet(&out_pkt));
+    }
+    if let Some(ref tr) = transport {
+        send_rtp_to_transport(out_pkt.to_bytes(), srtp_out, tr, turn_relay);
     }
 }
 
@@ -1668,5 +1747,246 @@ mod tests {
         let mut stream = start_video(ch, test_muted());
         stream.stop();
         assert!(stream.is_stopped());
+    }
+
+    // --- Paced PCM writer tests ---
+
+    #[test]
+    fn paced_pcm_writer_single_frame() {
+        let ch = test_channels();
+        let shared = test_shared(CallState::Active);
+        let mut stream = start_media(
+            MediaConfig::default(),
+            ch.clone(),
+            shared,
+            None,
+            test_muted(),
+        );
+
+        // Send exactly one frame (160 samples = 20ms at 8kHz).
+        ch.paced_pcm_writer.tx.send(vec![0i16; 160]).unwrap();
+
+        // The pacing tick fires every 20ms, so allow time for it.
+        let sent_rx = &ch.sent_rtp.as_ref().unwrap().rx;
+        let sent = read_pkt(sent_rx, 200).unwrap();
+        assert_eq!(sent.header.payload_type, 0); // PCMU
+        assert_eq!(sent.payload.len(), 160);
+        assert_eq!(sent.header.version, 2);
+
+        stream.stop();
+    }
+
+    #[test]
+    fn pcm_writer_burst_sends_instantly() {
+        // Documents that pcm_writer has NO pacing — all frames sent immediately.
+        // Use paced_pcm_writer for TTS/burst audio sources.
+        let ch = test_channels();
+        let shared = test_shared(CallState::Active);
+        let mut stream = start_media(
+            MediaConfig::default(),
+            ch.clone(),
+            shared,
+            None,
+            test_muted(),
+        );
+
+        for _ in 0..5 {
+            ch.pcm_writer.tx.send(vec![0i16; 160]).unwrap();
+        }
+
+        let sent_rx = &ch.sent_rtp.as_ref().unwrap().rx;
+        let t0 = Instant::now();
+        for _ in 0..5 {
+            read_pkt(sent_rx, 200).unwrap();
+        }
+        let elapsed = t0.elapsed();
+
+        // All 5 packets arrive in <5ms — no pacing.
+        assert!(elapsed < Duration::from_millis(5), "elapsed: {:?}", elapsed);
+
+        stream.stop();
+    }
+
+    #[test]
+    fn paced_pcm_writer_splits_large_buffer() {
+        let ch = test_channels();
+        let shared = test_shared(CallState::Active);
+        let mut stream = start_media(
+            MediaConfig::default(),
+            ch.clone(),
+            shared,
+            None,
+            test_muted(),
+        );
+
+        // Send 480 samples (3 frames worth) as a single burst.
+        ch.paced_pcm_writer.tx.send(vec![0i16; 480]).unwrap();
+
+        let sent_rx = &ch.sent_rtp.as_ref().unwrap().rx;
+        let p0 = read_pkt(sent_rx, 200).unwrap();
+        let p1 = read_pkt(sent_rx, 200).unwrap();
+        let p2 = read_pkt(sent_rx, 200).unwrap();
+
+        // All 3 frames should have sequential seq numbers and correct timestamps.
+        assert_eq!(p0.header.sequence_number, 0);
+        assert_eq!(p1.header.sequence_number, 1);
+        assert_eq!(p2.header.sequence_number, 2);
+        assert_eq!(p0.header.timestamp, 0);
+        assert_eq!(p1.header.timestamp, 160);
+        assert_eq!(p2.header.timestamp, 320);
+        assert_eq!(p0.header.ssrc, p1.header.ssrc);
+
+        stream.stop();
+    }
+
+    #[test]
+    fn paced_pcm_writer_handles_partial_frames() {
+        let ch = test_channels();
+        let shared = test_shared(CallState::Active);
+        let mut stream = start_media(
+            MediaConfig::default(),
+            ch.clone(),
+            shared,
+            None,
+            test_muted(),
+        );
+
+        // Send 240 samples (1.5 frames). First frame is sent, 80 samples buffered.
+        ch.paced_pcm_writer.tx.send(vec![0i16; 240]).unwrap();
+
+        let sent_rx = &ch.sent_rtp.as_ref().unwrap().rx;
+        let p0 = read_pkt(sent_rx, 200).unwrap();
+        assert_eq!(p0.header.sequence_number, 0);
+
+        // Send another 80 samples to complete the second frame.
+        ch.paced_pcm_writer.tx.send(vec![0i16; 80]).unwrap();
+
+        let p1 = read_pkt(sent_rx, 200).unwrap();
+        assert_eq!(p1.header.sequence_number, 1);
+        assert_eq!(p1.header.timestamp, 160);
+
+        stream.stop();
+    }
+
+    #[test]
+    fn paced_pcm_writer_pacing_interval() {
+        let ch = test_channels();
+        let shared = test_shared(CallState::Active);
+        let mut stream = start_media(
+            MediaConfig::default(),
+            ch.clone(),
+            shared,
+            None,
+            test_muted(),
+        );
+
+        // Send 5 frames as a burst.
+        ch.paced_pcm_writer.tx.send(vec![0i16; 160 * 5]).unwrap();
+
+        let sent_rx = &ch.sent_rtp.as_ref().unwrap().rx;
+
+        // Read first packet.
+        let _p0 = read_pkt(sent_rx, 200).unwrap();
+        let t0 = Instant::now();
+
+        // Read second packet — should arrive ~20ms later.
+        let _p1 = read_pkt(sent_rx, 200).unwrap();
+        let elapsed = t0.elapsed();
+
+        // Allow margin: at least 10ms (the tick may not be perfectly precise).
+        assert!(
+            elapsed >= Duration::from_millis(10),
+            "pacing interval too short: {:?}",
+            elapsed
+        );
+
+        stream.stop();
+    }
+
+    #[test]
+    fn paced_pcm_writer_muted_suppresses_send() {
+        let ch = test_channels();
+        let shared = test_shared(CallState::Active);
+        let muted = test_muted();
+        let mut stream = start_media(
+            MediaConfig::default(),
+            ch.clone(),
+            shared,
+            None,
+            muted.clone(),
+        );
+
+        muted.store(true, Ordering::Relaxed);
+
+        ch.paced_pcm_writer.tx.send(vec![0i16; 160 * 3]).unwrap();
+
+        // Wait long enough for all 3 frames to have been ticked.
+        std::thread::sleep(Duration::from_millis(100));
+
+        let sent_rx = &ch.sent_rtp.as_ref().unwrap().rx;
+        assert!(
+            sent_rx.try_recv().is_err(),
+            "paced writer should suppress packets while muted"
+        );
+
+        stream.stop();
+    }
+
+    #[test]
+    fn paced_pcm_writer_rtp_writer_suppresses() {
+        let ch = test_channels();
+        let shared = test_shared(CallState::Active);
+        let mut stream = start_media(
+            MediaConfig::default(),
+            ch.clone(),
+            shared,
+            None,
+            test_muted(),
+        );
+
+        // Activate raw RTP writer mode first.
+        ch.rtp_writer.tx.send(make_rtp(1, 0, vec![])).unwrap();
+        let sent_rx = &ch.sent_rtp.as_ref().unwrap().rx;
+        let _ = read_pkt(sent_rx, 200); // consume
+
+        // Now send paced PCM — should be suppressed.
+        ch.paced_pcm_writer.tx.send(vec![0i16; 160 * 3]).unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+
+        assert!(
+            sent_rx.try_recv().is_err(),
+            "paced writer should be suppressed when rtp_writer was used"
+        );
+
+        stream.stop();
+    }
+
+    #[test]
+    fn paced_writer_suppresses_pcm_writer() {
+        let ch = test_channels();
+        let shared = test_shared(CallState::Active);
+        let mut stream = start_media(
+            MediaConfig::default(),
+            ch.clone(),
+            shared,
+            None,
+            test_muted(),
+        );
+
+        // Activate paced writer first.
+        ch.paced_pcm_writer.tx.send(vec![0i16; 160]).unwrap();
+        let sent_rx = &ch.sent_rtp.as_ref().unwrap().rx;
+        let _ = read_pkt(sent_rx, 200); // consume paced packet
+
+        // Now send via regular pcm_writer — should be suppressed.
+        ch.pcm_writer.tx.send(vec![0i16; 160]).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+
+        assert!(
+            sent_rx.try_recv().is_err(),
+            "pcm_writer should be suppressed when paced_pcm_writer was used"
+        );
+
+        stream.stop();
     }
 }
