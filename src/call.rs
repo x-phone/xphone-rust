@@ -1945,12 +1945,34 @@ impl Call {
     }
 
     /// Returns the PCM writer sender (for sending PCM samples for encoding + sending).
+    ///
+    /// Each buffer sent is immediately encoded and sent as one RTP packet.
+    /// The caller must provide frames at real-time rate (one 160-sample frame
+    /// every 20ms for 8kHz codecs). Use [`paced_pcm_writer()`](Self::paced_pcm_writer)
+    /// for pre-generated audio (TTS, file playback) that needs internal pacing.
     pub fn pcm_writer(&self) -> Option<crossbeam_channel::Sender<Vec<i16>>> {
         self.inner
             .lock()
             .media_streams
             .first()
             .map(|s| s.channels.pcm_writer.tx.clone())
+    }
+
+    /// Returns the paced PCM writer sender for pre-generated audio.
+    ///
+    /// Unlike [`pcm_writer()`](Self::pcm_writer), this channel accepts arbitrary-length
+    /// PCM buffers (e.g. entire TTS utterances), splits them into codec-frame-sized
+    /// chunks, and sends them as RTP packets at real-time pace (one frame every 20ms).
+    ///
+    /// Use this for TTS providers, file playback, or any source that delivers audio
+    /// in bursts rather than at real-time rate. Do not use both `pcm_writer()` and
+    /// `paced_pcm_writer()` on the same call simultaneously.
+    pub fn paced_pcm_writer(&self) -> Option<crossbeam_channel::Sender<Vec<i16>>> {
+        self.inner
+            .lock()
+            .media_streams
+            .first()
+            .map(|s| s.channels.paced_pcm_writer.tx.clone())
     }
 
     /// Returns the PCM reader receiver (decoded PCM from inbound RTP).
