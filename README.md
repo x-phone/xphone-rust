@@ -35,8 +35,8 @@ Connect a real phone number directly to your LLM pipeline. No cloud telephony pl
 DID (phone number)
     +-- SIP Trunk (Telnyx, Twilio SIP, Vonage...)
             +-- xphone
-                    |-- pcm_reader -> Whisper / Deepgram (speech-to-text)
-                    +-- pcm_writer <- ElevenLabs / TTS (text-to-speech)
+                    |-- pcm_reader ---------> Whisper / Deepgram (speech-to-text)
+                    +-- paced_pcm_writer <-- ElevenLabs / TTS (text-to-speech)
 ```
 
 Your bot gets a real phone number, registers directly with a SIP trunk provider, and handles calls end-to-end — no Asterisk, no middleman, no per-minute platform fees.
@@ -486,7 +486,21 @@ if let Some(pcm_tx) = call.pcm_writer() {
 }
 ```
 
-> **Important:** Send frames at the natural 20ms pace. If you send faster than real-time, the outbound buffer fills and frames are dropped.
+> **Important:** `pcm_writer()` sends each buffer as an RTP packet immediately — the caller must provide frames at real-time rate (one 160-sample frame every 20ms). For live microphone input this is natural; for TTS or file playback, use `paced_pcm_writer()` instead.
+
+### Paced writer (for TTS / pre-generated audio)
+
+`call.paced_pcm_writer()` accepts arbitrary-length PCM buffers and handles framing + pacing internally. Send entire TTS utterances at once — xphone splits them into 20ms frames and sends RTP at real-time pace:
+
+```rust
+if let Some(paced_tx) = call.paced_pcm_writer() {
+    // Send an entire TTS utterance — any length, xphone handles pacing
+    let tts_audio: Vec<i16> = deepgram_tts_response();
+    paced_tx.send(tts_audio).unwrap();
+}
+```
+
+> **Note:** `pcm_writer` and `paced_pcm_writer` are mutually exclusive — using one suppresses the other for that call.
 
 ### Silence frame
 

@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.1] - 2026-03-11
+
+### Added
+
+- **Paced PCM writer** — `Call::paced_pcm_writer()` accepts arbitrary-length PCM buffers (e.g. entire TTS utterances from Deepgram, ElevenLabs), splits into codec-frame-sized chunks, and sends RTP packets at real-time pace (one frame every 20ms)
+- Mutual exclusion between `pcm_writer` and `paced_pcm_writer` prevents RTP stream corruption if both are used
+
+### Fixed
+
+- Audio playing at 10x+ speed when TTS providers deliver audio in bursts rather than at real-time rate
+
 ## [0.3.0] - 2026-03-10
 
 ### Added
