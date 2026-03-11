@@ -1777,6 +1777,37 @@ mod tests {
     }
 
     #[test]
+    fn pcm_writer_burst_sends_instantly() {
+        // Documents that pcm_writer has NO pacing — all frames sent immediately.
+        // Use paced_pcm_writer for TTS/burst audio sources.
+        let ch = test_channels();
+        let shared = test_shared(CallState::Active);
+        let mut stream = start_media(
+            MediaConfig::default(),
+            ch.clone(),
+            shared,
+            None,
+            test_muted(),
+        );
+
+        for _ in 0..5 {
+            ch.pcm_writer.tx.send(vec![0i16; 160]).unwrap();
+        }
+
+        let sent_rx = &ch.sent_rtp.as_ref().unwrap().rx;
+        let t0 = Instant::now();
+        for _ in 0..5 {
+            read_pkt(sent_rx, 200).unwrap();
+        }
+        let elapsed = t0.elapsed();
+
+        // All 5 packets arrive in <5ms — no pacing.
+        assert!(elapsed < Duration::from_millis(5), "elapsed: {:?}", elapsed);
+
+        stream.stop();
+    }
+
+    #[test]
     fn paced_pcm_writer_splits_large_buffer() {
         let ch = test_channels();
         let shared = test_shared(CallState::Active);
