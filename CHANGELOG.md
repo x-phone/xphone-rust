@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.2] - 2026-03-11
+
+### Added
+
+- CI check requiring `CHANGELOG.md` update on every PR
+- Release checklist in project guidelines (CHANGELOG, README, version bump, tests, review)
+- Updated README with paced PCM writer documentation and usage examples
+
 ## [0.3.1] - 2026-03-11
 
 ### Added
