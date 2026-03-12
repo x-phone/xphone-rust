@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Changed
+
+- `Call::set_rtp_socket` and `Call::set_local_media` are now public API, enabling external SIP transports (e.g. xbridge trunk host) to wire media pipelines without going through `Phone`
+
 ## [0.3.2] - 2026-03-11
 
 ### Added
