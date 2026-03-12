@@ -1610,7 +1610,8 @@ impl Call {
     }
 
     /// Sets the local media address and RTP port for this call.
-    pub(crate) fn set_local_media(&self, ip: &str, port: i32) {
+    /// Required before `accept()` for SDP answer generation.
+    pub fn set_local_media(&self, ip: &str, port: i32) {
         let mut inner = self.inner.lock();
         inner.local_ip = ip.to_string();
         inner.rtp_port = port;
@@ -1621,8 +1622,9 @@ impl Call {
         self.inner.lock().local_sdp = sdp.to_string();
     }
 
-    /// Sets the RTP socket for this call (production path).
-    pub(crate) fn set_rtp_socket(&self, socket: UdpSocket) {
+    /// Sets the RTP socket for this call.
+    /// Required before `accept()` for media pipeline to start.
+    pub fn set_rtp_socket(&self, socket: UdpSocket) {
         self.inner.lock().rtp_socket = Some(Arc::new(socket));
     }
 
