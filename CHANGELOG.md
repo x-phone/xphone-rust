@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- **SIP trunk host server mode (`Server`)** — accept and place calls directly with trusted SIP peers (PBXes, trunk providers like Twilio/Telnyx) without requiring SIP registration. Both `Phone` and `Server` produce the same `Call` object with identical downstream API.
+- New `trunk` module: `ServerConfig`, `PeerConfig`, `PeerAuthConfig` for peer configuration with IP allowlist and CIDR matching
+- Peer authentication: IP-based (fastest path) and SIP digest auth (RFC 2617) for incoming INVITEs
+- `TrunkDialog` implementing `Dialog` trait for both UAS (inbound) and UAC (outbound) roles
+- `Server::listen()` — async UDP listener with SIP message routing, BYE/CANCEL handling, and dialog TTL reaper
+- `Server::dial()` — outbound calls to named peers with SDP offer/answer
+- `Server::calls()` and `Server::find_call()` for active call inspection
+- Server-level callbacks: `on_incoming`, `on_call_state`, `on_call_ended`, `on_call_dtmf`
+- 8 FakePBX integration tests: inbound/outbound calls, RTP round-trip, auth rejection, callbacks, find_call
+
 ## [0.3.3] - 2026-03-12
 
 ### Changed
