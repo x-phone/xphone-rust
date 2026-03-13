@@ -35,7 +35,7 @@ zeroize = "1"
 [dev-dependencies]
 tokio = { version = "1", features = ["test-util"] }
 crossbeam-channel = "0.5"
-fakepbx = "0.1.0"
+fakepbx = "0.2.0"
 
 [[example]]
 name = "sipcli"

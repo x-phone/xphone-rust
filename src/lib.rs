@@ -25,6 +25,7 @@ pub mod srtp;
 pub mod stun;
 pub mod subscription;
 pub mod transport;
+pub mod trunk;
 pub mod turn;
 pub mod types;
 pub mod video;
@@ -36,6 +37,8 @@ pub use error::{Error, Result};
 pub use phone::Phone;
 pub use sip::conn::TlsConfig;
 pub use subscription::SubId;
+pub use trunk::config::{PeerAuthConfig, PeerConfig, ServerConfig};
+pub use trunk::server::Server;
 pub use types::{
     CallState, Codec, Direction, EndReason, ExtensionState, ExtensionStatus, NotifyEvent,
     PhoneState, SipMessage, SubState, VideoCodec, VideoFrame, VoicemailStatus,
