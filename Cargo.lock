@@ -586,9 +586,9 @@ dependencies = [
 
 [[package]]
 name = "fakepbx"
-version = "0.1.0"
+version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "c3cfe361aa026e61ab5eeed4078760d3c05c62a1edbf6daafb69d62c1b635b8d"
+checksum = "a50f0e8f03b144e180b22804533015b1fcc1dddeaede8527caddf2c2a1183d35"
 dependencies = [
  "getrandom 0.2.17",
  "md-5",
