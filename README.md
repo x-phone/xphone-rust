@@ -12,6 +12,13 @@ No PBX. No Twilio. No per-minute fees. Just clean PCM audio, in and out.
 
 xphone handles SIP signaling, RTP media, codecs, and call state so you can focus on what your application actually does with the audio — whether that's feeding frames to a speech model, recording to disk, or building a full softphone.
 
+xphone supports two connection modes:
+
+1. **`Phone`** — register to a SIP trunk or PBX like a normal endpoint
+2. **`Server`** — accept and place calls directly with trusted SIP peers or trunk providers
+
+In both cases, your application gets the same `Call` API and the same PCM/media pipeline.
+
 ---
 
 ## Why xphone?
@@ -34,12 +41,12 @@ Connect a real phone number directly to your LLM pipeline. No cloud telephony pl
 ```
 DID (phone number)
     +-- SIP Trunk (Telnyx, Twilio SIP, Vonage...)
-            +-- xphone
+            +-- xphone (Phone mode: register, or Server mode: direct)
                     |-- pcm_reader ---------> Whisper / Deepgram (speech-to-text)
                     +-- paced_pcm_writer <-- ElevenLabs / TTS (text-to-speech)
 ```
 
-Your bot gets a real phone number, registers directly with a SIP trunk provider, and handles calls end-to-end — no Asterisk, no middleman, no per-minute platform fees.
+Your bot gets a real phone number, connects to a SIP trunk provider (via registration or direct trunk), and handles calls end-to-end — no Asterisk, no middleman, no per-minute platform fees.
 
 ### Softphones & Click-to-Call
 Embed a SIP phone into any Rust application. Accept calls, dial out, hold, transfer — all from code. Works against any SIP PBX (Asterisk, FreeSWITCH, 3CX, Cisco) or directly to a SIP trunk.
@@ -57,7 +64,9 @@ Programmatically dial numbers, play audio, detect DTMF responses — classic IVR
 
 ## No PBX required
 
-A common misconception: you don't need Asterisk or FreeSWITCH to use xphone. A SIP trunk is just a SIP server — xphone registers with it directly, exactly like a desk phone would.
+A common misconception: you don't need Asterisk or FreeSWITCH to use xphone. A SIP trunk is just a SIP server — xphone connects to it directly.
+
+**Phone mode** — register with a SIP trunk like a normal endpoint:
 
 ```rust
 let phone = Phone::new(Config {
@@ -68,7 +77,21 @@ let phone = Phone::new(Config {
 });
 ```
 
-That's it. Your application registers with the SIP trunk, receives calls on your DID, and can dial out — no additional infrastructure.
+**Server mode** — accept SIP INVITEs directly from trunk providers or PBXes (no registration):
+
+```rust
+let server = Server::new(ServerConfig {
+    listen: "0.0.0.0:5080".into(),
+    peers: vec![PeerConfig {
+        name: "twilio".into(),
+        hosts: vec!["54.172.60.0/30".into()],
+        ..Default::default()
+    }],
+    ..Default::default()
+});
+```
+
+Both modes produce the same `Call` object — your call-handling code works identically regardless of how the call arrived.
 
 > A PBX only becomes relevant when you need to route calls across multiple agents or extensions. For single-purpose applications — a voice bot, a recorder, a dialer — xphone + SIP trunk is all you need.
 
@@ -101,7 +124,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-xphone = "0.3"
+xphone = "0.4"
 ```
 
 Requires Rust 1.87+.
@@ -182,10 +205,68 @@ if let Some(pcm_rx) = call.pcm_reader() {
 
 ---
 
+### Server mode (direct SIP trunk)
+
+For deployments that receive SIP INVITEs directly from trunk providers (Twilio SIP Trunk, Telnyx, etc.) or PBXes — no registration needed:
+
+```rust
+use xphone::{Server, ServerConfig, PeerConfig};
+use std::sync::Arc;
+
+#[tokio::main]
+async fn main() -> xphone::Result<()> {
+    let server = Server::new(ServerConfig {
+        listen: "0.0.0.0:5080".into(),
+        rtp_port_min: 10000,
+        rtp_port_max: 20000,
+        peers: vec![
+            PeerConfig {
+                name: "office-pbx".into(),
+                host: Some("192.168.1.10".parse().unwrap()),
+                ..Default::default()
+            },
+            PeerConfig {
+                name: "twilio".into(),
+                hosts: vec!["54.172.60.0/30".into(), "54.244.51.0/30".into()],
+                ..Default::default()
+            },
+        ],
+        ..Default::default()
+    });
+
+    // Same Call API as Phone mode
+    server.on_incoming(|call| {
+        println!("Incoming from {}", call.from());
+        call.accept().unwrap();
+
+        if let Some(pcm_rx) = call.pcm_reader() {
+            std::thread::spawn(move || {
+                while let Ok(frame) = pcm_rx.recv() {
+                    transcribe(&frame);
+                }
+            });
+        }
+    });
+
+    // Outbound calls to a named peer
+    // let call = server.dial("office-pbx", "+15551234567", "+15559876543")?;
+
+    server.listen().await
+}
+```
+
+Peers are authenticated by source IP (fastest path) or SIP digest auth. Both `Phone` and `Server` produce identical `Call` objects — your call-handling code works with either mode.
+
+---
+
 ## Features
 
 | Feature | Status |
 |---|---|
+| **Connection Modes** | |
+| Phone — SIP registration with PBX or trunk | Done |
+| Server — direct SIP trunk host (no registration) | Done |
+| Peer authentication (IP allowlist, CIDR, digest auth) | Done |
 | **Calling** | |
 | SIP Registration (auth, keepalive, auto-reconnect) | Done |
 | Inbound & outbound calls | Done |
