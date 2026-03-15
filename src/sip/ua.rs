@@ -585,6 +585,8 @@ fn parse_proxy_uri(uri: &str) -> Option<SocketAddr> {
         .strip_prefix("sip:")
         .or_else(|| uri.strip_prefix("sips:"))
         .unwrap_or(uri);
+    // Strip URI parameters (;transport=udp, etc.)
+    let host_part = host_part.split(';').next().unwrap_or(host_part);
     // Try as SocketAddr directly.
     if let Ok(addr) = host_part.parse::<SocketAddr>() {
         return Some(addr);
