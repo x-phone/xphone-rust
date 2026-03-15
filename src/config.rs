@@ -124,19 +124,21 @@ impl Default for Config {
 }
 
 impl Config {
-    /// Splits a `host:port` string into separate host and port values.
-    /// If the host contains an embedded port, it overrides `self.port`.
+    /// Extracts an embedded port from `host` (e.g. `"10.0.0.1:5060"`) into
+    /// the separate `port` field. Only applies if `port` is still at the
+    /// default value (5060) — an explicit `.port()` call takes precedence.
     ///
-    /// Handles IPv4 (`"10.0.0.1:5060"`), bare hostnames (`"sip.example.com:5061"`),
-    /// and IPv6 bracket notation (`"[::1]:5060"`). Leaves the config unchanged
-    /// if no port is embedded.
+    /// Called once from [`Phone::new()`](crate::phone::Phone::new).
     pub(crate) fn normalize_host(&mut self) {
         if self.host.is_empty() {
             return;
         }
         if let Some((host, port)) = split_host_port(&self.host) {
+            // Only apply embedded port if port hasn't been explicitly set.
+            if self.port == 5060 {
+                self.port = port;
+            }
             self.host = host.to_string();
-            self.port = port;
         }
     }
 }
@@ -182,13 +184,13 @@ impl PhoneBuilder {
     /// Sets SIP username, password, and server host.
     ///
     /// The `host` parameter accepts `"hostname"`, `"hostname:port"`, or
-    /// `"ip:port"` formats. If a port is embedded, it overrides the default
-    /// port (5060).
+    /// `"ip:port"` formats. If a port is embedded, it is extracted and
+    /// applied when the `Config` is consumed by [`Phone::new()`](crate::phone::Phone::new).
+    /// An explicit [`.port()`](Self::port) call always takes precedence.
     pub fn credentials(mut self, username: &str, password: &str, host: &str) -> Self {
         self.config.username = username.into();
         self.config.password = password.into();
         self.config.host = host.into();
-        self.config.normalize_host();
         self
     }
 
@@ -320,10 +322,7 @@ impl PhoneBuilder {
     }
 
     /// Consumes the builder and returns the finished [`Config`].
-    pub fn build(mut self) -> Config {
-        // Safety net: normalize host in case it was set via direct field access
-        // after credentials(), or if credentials() wasn't used.
-        self.config.normalize_host();
+    pub fn build(self) -> Config {
         self.config
     }
 }
@@ -448,47 +447,56 @@ mod tests {
     // ── host:port parsing ──
 
     #[test]
-    fn credentials_splits_host_port() {
-        let cfg = PhoneBuilder::new()
-            .credentials("1001", "secret", "10.0.0.7:5061")
-            .build();
+    fn normalize_splits_host_port() {
+        let mut cfg = Config {
+            host: "10.0.0.7:5061".into(),
+            ..Config::default()
+        };
+        cfg.normalize_host();
         assert_eq!(cfg.host, "10.0.0.7");
         assert_eq!(cfg.port, 5061);
     }
 
     #[test]
-    fn credentials_host_only() {
-        let cfg = PhoneBuilder::new()
-            .credentials("1001", "secret", "10.0.0.7")
-            .build();
+    fn normalize_host_only() {
+        let mut cfg = Config {
+            host: "10.0.0.7".into(),
+            ..Config::default()
+        };
+        cfg.normalize_host();
         assert_eq!(cfg.host, "10.0.0.7");
         assert_eq!(cfg.port, 5060); // default
     }
 
     #[test]
-    fn credentials_hostname_with_port() {
-        let cfg = PhoneBuilder::new()
-            .credentials("1001", "secret", "sip.example.com:5080")
-            .build();
+    fn normalize_hostname_with_port() {
+        let mut cfg = Config {
+            host: "sip.example.com:5080".into(),
+            ..Config::default()
+        };
+        cfg.normalize_host();
         assert_eq!(cfg.host, "sip.example.com");
         assert_eq!(cfg.port, 5080);
     }
 
     #[test]
-    fn credentials_ipv6_bracket_with_port() {
-        let cfg = PhoneBuilder::new()
-            .credentials("1001", "secret", "[::1]:5060")
-            .build();
+    fn normalize_ipv6_bracket_with_port() {
+        let mut cfg = Config {
+            host: "[::1]:5060".into(),
+            ..Config::default()
+        };
+        cfg.normalize_host();
         assert_eq!(cfg.host, "[::1]");
         assert_eq!(cfg.port, 5060);
     }
 
     #[test]
-    fn credentials_bare_ipv6_no_split() {
-        // Bare IPv6 without brackets should not be split on colons.
-        let cfg = PhoneBuilder::new()
-            .credentials("1001", "secret", "::1")
-            .build();
+    fn normalize_bare_ipv6_no_split() {
+        let mut cfg = Config {
+            host: "::1".into(),
+            ..Config::default()
+        };
+        cfg.normalize_host();
         assert_eq!(cfg.host, "::1");
         assert_eq!(cfg.port, 5060);
     }
@@ -528,14 +536,15 @@ mod tests {
     }
 
     #[test]
-    fn builder_embedded_port_wins_over_explicit() {
-        // build() normalizes, so embedded port in host wins.
-        let cfg = PhoneBuilder::new()
-            .port(9999)
+    fn explicit_port_wins_over_embedded() {
+        // Explicit .port() takes precedence over embedded port in host.
+        let mut cfg = PhoneBuilder::new()
             .credentials("1001", "secret", "10.0.0.7:5080")
+            .port(9999)
             .build();
-        assert_eq!(cfg.host, "10.0.0.7");
-        assert_eq!(cfg.port, 5080);
+        cfg.normalize_host();
+        assert_eq!(cfg.host, "10.0.0.7"); // host part still stripped
+        assert_eq!(cfg.port, 9999); // explicit port preserved
     }
 
     // ── existing tests ──
