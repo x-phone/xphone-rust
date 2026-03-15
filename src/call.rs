@@ -1386,7 +1386,7 @@ impl Call {
         };
 
         // Pre-allocate video RTP socket outside the lock (blocking I/O).
-        let video_socket = if need_socket && rtp_port_min > 0 && rtp_port_max > 0 {
+        let video_socket = if need_socket {
             match crate::media::listen_rtp_port(rtp_port_min, rtp_port_max) {
                 Ok((vsock, vport)) => Some((vsock, vport)),
                 Err(e) => {

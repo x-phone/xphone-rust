@@ -235,7 +235,21 @@ impl MediaTransport {
 
 /// Allocates a UDP socket on an even port in [min, max].
 /// Returns the socket and the allocated port.
+///
+/// When both `min` and `max` are 0, binds to an OS-assigned ephemeral port
+/// (useful for development or single-call scenarios).
 pub fn listen_rtp_port(min: u16, max: u16) -> crate::error::Result<(UdpSocket, u16)> {
+    // Ephemeral port fallback when no range is configured.
+    if min == 0 && max == 0 {
+        let sock = UdpSocket::bind("0.0.0.0:0")
+            .map_err(|e| crate::error::Error::Other(format!("RTP ephemeral bind failed: {e}")))?;
+        let port = sock
+            .local_addr()
+            .map_err(|e| crate::error::Error::Other(format!("RTP local_addr failed: {e}")))?
+            .port();
+        return Ok((sock, port));
+    }
+
     let mut port = min;
     // Ensure we start on an even port (RTP convention).
     if !port.is_multiple_of(2) {

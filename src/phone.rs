@@ -292,23 +292,16 @@ impl Phone {
         } else {
             local_ip_for(&self.cfg.host)
         };
-        let (rtp_socket, rtp_port) = if self.cfg.rtp_port_min > 0 && self.cfg.rtp_port_max > 0 {
-            match crate::media::listen_rtp_port(self.cfg.rtp_port_min, self.cfg.rtp_port_max) {
-                Ok((sock, port)) => (Some(sock), port as i32),
-                Err(_) => (None, 20000),
-            }
-        } else {
-            (None, 20000)
+        let (rtp_socket, rtp_port) = {
+            let (sock, port) =
+                crate::media::listen_rtp_port(self.cfg.rtp_port_min, self.cfg.rtp_port_max)?;
+            (Some(sock), port as i32)
         };
         // Allocate video RTP socket if video is requested.
         let (video_rtp_socket, video_rtp_port) = if opts.video {
-            if self.cfg.rtp_port_min > 0 && self.cfg.rtp_port_max > 0 {
-                match crate::media::listen_rtp_port(self.cfg.rtp_port_min, self.cfg.rtp_port_max) {
-                    Ok((sock, port)) => (Some(sock), port as i32),
-                    Err(_) => (None, 0),
-                }
-            } else {
-                (None, 0)
+            match crate::media::listen_rtp_port(self.cfg.rtp_port_min, self.cfg.rtp_port_max) {
+                Ok((sock, port)) => (Some(sock), port as i32),
+                Err(_) => (None, 0),
             }
         } else {
             (None, 0)
@@ -962,14 +955,15 @@ fn handle_dialog_incoming(
     info!(from = _from, to = _to, "Phone handling incoming INVITE");
     let incoming_fn = inner.lock().incoming.clone();
 
-    // Allocate an RTP socket for this call.
-    let (rtp_socket, actual_port) = if rtp_port_min > 0 && rtp_port_max > 0 {
-        match crate::media::listen_rtp_port(rtp_port_min, rtp_port_max) {
-            Ok((sock, port)) => (Some(sock), port as i32),
-            Err(_) => (None, rtp_port_min as i32),
+    // Allocate an RTP socket for this call (ephemeral port if range is 0,0).
+    let (rtp_socket, actual_port) = match crate::media::listen_rtp_port(rtp_port_min, rtp_port_max)
+    {
+        Ok((sock, port)) => (Some(sock), port as i32),
+        Err(e) => {
+            warn!("RTP port allocation failed for incoming call, rejecting: {e}");
+            let _ = dlg.respond(503, "Service Unavailable", &[]);
+            return;
         }
-    } else {
-        (None, rtp_port_min as i32)
     };
 
     // Parse remote SDP once for SRTP detection and video detection.
@@ -1001,7 +995,7 @@ fn handle_dialog_incoming(
 
     // Allocate video RTP socket if remote SDP offers video.
     if let Some(ref sess) = parsed_sdp {
-        if sess.has_video() && rtp_port_min > 0 && rtp_port_max > 0 {
+        if sess.has_video() {
             if let Ok((vsock, vport)) = crate::media::listen_rtp_port(rtp_port_min, rtp_port_max) {
                 call.set_video_rtp_port(vport as i32);
                 call.set_video_rtp_socket(vsock);
