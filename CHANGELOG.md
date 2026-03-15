@@ -4,6 +4,10 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Changed
+
+- Consolidated SIP URI-to-SocketAddr parsing into shared `sip::resolve_host()` — used by both outbound proxy URI parser and trunk server ACK routing. Adds DNS resolution and `;params` stripping to both paths consistently.
+
 ### Added
 
 - **Outbound proxy support** — route outbound INVITEs through a proxy separate from the registrar via `Config::outbound_proxy` (e.g. `"sip:proxy.example.com:5060"`)
