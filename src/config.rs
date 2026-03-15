@@ -123,6 +123,51 @@ impl Default for Config {
     }
 }
 
+impl Config {
+    /// Extracts an embedded port from `host` (e.g. `"10.0.0.1:5060"`) into
+    /// the separate `port` field. Only applies if `port` is still at the
+    /// default value (5060) — an explicit `.port()` call takes precedence.
+    ///
+    /// Called once from [`Phone::new()`](crate::phone::Phone::new).
+    pub(crate) fn normalize_host(&mut self) {
+        if self.host.is_empty() {
+            return;
+        }
+        if let Some((host, port)) = split_host_port(&self.host) {
+            // Only apply embedded port if port hasn't been explicitly set.
+            if self.port == 5060 {
+                self.port = port;
+            }
+            self.host = host.to_string();
+        }
+    }
+}
+
+/// Split a `host:port` string. Returns `None` if no port is present.
+/// Handles `[::1]:5060` (IPv6 bracket notation) and `10.0.0.1:5060`.
+fn split_host_port(s: &str) -> Option<(&str, u16)> {
+    // IPv6 bracket notation: [::1]:5060
+    if let Some(bracket_end) = s.find(']') {
+        let after = &s[bracket_end + 1..];
+        if let Some(port_str) = after.strip_prefix(':') {
+            if let Ok(port) = port_str.parse::<u16>() {
+                return Some((&s[..bracket_end + 1], port));
+            }
+        }
+        return None;
+    }
+    // Only split on the last colon, and only if there's exactly one
+    // (multiple colons without brackets = bare IPv6, don't split).
+    if s.matches(':').count() == 1 {
+        if let Some((host, port_str)) = s.rsplit_once(':') {
+            if let Ok(port) = port_str.parse::<u16>() {
+                return Some((host, port));
+            }
+        }
+    }
+    None
+}
+
 /// Builder for constructing a [`Config`] using chained method calls.
 pub struct PhoneBuilder {
     config: Config,
@@ -137,6 +182,11 @@ impl PhoneBuilder {
     }
 
     /// Sets SIP username, password, and server host.
+    ///
+    /// The `host` parameter accepts `"hostname"`, `"hostname:port"`, or
+    /// `"ip:port"` formats. If a port is embedded, it is extracted and
+    /// applied when the `Config` is consumed by [`Phone::new()`](crate::phone::Phone::new).
+    /// An explicit [`.port()`](Self::port) call always takes precedence.
     pub fn credentials(mut self, username: &str, password: &str, host: &str) -> Self {
         self.config.username = username.into();
         self.config.password = password.into();
@@ -393,6 +443,111 @@ impl Default for DialOptionsBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── host:port parsing ──
+
+    #[test]
+    fn normalize_splits_host_port() {
+        let mut cfg = Config {
+            host: "10.0.0.7:5061".into(),
+            ..Config::default()
+        };
+        cfg.normalize_host();
+        assert_eq!(cfg.host, "10.0.0.7");
+        assert_eq!(cfg.port, 5061);
+    }
+
+    #[test]
+    fn normalize_host_only() {
+        let mut cfg = Config {
+            host: "10.0.0.7".into(),
+            ..Config::default()
+        };
+        cfg.normalize_host();
+        assert_eq!(cfg.host, "10.0.0.7");
+        assert_eq!(cfg.port, 5060); // default
+    }
+
+    #[test]
+    fn normalize_hostname_with_port() {
+        let mut cfg = Config {
+            host: "sip.example.com:5080".into(),
+            ..Config::default()
+        };
+        cfg.normalize_host();
+        assert_eq!(cfg.host, "sip.example.com");
+        assert_eq!(cfg.port, 5080);
+    }
+
+    #[test]
+    fn normalize_ipv6_bracket_with_port() {
+        let mut cfg = Config {
+            host: "[::1]:5060".into(),
+            ..Config::default()
+        };
+        cfg.normalize_host();
+        assert_eq!(cfg.host, "[::1]");
+        assert_eq!(cfg.port, 5060);
+    }
+
+    #[test]
+    fn normalize_bare_ipv6_no_split() {
+        let mut cfg = Config {
+            host: "::1".into(),
+            ..Config::default()
+        };
+        cfg.normalize_host();
+        assert_eq!(cfg.host, "::1");
+        assert_eq!(cfg.port, 5060);
+    }
+
+    #[test]
+    fn normalize_host_direct_config() {
+        let mut cfg = Config {
+            host: "10.0.0.7:5061".into(),
+            ..Config::default()
+        };
+        cfg.normalize_host();
+        assert_eq!(cfg.host, "10.0.0.7");
+        assert_eq!(cfg.port, 5061);
+    }
+
+    #[test]
+    fn normalize_host_invalid_port_ignored() {
+        let mut cfg = Config {
+            host: "10.0.0.7:notaport".into(),
+            ..Config::default()
+        };
+        cfg.normalize_host();
+        // Invalid port — host unchanged.
+        assert_eq!(cfg.host, "10.0.0.7:notaport");
+        assert_eq!(cfg.port, 5060);
+    }
+
+    #[test]
+    fn builder_explicit_port_wins_over_default() {
+        // If .port() is called after .credentials(), it should take precedence.
+        let cfg = PhoneBuilder::new()
+            .credentials("1001", "secret", "10.0.0.7")
+            .port(5061)
+            .build();
+        assert_eq!(cfg.host, "10.0.0.7");
+        assert_eq!(cfg.port, 5061);
+    }
+
+    #[test]
+    fn explicit_port_wins_over_embedded() {
+        // Explicit .port() takes precedence over embedded port in host.
+        let mut cfg = PhoneBuilder::new()
+            .credentials("1001", "secret", "10.0.0.7:5080")
+            .port(9999)
+            .build();
+        cfg.normalize_host();
+        assert_eq!(cfg.host, "10.0.0.7"); // host part still stripped
+        assert_eq!(cfg.port, 9999); // explicit port preserved
+    }
+
+    // ── existing tests ──
 
     #[test]
     fn config_defaults() {
