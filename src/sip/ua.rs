@@ -449,10 +449,18 @@ impl SipTransport for SipUA {
         // Build extra headers from DialOptions (caller_id, custom_headers).
         let mut extra = HashMap::new();
         if let Some(ref cid) = opts.caller_id {
-            extra.insert(
-                "P-Asserted-Identity".to_string(),
-                format!("<sip:{}@{}>", cid, self.client.domain()),
-            );
+            // If caller_id is already a SIP URI (contains @), use as-is.
+            // Otherwise, format with the configured domain.
+            let pai = if cid.contains('@') {
+                if cid.starts_with('<') {
+                    cid.clone()
+                } else {
+                    format!("<{cid}>")
+                }
+            } else {
+                format!("<sip:{}@{}>", cid, self.client.domain())
+            };
+            extra.insert("P-Asserted-Identity".to_string(), pai);
         }
         for (k, v) in &opts.custom_headers {
             extra.insert(k.clone(), v.clone());
@@ -571,6 +579,8 @@ impl SipTransport for SipUA {
 /// Parse a SIP proxy URI (`"sip:proxy.example.com:5060"`) to a `SocketAddr`.
 /// Supports `sip:host:port`, `sip:host`, and bare `host:port` formats.
 fn parse_proxy_uri(uri: &str) -> Option<SocketAddr> {
+    let is_sips = uri.starts_with("sips:");
+    let default_port: u16 = if is_sips { 5061 } else { 5060 };
     let host_part = uri
         .strip_prefix("sip:")
         .or_else(|| uri.strip_prefix("sips:"))
@@ -579,16 +589,16 @@ fn parse_proxy_uri(uri: &str) -> Option<SocketAddr> {
     if let Ok(addr) = host_part.parse::<SocketAddr>() {
         return Some(addr);
     }
-    // Try as IP with default SIP port.
+    // Try as IP with default port (5060 for sip:, 5061 for sips:).
     if let Ok(ip) = host_part.parse::<std::net::IpAddr>() {
-        return Some(SocketAddr::new(ip, 5060));
+        return Some(SocketAddr::new(ip, default_port));
     }
     // Try DNS resolution.
     use std::net::ToSocketAddrs;
     let with_port = if host_part.contains(':') {
         host_part.to_string()
     } else {
-        format!("{host_part}:5060")
+        format!("{host_part}:{default_port}")
     };
     with_port.to_socket_addrs().ok()?.next()
 }

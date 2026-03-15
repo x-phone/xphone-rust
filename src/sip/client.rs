@@ -289,19 +289,19 @@ impl Client {
     }
 
     /// Returns the username for outbound INVITE auth (falls back to main credentials).
-    fn outbound_username(&self) -> String {
+    fn outbound_username(&self) -> &str {
         self.cfg
             .outbound_username
-            .clone()
-            .unwrap_or_else(|| self.cfg.username.clone())
+            .as_deref()
+            .unwrap_or(&self.cfg.username)
     }
 
     /// Returns the password for outbound INVITE auth (falls back to main credentials).
-    fn outbound_password(&self) -> String {
+    fn outbound_password(&self) -> &str {
         self.cfg
             .outbound_password
-            .clone()
-            .unwrap_or_else(|| self.cfg.password.clone())
+            .as_deref()
+            .unwrap_or(&self.cfg.password)
     }
 
     /// Returns the configured domain.
@@ -375,8 +375,8 @@ impl Client {
                 .map_err(|_| Error::Other("sip: auth challenge parse failed".into()))?;
             // Use outbound credentials for INVITE auth when available.
             let creds = Credentials {
-                username: self.outbound_username(),
-                password: self.outbound_password(),
+                username: self.outbound_username().to_string(),
+                password: self.outbound_password().to_string(),
             };
             let auth_val = auth::build_authorization(&ch, &creds, "INVITE", target_uri);
             let auth_resp_hdr = if resp.status_code == 401 {
