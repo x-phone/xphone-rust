@@ -385,14 +385,15 @@ impl Client {
                 "Proxy-Authorization"
             };
 
+            // Merge caller's extra headers first, then insert auth header
+            // so the computed digest always wins (prevents accidental overwrite).
             let mut auth_extra = HashMap::new();
-            auth_extra.insert(auth_resp_hdr.to_string(), auth_val);
-            // Merge caller's extra headers into auth retry.
             if let Some(eh) = extra_headers {
                 for (k, v) in eh {
                     auth_extra.insert(k.clone(), v.clone());
                 }
             }
+            auth_extra.insert(auth_resp_hdr.to_string(), auth_val);
             let mut retry = self.build_invite_request(target_uri, sdp, Some(&auth_extra));
             debug!(method = "INVITE", "SIP >>> re-sending with auth");
             let resp = self.tm.send(&mut retry, dest, timeout)?;
