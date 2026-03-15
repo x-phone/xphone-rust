@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+
+- `Config.host` containing `host:port` (e.g. `"10.0.0.7:5060"`) no longer produces malformed SIP URIs with double ports. The embedded port is extracted automatically; explicit `.port()` calls take precedence.
+
 ## [0.4.0] - 2026-03-13
 
 ### Added
