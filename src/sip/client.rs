@@ -50,6 +50,12 @@ pub struct ClientConfig {
     pub tls_config: Option<TlsConfig>,
     /// STUN server address (e.g. `"stun.l.google.com:19302"`).
     pub stun_server: Option<String>,
+    /// Outbound proxy address for routing INVITEs (parsed from URI).
+    pub outbound_proxy: Option<SocketAddr>,
+    /// Username for outbound INVITE auth. Falls back to `username` if `None`.
+    pub outbound_username: Option<String>,
+    /// Password for outbound INVITE auth. Falls back to `password` if `None`.
+    pub outbound_password: Option<String>,
 }
 
 /// A SIP UA client that can send REGISTER and other requests,
@@ -277,6 +283,27 @@ impl Client {
         &self.cfg.username
     }
 
+    /// Returns the INVITE destination: outbound proxy if set, otherwise registrar.
+    fn outbound_dest(&self) -> SocketAddr {
+        self.cfg.outbound_proxy.unwrap_or(self.cfg.server_addr)
+    }
+
+    /// Returns the username for outbound INVITE auth (falls back to main credentials).
+    fn outbound_username(&self) -> String {
+        self.cfg
+            .outbound_username
+            .clone()
+            .unwrap_or_else(|| self.cfg.username.clone())
+    }
+
+    /// Returns the password for outbound INVITE auth (falls back to main credentials).
+    fn outbound_password(&self) -> String {
+        self.cfg
+            .outbound_password
+            .clone()
+            .unwrap_or_else(|| self.cfg.password.clone())
+    }
+
     /// Returns the configured domain.
     pub fn domain(&self) -> &str {
         &self.cfg.domain
@@ -290,6 +317,7 @@ impl Client {
         target_uri: &str,
         sdp: &[u8],
         timeout: Duration,
+        extra_headers: Option<&HashMap<String, String>>,
     ) -> Result<InviteResult> {
         let mut current_target = target_uri.to_string();
         let mut redirects: u8 = 0;
@@ -298,7 +326,7 @@ impl Client {
             if redirects > 0 {
                 info!(hop = redirects, target = %current_target, "SIP >>> following 3xx redirect");
             }
-            match self.send_invite_once(&current_target, sdp, timeout)? {
+            match self.send_invite_once(&current_target, sdp, timeout, extra_headers)? {
                 ConsumeResult::Success(result) => return Ok(*result),
                 ConsumeResult::Redirect(new_target) => {
                     redirects += 1;
@@ -320,15 +348,18 @@ impl Client {
         target_uri: &str,
         sdp: &[u8],
         timeout: Duration,
+        extra_headers: Option<&HashMap<String, String>>,
     ) -> Result<ConsumeResult> {
         if *self.closed.lock() {
             return Err(Error::Other("sip: client closed".into()));
         }
 
-        let mut req = self.build_invite_request(target_uri, sdp, None);
+        let mut req = self.build_invite_request(target_uri, sdp, extra_headers);
 
-        info!(method = "INVITE", target = %target_uri, server = %self.cfg.server_addr, "SIP >>> sending");
-        let resp = self.tm.send(&mut req, self.cfg.server_addr, timeout)?;
+        // Route to outbound proxy if configured, otherwise to registrar.
+        let dest = self.outbound_dest();
+        info!(method = "INVITE", target = %target_uri, server = %dest, "SIP >>> sending");
+        let resp = self.tm.send(&mut req, dest, timeout)?;
         debug!(method = "INVITE", status = resp.status_code, reason = %resp.reason, "SIP <<< response");
         let branch = req.via_branch().to_string();
 
@@ -342,9 +373,10 @@ impl Client {
             let auth_hdr = resp.header(auth_hdr_name);
             let ch = auth::parse_challenge(auth_hdr)
                 .map_err(|_| Error::Other("sip: auth challenge parse failed".into()))?;
+            // Use outbound credentials for INVITE auth when available.
             let creds = Credentials {
-                username: self.cfg.username.clone(),
-                password: self.cfg.password.clone(),
+                username: self.outbound_username(),
+                password: self.outbound_password(),
             };
             let auth_val = auth::build_authorization(&ch, &creds, "INVITE", target_uri);
             let auth_resp_hdr = if resp.status_code == 401 {
@@ -353,11 +385,17 @@ impl Client {
                 "Proxy-Authorization"
             };
 
-            let mut extra = HashMap::new();
-            extra.insert(auth_resp_hdr.to_string(), auth_val);
-            let mut retry = self.build_invite_request(target_uri, sdp, Some(&extra));
+            let mut auth_extra = HashMap::new();
+            auth_extra.insert(auth_resp_hdr.to_string(), auth_val);
+            // Merge caller's extra headers into auth retry.
+            if let Some(eh) = extra_headers {
+                for (k, v) in eh {
+                    auth_extra.insert(k.clone(), v.clone());
+                }
+            }
+            let mut retry = self.build_invite_request(target_uri, sdp, Some(&auth_extra));
             debug!(method = "INVITE", "SIP >>> re-sending with auth");
-            let resp = self.tm.send(&mut retry, self.cfg.server_addr, timeout)?;
+            let resp = self.tm.send(&mut retry, dest, timeout)?;
             debug!(method = "INVITE", status = resp.status_code, reason = %resp.reason, "SIP <<< auth response");
             let branch = retry.via_branch().to_string();
             (resp, branch, retry)
@@ -744,6 +782,9 @@ mod tests {
             transport: "udp".into(),
             tls_config: None,
             stun_server: None,
+            outbound_proxy: None,
+            outbound_username: None,
+            outbound_password: None,
         }
     }
 
@@ -787,6 +828,9 @@ mod tests {
             transport: "udp".into(),
             tls_config: None,
             stun_server: None,
+            outbound_proxy: None,
+            outbound_username: None,
+            outbound_password: None,
         };
         let client = Client::new(cfg).unwrap();
 
@@ -851,6 +895,9 @@ mod tests {
             transport: "udp".into(),
             tls_config: None,
             stun_server: None,
+            outbound_proxy: None,
+            outbound_username: None,
+            outbound_password: None,
         };
         let client = Client::new(cfg).unwrap();
 
@@ -899,7 +946,7 @@ mod tests {
 
         let sdp = b"v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 10000 RTP/AVP 0\r\n";
         let result = client
-            .send_invite("sip:1002@pbx.local", sdp, Duration::from_secs(5))
+            .send_invite("sip:1002@pbx.local", sdp, Duration::from_secs(5), None)
             .unwrap();
 
         // Should have followed redirect to 1003.
@@ -924,6 +971,9 @@ mod tests {
             transport: "udp".into(),
             tls_config: None,
             stun_server: None,
+            outbound_proxy: None,
+            outbound_username: None,
+            outbound_password: None,
         };
         let client = Client::new(cfg).unwrap();
 
@@ -945,7 +995,7 @@ mod tests {
         });
 
         let sdp = b"v=0\r\n";
-        let result = client.send_invite("sip:1002@pbx.local", sdp, Duration::from_secs(5));
+        let result = client.send_invite("sip:1002@pbx.local", sdp, Duration::from_secs(5), None);
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("no Contact URI"));
 
@@ -967,6 +1017,9 @@ mod tests {
             transport: "udp".into(),
             tls_config: None,
             stun_server: None,
+            outbound_proxy: None,
+            outbound_username: None,
+            outbound_password: None,
         };
         let client = Client::new(cfg).unwrap();
 
@@ -992,7 +1045,7 @@ mod tests {
         });
 
         let sdp = b"v=0\r\n";
-        let result = client.send_invite("sip:1002@pbx.local", sdp, Duration::from_secs(5));
+        let result = client.send_invite("sip:1002@pbx.local", sdp, Duration::from_secs(5), None);
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
@@ -1017,6 +1070,9 @@ mod tests {
             transport: "udp".into(),
             tls_config: None,
             stun_server: None,
+            outbound_proxy: None,
+            outbound_username: None,
+            outbound_password: None,
         };
         let client = Client::new(cfg).unwrap();
 
@@ -1083,7 +1139,7 @@ mod tests {
 
         let sdp = b"v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 10000 RTP/AVP 0\r\n";
         let result = client
-            .send_invite("sip:1002@pbx.local", sdp, Duration::from_secs(5))
+            .send_invite("sip:1002@pbx.local", sdp, Duration::from_secs(5), None)
             .unwrap();
 
         assert_eq!(result.response.status_code, 200);
@@ -1107,6 +1163,9 @@ mod tests {
             transport: "udp".into(),
             tls_config: None,
             stun_server: None,
+            outbound_proxy: None,
+            outbound_username: None,
+            outbound_password: None,
         };
         let client = Client::new(cfg).unwrap();
 
@@ -1164,7 +1223,7 @@ mod tests {
 
         let sdp = b"v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 10000 RTP/AVP 0\r\n";
         let result = client
-            .send_invite("sip:1002@pbx.local", sdp, Duration::from_secs(5))
+            .send_invite("sip:1002@pbx.local", sdp, Duration::from_secs(5), None)
             .unwrap();
 
         assert_eq!(result.response.status_code, 200);

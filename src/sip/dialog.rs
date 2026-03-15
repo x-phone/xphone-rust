@@ -469,6 +469,9 @@ mod tests {
             transport: "udp".into(),
             tls_config: None,
             stun_server: None,
+            outbound_proxy: None,
+            outbound_username: None,
+            outbound_password: None,
         };
         Arc::new(Client::new(cfg).unwrap())
     }

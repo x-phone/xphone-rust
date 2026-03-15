@@ -88,6 +88,15 @@ pub struct Config {
     /// Enable ICE-Lite candidate gathering and STUN responder.
     /// Requires `stun_server` and/or `turn_server` to produce useful candidates.
     pub ice: bool,
+
+    /// Outbound proxy URI for routing INVITEs (e.g. `"sip:proxy.example.com:5060"`).
+    /// When set, outbound INVITEs are sent to this proxy instead of the registrar.
+    /// Registration traffic still goes to `host:port`.
+    pub outbound_proxy: Option<String>,
+    /// Username for outbound INVITE authentication. Falls back to `username` if unset.
+    pub outbound_username: Option<String>,
+    /// Password for outbound INVITE authentication. Falls back to `password` if unset.
+    pub outbound_password: Option<String>,
 }
 
 impl Default for Config {
@@ -119,6 +128,9 @@ impl Default for Config {
             turn_username: None,
             turn_password: None,
             ice: false,
+            outbound_proxy: None,
+            outbound_username: None,
+            outbound_password: None,
         }
     }
 }
@@ -318,6 +330,21 @@ impl PhoneBuilder {
     /// Enables ICE-Lite candidate gathering and STUN responder.
     pub fn ice(mut self, enabled: bool) -> Self {
         self.config.ice = enabled;
+        self
+    }
+
+    /// Sets an outbound proxy for routing INVITEs (e.g. `"sip:proxy.example.com:5060"`).
+    /// Registration traffic still goes to the configured host.
+    pub fn outbound_proxy(mut self, proxy: &str) -> Self {
+        self.config.outbound_proxy = Some(proxy.into());
+        self
+    }
+
+    /// Sets separate credentials for outbound INVITE authentication.
+    /// Falls back to the main credentials if unset.
+    pub fn outbound_credentials(mut self, username: &str, password: &str) -> Self {
+        self.config.outbound_username = Some(username.into());
+        self.config.outbound_password = Some(password.into());
         self
     }
 
