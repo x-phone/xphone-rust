@@ -4,8 +4,16 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **Outbound proxy support** — route outbound INVITEs through a proxy separate from the registrar via `Config::outbound_proxy` (e.g. `"sip:proxy.example.com:5060"`)
+- **Separate outbound credentials** — `Config::outbound_username` / `outbound_password` for INVITE authentication distinct from REGISTER credentials
+- **P-Asserted-Identity** — `DialOptions::caller_id` now sets the P-Asserted-Identity header on outbound INVITEs
+- `PhoneBuilder::outbound_proxy()` and `PhoneBuilder::outbound_credentials()` builder methods
+
 ### Fixed
 
+- **Custom headers not applied to outbound INVITEs** — `DialOptions::custom_headers` and `caller_id` were stored but never sent in the SIP INVITE. Now plumbed through `SipTransport::dial()` → `Client::send_invite()` → wire format.
 - `Config.host` containing `host:port` (e.g. `"10.0.0.7:5060"`) no longer produces malformed SIP URIs with double ports. The embedded port is extracted automatically; explicit `.port()` calls take precedence.
 - RTP port 0 in SDP when `rtp_port_min`/`rtp_port_max` are unset (default 0,0) — now falls back to OS-assigned ephemeral port instead of producing `m=audio 0` which rejects media per RFC 3264
 

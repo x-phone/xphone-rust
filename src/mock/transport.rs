@@ -443,6 +443,7 @@ impl SipTransport for MockTransport {
         _target: &str,
         _local_sdp: &[u8],
         timeout: Duration,
+        _opts: &crate::config::DialOptions,
     ) -> Result<crate::transport::DialResult> {
         // Record as an INVITE send.
         {

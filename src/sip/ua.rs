@@ -4,7 +4,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use parking_lot::Mutex;
-use tracing::{debug, info};
+use tracing::{debug, info, warn};
 
 use super::client::{Client, ClientConfig};
 use super::dialog::{build_sip_response, SipDialogUAC, SipDialogUAS};
@@ -71,6 +71,14 @@ impl SipUA {
             .parse()
             .map_err(|e| Error::Other(format!("invalid server address: {}", e)))?;
 
+        // Parse outbound proxy URI to SocketAddr if configured.
+        let outbound_proxy = cfg.outbound_proxy.as_ref().and_then(|uri| {
+            parse_proxy_uri(uri).or_else(|| {
+                warn!("invalid outbound_proxy URI: {uri}");
+                None
+            })
+        });
+
         let client_cfg = ClientConfig {
             local_addr: "0.0.0.0:0".into(),
             server_addr,
@@ -80,6 +88,9 @@ impl SipUA {
             transport: transport.clone(),
             tls_config: cfg.tls_config.clone(),
             stun_server: cfg.stun_server.clone(),
+            outbound_proxy,
+            outbound_username: cfg.outbound_username.clone(),
+            outbound_password: cfg.outbound_password.clone(),
         };
 
         let client = Arc::new(Client::new(client_cfg)?);
@@ -424,6 +435,7 @@ impl SipTransport for SipUA {
         target: &str,
         local_sdp: &[u8],
         timeout: Duration,
+        opts: &crate::config::DialOptions,
     ) -> Result<crate::transport::DialResult> {
         // Normalize target to SIP URI.
         let target_uri = if target.starts_with("sip:") {
@@ -433,7 +445,31 @@ impl SipTransport for SipUA {
         };
 
         info!(target = %target_uri, "SIP >>> dialing");
-        let result = self.client.send_invite(&target_uri, local_sdp, timeout)?;
+
+        // Build extra headers from DialOptions (caller_id, custom_headers).
+        let mut extra = HashMap::new();
+        if let Some(ref cid) = opts.caller_id {
+            // If caller_id is already a SIP URI (contains @), use as-is.
+            // Otherwise, format with the configured domain.
+            let pai = if cid.contains('@') {
+                if cid.starts_with('<') {
+                    cid.clone()
+                } else {
+                    format!("<{cid}>")
+                }
+            } else {
+                format!("<sip:{}@{}>", cid, self.client.domain())
+            };
+            extra.insert("P-Asserted-Identity".to_string(), pai);
+        }
+        for (k, v) in &opts.custom_headers {
+            extra.insert(k.clone(), v.clone());
+        }
+        let extra_ref = if extra.is_empty() { None } else { Some(&extra) };
+
+        let result = self
+            .client
+            .send_invite(&target_uri, local_sdp, timeout, extra_ref)?;
         let remote_sdp = String::from_utf8_lossy(&result.response.body).to_string();
         info!(
             status = result.response.status_code,
@@ -538,6 +574,35 @@ impl SipTransport for SipUA {
         self.client.close();
         Ok(())
     }
+}
+
+/// Parse a SIP proxy URI (`"sip:proxy.example.com:5060"`) to a `SocketAddr`.
+/// Supports `sip:host:port`, `sip:host`, and bare `host:port` formats.
+fn parse_proxy_uri(uri: &str) -> Option<SocketAddr> {
+    let is_sips = uri.starts_with("sips:");
+    let default_port: u16 = if is_sips { 5061 } else { 5060 };
+    let host_part = uri
+        .strip_prefix("sip:")
+        .or_else(|| uri.strip_prefix("sips:"))
+        .unwrap_or(uri);
+    // Strip URI parameters (;transport=udp, etc.)
+    let host_part = host_part.split(';').next().unwrap_or(host_part);
+    // Try as SocketAddr directly.
+    if let Ok(addr) = host_part.parse::<SocketAddr>() {
+        return Some(addr);
+    }
+    // Try as IP with default port (5060 for sip:, 5061 for sips:).
+    if let Ok(ip) = host_part.parse::<std::net::IpAddr>() {
+        return Some(SocketAddr::new(ip, default_port));
+    }
+    // Try DNS resolution.
+    use std::net::ToSocketAddrs;
+    let with_port = if host_part.contains(':') {
+        host_part.to_string()
+    } else {
+        format!("{host_part}:{default_port}")
+    };
+    with_port.to_socket_addrs().ok()?.next()
 }
 
 #[cfg(test)]

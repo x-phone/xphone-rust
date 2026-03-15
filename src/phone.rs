@@ -369,7 +369,7 @@ impl Phone {
         };
 
         // Try dialog-based dial (production SipUA path).
-        let dial_result = tr.dial(target, local_sdp.as_bytes(), opts.timeout);
+        let dial_result = tr.dial(target, local_sdp.as_bytes(), opts.timeout, &opts);
 
         let (call, responses) = match dial_result {
             Ok(result) => {

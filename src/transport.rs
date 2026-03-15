@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::config::DialOptions;
 use crate::dialog::Dialog;
 use crate::error::{Error, Result};
 use crate::sip::message::Message;
@@ -47,7 +48,13 @@ pub trait SipTransport: Send + Sync {
 
     /// Dials a target with an SDP offer, creating an outbound dialog.
     /// Returns a [`DialResult`] with the dialog, remote SDP, and optional early media SDP.
-    fn dial(&self, _target: &str, _local_sdp: &[u8], _timeout: Duration) -> Result<DialResult> {
+    fn dial(
+        &self,
+        _target: &str,
+        _local_sdp: &[u8],
+        _timeout: Duration,
+        _opts: &DialOptions,
+    ) -> Result<DialResult> {
         Err(Error::Other("dial not supported on this transport".into()))
     }
 
