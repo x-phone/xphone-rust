@@ -576,8 +576,6 @@ impl SipTransport for SipUA {
     }
 }
 
-/// Parse a SIP proxy URI (`"sip:proxy.example.com:5060"`) to a `SocketAddr`.
-/// Supports `sip:host:port`, `sip:host`, and bare `host:port` formats.
 /// Parse a SIP proxy URI to a `SocketAddr`. Strips `sip:`/`sips:` scheme
 /// and delegates to `sip::resolve_host` for address resolution.
 fn parse_proxy_uri(uri: &str) -> Option<SocketAddr> {
