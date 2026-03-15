@@ -292,14 +292,11 @@ impl Phone {
         } else {
             local_ip_for(&self.cfg.host)
         };
-        let (rtp_socket, rtp_port) =
-            match crate::media::listen_rtp_port(self.cfg.rtp_port_min, self.cfg.rtp_port_max) {
-                Ok((sock, port)) => (Some(sock), port as i32),
-                Err(e) => {
-                    warn!("RTP port allocation failed for outbound call: {e}");
-                    (None, 0)
-                }
-            };
+        let (rtp_socket, rtp_port) = {
+            let (sock, port) =
+                crate::media::listen_rtp_port(self.cfg.rtp_port_min, self.cfg.rtp_port_max)?;
+            (Some(sock), port as i32)
+        };
         // Allocate video RTP socket if video is requested.
         let (video_rtp_socket, video_rtp_port) = if opts.video {
             match crate::media::listen_rtp_port(self.cfg.rtp_port_min, self.cfg.rtp_port_max) {
@@ -963,8 +960,9 @@ fn handle_dialog_incoming(
     {
         Ok((sock, port)) => (Some(sock), port as i32),
         Err(e) => {
-            warn!("RTP port allocation failed for incoming call: {e}");
-            (None, 0)
+            warn!("RTP port allocation failed for incoming call, rejecting: {e}");
+            let _ = dlg.respond(503, "Service Unavailable", &[]);
+            return;
         }
     };
 
