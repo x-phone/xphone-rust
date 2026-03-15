@@ -7,6 +7,7 @@ All notable changes to this project will be documented in this file.
 ### Fixed
 
 - `Config.host` containing `host:port` (e.g. `"10.0.0.7:5060"`) no longer produces malformed SIP URIs with double ports. The embedded port is extracted automatically; explicit `.port()` calls take precedence.
+- RTP port 0 in SDP when `rtp_port_min`/`rtp_port_max` are unset (default 0,0) — now falls back to OS-assigned ephemeral port instead of producing `m=audio 0` which rejects media per RFC 3264
 
 ## [0.4.0] - 2026-03-13
 
