@@ -46,14 +46,11 @@ fn integration_client_config(ext: &str, password: &str) -> ClientConfig {
     let host = asterisk_host();
     let port = asterisk_port();
     ClientConfig {
-        local_addr: "0.0.0.0:0".into(),
         server_addr: format!("{}:{}", host, port).parse().unwrap(),
         username: ext.into(),
         password: password.into(),
         domain: host,
-        transport: "udp".into(),
-        tls_config: None,
-        stun_server: None,
+        ..Default::default()
     }
 }
 

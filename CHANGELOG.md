@@ -7,6 +7,7 @@ All notable changes to this project will be documented in this file.
 ### Changed
 
 - Consolidated SIP URI-to-SocketAddr parsing into shared `sip::resolve_host()` — used by both outbound proxy URI parser and trunk server ACK routing. Adds DNS resolution and `;params` stripping to both paths consistently.
+- `ClientConfig` now implements `Default` — reduces boilerplate when adding new optional fields (tests use `..Default::default()` instead of spelling out every `None`)
 
 ### Added
 
