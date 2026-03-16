@@ -466,12 +466,7 @@ mod tests {
             username: "1001".into(),
             password: "test".into(),
             domain: "pbx.local".into(),
-            transport: "udp".into(),
-            tls_config: None,
-            stun_server: None,
-            outbound_proxy: None,
-            outbound_username: None,
-            outbound_password: None,
+            ..Default::default()
         };
         Arc::new(Client::new(cfg).unwrap())
     }

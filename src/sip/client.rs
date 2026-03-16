@@ -58,6 +58,24 @@ pub struct ClientConfig {
     pub outbound_password: Option<String>,
 }
 
+impl Default for ClientConfig {
+    fn default() -> Self {
+        Self {
+            local_addr: "0.0.0.0:0".into(),
+            server_addr: "127.0.0.1:5060".parse().unwrap(),
+            username: String::new(),
+            password: String::new(),
+            domain: String::new(),
+            transport: "udp".into(),
+            tls_config: None,
+            stun_server: None,
+            outbound_proxy: None,
+            outbound_username: None,
+            outbound_password: None,
+        }
+    }
+}
+
 /// A SIP UA client that can send REGISTER and other requests,
 /// and receive incoming requests (INVITE, BYE, etc.).
 pub struct Client {
@@ -780,12 +798,7 @@ mod tests {
             username: "1001".into(),
             password: "test".into(),
             domain: "pbx.local".into(),
-            transport: "udp".into(),
-            tls_config: None,
-            stun_server: None,
-            outbound_proxy: None,
-            outbound_username: None,
-            outbound_password: None,
+            ..Default::default()
         }
     }
 
@@ -826,12 +839,7 @@ mod tests {
             username: "1001".into(),
             password: "test".into(),
             domain: "pbx.local".into(),
-            transport: "udp".into(),
-            tls_config: None,
-            stun_server: None,
-            outbound_proxy: None,
-            outbound_username: None,
-            outbound_password: None,
+            ..Default::default()
         };
         let client = Client::new(cfg).unwrap();
 
@@ -893,12 +901,7 @@ mod tests {
             username: "1001".into(),
             password: "test".into(),
             domain: "pbx.local".into(),
-            transport: "udp".into(),
-            tls_config: None,
-            stun_server: None,
-            outbound_proxy: None,
-            outbound_username: None,
-            outbound_password: None,
+            ..Default::default()
         };
         let client = Client::new(cfg).unwrap();
 
@@ -969,12 +972,7 @@ mod tests {
             username: "1001".into(),
             password: "test".into(),
             domain: "pbx.local".into(),
-            transport: "udp".into(),
-            tls_config: None,
-            stun_server: None,
-            outbound_proxy: None,
-            outbound_username: None,
-            outbound_password: None,
+            ..Default::default()
         };
         let client = Client::new(cfg).unwrap();
 
@@ -1015,12 +1013,7 @@ mod tests {
             username: "1001".into(),
             password: "test".into(),
             domain: "pbx.local".into(),
-            transport: "udp".into(),
-            tls_config: None,
-            stun_server: None,
-            outbound_proxy: None,
-            outbound_username: None,
-            outbound_password: None,
+            ..Default::default()
         };
         let client = Client::new(cfg).unwrap();
 
@@ -1068,12 +1061,7 @@ mod tests {
             username: "1001".into(),
             password: "test".into(),
             domain: "pbx.local".into(),
-            transport: "udp".into(),
-            tls_config: None,
-            stun_server: None,
-            outbound_proxy: None,
-            outbound_username: None,
-            outbound_password: None,
+            ..Default::default()
         };
         let client = Client::new(cfg).unwrap();
 
@@ -1161,12 +1149,7 @@ mod tests {
             username: "1001".into(),
             password: "test".into(),
             domain: "pbx.local".into(),
-            transport: "udp".into(),
-            tls_config: None,
-            stun_server: None,
-            outbound_proxy: None,
-            outbound_username: None,
-            outbound_password: None,
+            ..Default::default()
         };
         let client = Client::new(cfg).unwrap();
 
