@@ -786,17 +786,11 @@ fn send_ack(
     }
 }
 
+/// Extract a `SocketAddr` from a SIP URI (e.g. `sip:1001@10.0.0.1:5060`).
+/// Strips the `user@` prefix and delegates to `sip::resolve_host`.
 fn parse_addr_from_uri(uri: &str) -> Option<SocketAddr> {
     let host_part = uri.split('@').nth(1)?;
-    // Strip URI parameters (;transport=udp etc.)
-    let host_part = host_part.split(';').next().unwrap_or(host_part);
-    if let Ok(addr) = host_part.parse::<SocketAddr>() {
-        return Some(addr);
-    }
-    if let Ok(ip) = host_part.parse::<std::net::IpAddr>() {
-        return Some(SocketAddr::new(ip, 5060));
-    }
-    None
+    crate::sip::resolve_host(host_part, 5060)
 }
 
 struct BuildInviteParams<'a> {
