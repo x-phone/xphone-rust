@@ -329,6 +329,7 @@ impl Server {
                 }
                 "BYE" => self.handle_bye(&socket, addr, &msg, &dialogs).await,
                 "CANCEL" => handle_cancel(&socket, addr, &msg, &dialogs).await,
+                "NOTIFY" => handle_notify(&socket, addr, &msg, &dialogs).await,
                 other => {
                     debug!("unsupported SIP method '{other}' from {addr}");
                     send_sip_response(&socket, addr, &msg, 405, "Method Not Allowed").await;
@@ -707,6 +708,38 @@ async fn handle_cancel(socket: &UdpSocket, addr: SocketAddr, msg: &Message, dial
         if let Err(e) = socket.send_to(&data, addr).await {
             warn!("SIP send to {addr} failed: {e}");
         }
+    }
+}
+
+async fn handle_notify(socket: &UdpSocket, addr: SocketAddr, msg: &Message, dialogs: &DialogMap) {
+    let sip_call_id = msg.header("Call-ID").to_string();
+    info!(call_id = %sip_call_id, "NOTIFY from {addr}");
+
+    // Always respond 200 OK to NOTIFY.
+    send_sip_response(socket, addr, msg, 200, "OK").await;
+
+    // Parse sipfrag status from the NOTIFY body (e.g., "SIP/2.0 200 OK" → 200).
+    let body = String::from_utf8_lossy(&msg.body);
+    let status_code = body
+        .lines()
+        .next()
+        .filter(|line| line.trim().starts_with("SIP/"))
+        .and_then(|line| line.trim().split(' ').nth(1))
+        .and_then(|s| s.parse::<u16>().ok());
+
+    if let Some(code) = status_code {
+        let call = dialogs
+            .lock()
+            .get(&sip_call_id)
+            .and_then(|e| e.call.clone());
+        if let Some(call) = call {
+            info!(call_id = %sip_call_id, code = code, "dispatching NOTIFY to call");
+            call.fire_notify(code);
+        } else {
+            debug!(call_id = %sip_call_id, "NOTIFY for unknown dialog");
+        }
+    } else {
+        debug!(call_id = %sip_call_id, "NOTIFY without parseable sipfrag status");
     }
 }
 
@@ -1151,5 +1184,93 @@ mod tests {
         assert_eq!(dialogs.lock().len(), 1);
         assert!(dialogs.lock().get("stale@xphone").is_none());
         assert!(dialogs.lock().get("fresh@xphone").is_some());
+    }
+
+    #[tokio::test]
+    async fn handle_notify_dispatches_sipfrag_to_call() {
+        use crate::mock::dialog::MockDialog;
+
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+
+        // Create an inbound call, accept it, then start a blind transfer.
+        let mock = Arc::new(MockDialog::new());
+        let call = Call::new_inbound(mock.clone());
+        call.accept().unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        call.on_ended(move |reason| {
+            let _ = tx.send(reason);
+        });
+        call.blind_transfer("sip:1003@pbx.local").unwrap();
+
+        let dialogs: DialogMap = Arc::new(Mutex::new(HashMap::new()));
+        dialogs.lock().insert(
+            "notify-test@xphone".into(),
+            DialogEntry {
+                call: Some(call),
+                dialog: None,
+                created_at: Instant::now(),
+            },
+        );
+
+        // Build a NOTIFY with sipfrag "SIP/2.0 200 OK" body.
+        let mut notify = Message::new_request("NOTIFY", "sip:xphone@127.0.0.1:5080");
+        notify.set_header("Via", "SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bKnotify1");
+        notify.set_header("From", "<sip:1001@pbx.local>;tag=from1");
+        notify.set_header("To", "<sip:3004@xphone:5080>;tag=to1");
+        notify.set_header("Call-ID", "notify-test@xphone");
+        notify.set_header("CSeq", "1 NOTIFY");
+        notify.set_header("Event", "refer");
+        notify.set_header("Content-Type", "message/sipfrag");
+        notify.body = b"SIP/2.0 200 OK\r\n".to_vec();
+
+        handle_notify(&socket, addr, &notify, &dialogs).await;
+
+        // The call should end with Transfer reason.
+        let reason = rx
+            .recv_timeout(std::time::Duration::from_millis(200))
+            .unwrap();
+        assert_eq!(reason, EndReason::Transfer);
+        // Dialog should NOT be removed by handle_notify itself.
+        assert!(dialogs.lock().contains_key("notify-test@xphone"));
+    }
+
+    #[tokio::test]
+    async fn handle_notify_unknown_dialog_does_not_panic() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        let dialogs: DialogMap = Arc::new(Mutex::new(HashMap::new()));
+
+        let mut notify = Message::new_request("NOTIFY", "sip:xphone@127.0.0.1:5080");
+        notify.set_header("Via", "SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bKnotify2");
+        notify.set_header("From", "<sip:1001@pbx.local>;tag=from1");
+        notify.set_header("To", "<sip:3004@xphone:5080>;tag=to1");
+        notify.set_header("Call-ID", "unknown@xphone");
+        notify.set_header("CSeq", "1 NOTIFY");
+        notify.set_header("Event", "refer");
+        notify.set_header("Content-Type", "message/sipfrag");
+        notify.body = b"SIP/2.0 200 OK\r\n".to_vec();
+
+        // Should not panic — just logs debug.
+        handle_notify(&socket, addr, &notify, &dialogs).await;
+    }
+
+    #[tokio::test]
+    async fn handle_notify_no_sipfrag_body() {
+        let socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let addr = socket.local_addr().unwrap();
+        let dialogs: DialogMap = Arc::new(Mutex::new(HashMap::new()));
+
+        let mut notify = Message::new_request("NOTIFY", "sip:xphone@127.0.0.1:5080");
+        notify.set_header("Via", "SIP/2.0/UDP 10.0.0.1:5060;branch=z9hG4bKnotify3");
+        notify.set_header("From", "<sip:1001@pbx.local>;tag=from1");
+        notify.set_header("To", "<sip:3004@xphone:5080>;tag=to1");
+        notify.set_header("Call-ID", "empty-body@xphone");
+        notify.set_header("CSeq", "1 NOTIFY");
+        notify.set_header("Event", "refer");
+
+        // Empty body — should not dispatch, just log debug.
+        handle_notify(&socket, addr, &notify, &dialogs).await;
     }
 }
