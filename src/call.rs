@@ -1144,18 +1144,24 @@ impl Call {
         }
         let weak = Arc::downgrade(self);
         self.dlg.on_notify(Box::new(move |code| {
-            if code == 200 {
-                let Some(call) = weak.upgrade() else {
-                    return;
-                };
-                let mut inner = call.inner.lock();
-                if inner.state == CallState::Ended {
-                    return;
-                }
-                inner.state = CallState::Ended;
-                Self::fire_on_state(&inner, CallState::Ended);
-                Self::fire_on_ended(&mut inner, EndReason::Transfer);
+            let reason = if (200..300).contains(&code) {
+                EndReason::Transfer
+            } else if code >= 300 {
+                EndReason::TransferFailed
+            } else {
+                // 1xx provisional — transfer in progress, don't end the call yet.
+                return;
+            };
+            let Some(call) = weak.upgrade() else {
+                return;
+            };
+            let mut inner = call.inner.lock();
+            if inner.state == CallState::Ended {
+                return;
             }
+            inner.state = CallState::Ended;
+            Self::fire_on_state(&inner, CallState::Ended);
+            Self::fire_on_ended(&mut inner, reason);
         }));
         self.dlg.send_refer(target)?;
         Ok(())
@@ -2416,6 +2422,38 @@ mod tests {
             rx.recv_timeout(Duration::from_millis(200)).unwrap(),
             EndReason::Transfer
         );
+    }
+
+    #[test]
+    fn blind_transfer_failure_notify_ends_call() {
+        let dlg = mock_dlg();
+        let call = Call::new_inbound(dlg.clone());
+        call.accept().unwrap();
+        let (tx, rx) = mpsc::channel();
+        call.on_ended(move |r| {
+            let _ = tx.send(r);
+        });
+        call.blind_transfer("sip:1003@pbx").unwrap();
+        dlg.simulate_notify(503); // Service Unavailable
+        assert_eq!(
+            rx.recv_timeout(Duration::from_millis(200)).unwrap(),
+            EndReason::TransferFailed
+        );
+    }
+
+    #[test]
+    fn blind_transfer_1xx_notify_does_not_end_call() {
+        let dlg = mock_dlg();
+        let call = Call::new_inbound(dlg.clone());
+        call.accept().unwrap();
+        let (tx, rx) = mpsc::channel();
+        call.on_ended(move |r| {
+            let _ = tx.send(r);
+        });
+        call.blind_transfer("sip:1003@pbx").unwrap();
+        dlg.simulate_notify(100); // Trying — should not end
+        assert!(rx.recv_timeout(Duration::from_millis(100)).is_err());
+        assert_eq!(call.state(), CallState::Active);
     }
 
     #[test]
