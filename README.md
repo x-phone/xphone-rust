@@ -309,6 +309,12 @@ fn pcm_to_f32(frame: &[i16]) -> Vec<f32> {
 - Mute / unmute
 - 302 redirect following
 - Early media (183 Session Progress)
+- Outbound proxy routing (`Config::outbound_proxy`)
+- Separate outbound credentials (`outbound_username` / `outbound_password`)
+- P-Asserted-Identity for caller ID (`DialOptions::caller_id`)
+- Custom headers on outbound INVITEs (`DialOptions::custom_headers`)
+- `Server::dial_uri` — dial arbitrary SIP URIs without pre-configured peers
+- `EndReason::TransferFailed` — surfaces REFER failures instead of silently dropping them
 
 ### DTMF — stable
 
@@ -467,6 +473,9 @@ let phone = Phone::new(Config {
     turn_server: Some("turn.example.com:3478".into()),
     turn_username: Some("user".into()),
     turn_password: Some("pass".into()),
+    outbound_proxy: Some("sip:proxy.example.com:5060".into()), // route INVITEs via proxy
+    outbound_username: Some("trunk-user".into()),               // separate INVITE auth
+    outbound_password: Some("trunk-pass".into()),
     ..Config::default()
 });
 
@@ -478,6 +487,8 @@ let phone = Phone::new(
         .codecs(vec![Codec::Opus, Codec::PCMU])
         .srtp(true)
         .stun_server("stun.l.google.com:19302")
+        .outbound_proxy("sip:proxy.example.com:5060")
+        .outbound_credentials("trunk-user", "trunk-pass")
         .build(),
 );
 ```
