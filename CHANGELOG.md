@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Changed
+
+- **`attended_transfer` moved from `Phone` to `Call`** — now works for both `Phone` and `Server` (trunk mode) calls. `Phone::attended_transfer` remains as a thin delegate (non-breaking). NOTIFY handler upgraded to handle transfer failures (3xx+) with `EndReason::TransferFailed`.
+
 ## [0.4.3] - 2026-03-28
 
 ### Added

@@ -4,7 +4,7 @@ use std::sync::Arc;
 use parking_lot::Mutex;
 use tracing::{debug, info, warn};
 
-use crate::call::{self, Call};
+use crate::call::Call;
 use crate::config::{Config, DialOptions};
 use crate::dialog::Dialog;
 use crate::dialog_info::parse_dialog_info;
@@ -14,9 +14,10 @@ use crate::mwi::MwiSubscriber;
 use crate::registry::Registry;
 use crate::subscription::{SubId, SubscriptionManager};
 use crate::transport::SipTransport;
+#[cfg(test)]
+use crate::types::{CallState, EndReason};
 use crate::types::{
-    CallState, Direction, EndReason, ExtensionState, ExtensionStatus, NotifyEvent, PhoneState,
-    SipMessage, VoicemailStatus,
+    ExtensionState, ExtensionStatus, NotifyEvent, PhoneState, SipMessage, VoicemailStatus,
 };
 
 type CallStateCb = Arc<dyn Fn(Arc<Call>, crate::types::CallState) + Send + Sync>;
@@ -724,85 +725,9 @@ impl Phone {
         self.inner.lock().calls.values().cloned().collect()
     }
 
-    /// Initiates an attended (consultative) transfer.
-    ///
-    /// Transfers `call_a` by sending REFER with a Replaces header that references
-    /// `call_b`'s dialog. After the transfer succeeds (NOTIFY 200), both calls end
-    /// with `EndReason::Transfer`.
-    ///
-    /// Both calls must be in `Active` or `OnHold` state.
+    /// Performs an attended transfer. Delegates to [`Call::attended_transfer`].
     pub fn attended_transfer(&self, call_a: &Arc<Call>, call_b: &Arc<Call>) -> Result<()> {
-        {
-            let state_a = call_a.state();
-            if state_a != CallState::Active && state_a != CallState::OnHold {
-                return Err(Error::InvalidState);
-            }
-            let state_b = call_b.state();
-            if state_b != CallState::Active && state_b != CallState::OnHold {
-                return Err(Error::InvalidState);
-            }
-        }
-
-        // Extract Call B's dialog identifiers for the Replaces header.
-        let (b_call_id, b_local_tag, b_remote_tag) = call_b.dialog_id();
-        if b_call_id.is_empty() || b_local_tag.is_empty() || b_remote_tag.is_empty() {
-            return Err(Error::Other(
-                "attended transfer: call B dialog missing call-id or tags".into(),
-            ));
-        }
-
-        // Build the remote party's SIP URI from Call B.
-        let remote_uri = match call_b.direction() {
-            Direction::Outbound => {
-                // Outbound: remote party is in the To header.
-                call_b
-                    .header("To")
-                    .first()
-                    .map(|v| call::sip_header_uri(v).to_string())
-                    .unwrap_or_default()
-            }
-            Direction::Inbound => {
-                // Inbound: remote party is in the From header.
-                call_b
-                    .header("From")
-                    .first()
-                    .map(|v| call::sip_header_uri(v).to_string())
-                    .unwrap_or_default()
-            }
-        };
-        if remote_uri.is_empty() {
-            return Err(Error::Other(
-                "attended transfer: cannot determine call B remote URI".into(),
-            ));
-        }
-
-        // Build Refer-To URI with Replaces parameter (URL-encoded per RFC 3891).
-        // Format: <remote_uri>?Replaces=<call-id>%3Bto-tag%3D<remote-tag>%3Bfrom-tag%3D<local-tag>
-        let refer_to = format!(
-            "{}?Replaces={}%3Bto-tag%3D{}%3Bfrom-tag%3D{}",
-            remote_uri,
-            uri_encode(&b_call_id),
-            uri_encode(&b_remote_tag),
-            uri_encode(&b_local_tag),
-        );
-
-        // Wire up NOTIFY handler: on 200, end both calls with Transfer reason.
-        let weak_a = Arc::downgrade(call_a);
-        let weak_b = Arc::downgrade(call_b);
-        call_a.dlg.on_notify(Box::new(move |code| {
-            if code == 200 {
-                if let Some(a) = weak_a.upgrade() {
-                    a.end_with_reason(EndReason::Transfer);
-                }
-                if let Some(b) = weak_b.upgrade() {
-                    b.end_with_reason(EndReason::Transfer);
-                }
-            }
-        }));
-
-        // Send REFER on Call A's dialog.
-        call_a.dlg.send_refer(&refer_to)?;
-        Ok(())
+        call_a.attended_transfer(call_b)
     }
 }
 
@@ -814,27 +739,6 @@ impl Drop for Phone {
             let _ = self.disconnect();
         }
     }
-}
-
-/// URI-encoding for SIP Replaces header values (RFC 3891).
-/// Encodes URI-reserved characters that appear in Call-IDs and tag values.
-fn uri_encode(val: &str) -> String {
-    let mut out = String::with_capacity(val.len() * 2);
-    for b in val.bytes() {
-        match b {
-            b'%' => out.push_str("%25"),
-            b'@' => out.push_str("%40"),
-            b' ' => out.push_str("%20"),
-            b';' => out.push_str("%3B"),
-            b'?' => out.push_str("%3F"),
-            b'&' => out.push_str("%26"),
-            b'=' => out.push_str("%3D"),
-            b'+' => out.push_str("%2B"),
-            b':' => out.push_str("%3A"),
-            _ => out.push(b as char),
-        }
-    }
-    out
 }
 
 /// Discovers the local IP address used to reach the given host.
@@ -1822,16 +1726,6 @@ mod tests {
 
         assert_eq!(call_a.state(), CallState::Active);
         assert_eq!(call_b.state(), CallState::Active);
-    }
-
-    #[test]
-    fn uri_encode_encodes_special_chars() {
-        assert_eq!(uri_encode("abc@host"), "abc%40host");
-        assert_eq!(uri_encode("hello world"), "hello%20world");
-        assert_eq!(uri_encode("100%done"), "100%25done");
-        assert_eq!(uri_encode("simple"), "simple");
-        assert_eq!(uri_encode("a;b=c?d&e+f"), "a%3Bb%3Dc%3Fd%26e%2Bf");
-        assert_eq!(uri_encode("sip:user"), "sip%3Auser");
     }
 
     // --- MWI ---
