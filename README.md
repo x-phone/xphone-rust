@@ -13,7 +13,9 @@ A Rust library for SIP calling and RTP media. Register with a SIP trunk or PBX, 
 
 ## Status — Beta
 
-xphone-rust is in active development and tracks feature parity with [xphone-go](https://github.com/x-phone/xphone-go). APIs may change between minor versions. The Go implementation has more production mileage — if you're evaluating and language is flexible, start there.
+xphone-rust is in active development and used in production alongside [xbridge](https://github.com/x-phone/xbridge). Feature coverage is broad but real-world mileage is still limited — not all features have been exercised under diverse production conditions. The [Go implementation](https://github.com/x-phone/xphone-go) has more production exposure; if you're evaluating and language is flexible, start there.
+
+The entire SIP and RTP stack is implemented from scratch in Rust — no external SIP or RTP crate dependencies.
 
 ---
 
@@ -49,7 +51,7 @@ xphone is a **voice data-plane library** — SIP signaling and RTP media. It is 
 |---|---|
 | **SIP trunks** | Telnyx, Twilio SIP, VoIP.ms, Vonage |
 | **PBXes** | Asterisk, FreeSWITCH, 3CX |
-| **Integration tests** | Dockerized Asterisk ([xpbx](https://github.com/x-phone/xpbx)) in CI |
+| **Integration tests** | [fakepbx](https://github.com/x-phone/fakepbx) (in-process SIP server, real SIP over loopback) + Dockerized Asterisk ([xpbx](https://github.com/x-phone/xpbx)) in CI |
 | **Unit tests** | MockPhone & MockCall — full Phone/Call API mocks |
 
 This is not a comprehensive compatibility matrix. If you hit issues with a provider or PBX not listed here, please open an issue.
@@ -63,6 +65,8 @@ This is not a comprehensive compatibility matrix. If you hit issues with a provi
 - **Call recording and monitoring** — tap the PCM audio stream for transcription, analysis, or storage
 - **Outbound dialers** — programmatic dialing with DTMF detection for IVR automation
 - **Unit-testable call flows** — MockPhone and MockCall let you test every call branch without a SIP server
+
+See the [demos repo](https://github.com/x-phone/demos) for working examples.
 
 ---
 
@@ -324,7 +328,7 @@ fn pcm_to_f32(frame: &[i16]) -> Vec<f32> {
 - H.264 (RFC 6184) and VP8 (RFC 7741)
 - Depacketizer/packetizer pipeline
 - Mid-call video upgrade/downgrade (re-INVITE)
-- Video upgrade accept/reject API (privacy-safe)
+- Video upgrade accept/reject API
 - VideoReader / VideoWriter / VideoRTPReader / VideoRTPWriter
 - RTCP PLI/FIR for keyframe requests
 
@@ -641,7 +645,14 @@ assert_eq!(call.sent_dtmf(), vec!["5"]);
 call.simulate_dtmf("9");
 ```
 
-### Integration tests with Asterisk
+### Integration tests with FakePBX (no Docker)
+
+```bash
+cargo test --test fakepbx_test
+cargo test --test server_test
+```
+
+### End-to-end tests with Asterisk
 
 ```bash
 docker compose -f testutil/docker/docker-compose.yml up -d --wait
@@ -682,6 +693,16 @@ tracing_subscriber::fmt()
 ```
 
 All SIP messages, RTP stats, media events, and call state transitions are instrumented with `tracing` spans and events.
+
+To silence library logs in production:
+
+```rust
+use tracing_subscriber::EnvFilter;
+
+tracing_subscriber::fmt()
+    .with_env_filter(EnvFilter::new("xphone=warn"))
+    .init();
+```
 
 ---
 
