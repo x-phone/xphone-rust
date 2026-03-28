@@ -151,6 +151,44 @@ impl Server {
     /// `to` is the destination (e.g., `"+15551234567"`).
     /// `from` is the caller ID (e.g., `"+15559876543"`).
     pub fn dial(&self, peer_name: &str, to: &str, from: &str) -> Result<Arc<Call>> {
+        let peer = auth::find_peer(&self.config, peer_name)
+            .ok_or_else(|| Error::Other(format!("unknown peer: {peer_name}")))?;
+        let remote_addr = SocketAddr::new(
+            peer.host
+                .ok_or_else(|| Error::Other(format!("peer '{peer_name}' has no host")))?,
+            peer.port,
+        );
+        let rtp_address = peer.rtp_address.or(self.config.rtp_address);
+
+        self.dial_inner(remote_addr, to, from, rtp_address)
+    }
+
+    /// Dials a SIP URI directly, bypassing peer resolution.
+    ///
+    /// The host:port is extracted from the URI (default port 5060).
+    /// Useful for outbound trunking where the destination is dynamic.
+    ///
+    /// ```ignore
+    /// let call = server.dial_uri("sip:+15551234567@trunk.provider.com:5060", "1001")?;
+    /// ```
+    pub fn dial_uri(&self, sip_uri: &str, from: &str) -> Result<Arc<Call>> {
+        let remote_addr = parse_addr_from_uri(sip_uri)
+            .ok_or_else(|| Error::Other(format!("cannot parse address from URI: {sip_uri}")))?;
+        let to = extract_uri_user(sip_uri);
+        if to.is_empty() || to.contains(':') {
+            return Err(Error::Other(format!("SIP URI has no user part: {sip_uri}")));
+        }
+
+        self.dial_inner(remote_addr, to, from, self.config.rtp_address)
+    }
+
+    fn dial_inner(
+        &self,
+        remote_addr: SocketAddr,
+        to: &str,
+        from: &str,
+        rtp_address: Option<std::net::IpAddr>,
+    ) -> Result<Arc<Call>> {
         let inner = self.inner.lock();
         let sip_tx = inner
             .sip_tx
@@ -165,17 +203,6 @@ impl Server {
         let on_call_dtmf_fn = inner.on_call_dtmf_fn.clone();
         drop(inner);
 
-        // Look up peer config.
-        let peer = auth::find_peer(&self.config, peer_name)
-            .ok_or_else(|| Error::Other(format!("unknown peer: {peer_name}")))?;
-        let remote_addr = SocketAddr::new(
-            peer.host
-                .ok_or_else(|| Error::Other(format!("peer '{peer_name}' has no host")))?,
-            peer.port,
-        );
-
-        // Per-peer rtp_address takes priority over server-level.
-        let rtp_address = peer.rtp_address.or(self.config.rtp_address);
         let local_ip = rtp_address
             .map(|ip| ip.to_string())
             .unwrap_or_else(|| local_addr.ip().to_string());
@@ -1138,6 +1165,34 @@ mod tests {
         let server = Server::new(ServerConfig::default());
         let result = server.dial("peer", "1002", "1001");
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn server_dial_uri_without_listen_fails() {
+        let server = Server::new(ServerConfig::default());
+        let result = server.dial_uri("sip:1002@10.0.0.1:5060", "1001");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn server_dial_uri_bad_uri_fails() {
+        let server = Server::new(ServerConfig::default());
+        let result = server.dial_uri("not-a-sip-uri", "1001");
+        let err = result.err().expect("expected error");
+        assert!(err.to_string().contains("cannot parse"));
+    }
+
+    #[test]
+    fn server_dial_uri_no_user_part_fails() {
+        let server = Server::new(ServerConfig::default());
+        // No @ sign → parse_addr_from_uri fails first.
+        assert!(server.dial_uri("sip:10.0.0.1:5060", "1001").is_err());
+        // Empty user part → caught by user validation.
+        let err = server
+            .dial_uri("sip:@10.0.0.1:5060", "1001")
+            .err()
+            .expect("expected error");
+        assert!(err.to_string().contains("no user part"));
     }
 
     #[test]

@@ -225,6 +225,54 @@ fn server_outbound_dial() {
     server.stop();
 }
 
+// --- S4b: Outbound dial via SIP URI (no peer config) ---
+
+#[test]
+fn server_outbound_dial_uri() {
+    let pbx = FakePBX::new(&[]);
+    pbx.auto_answer(&sdp::sdp("127.0.0.1", 20100, &[sdp::PCMU]));
+
+    // Server with NO peers configured — dial_uri doesn't need them.
+    let config = ServerConfig {
+        listen: "127.0.0.1:0".into(),
+        rtp_port_min: 31300,
+        rtp_port_max: 31399,
+        ..Default::default()
+    };
+    let server = Server::new(config);
+
+    let (ended_tx, ended_rx) = crossbeam_channel::bounded::<EndReason>(1);
+    server.on_call_ended(move |_call, reason| {
+        let _ = ended_tx.try_send(reason);
+    });
+
+    let _server_addr = start_server(&server);
+
+    // Dial directly using the FakePBX's SIP URI.
+    let sip_uri = format!("sip:1002@{}", pbx.addr());
+    let call = server.dial_uri(&sip_uri, "1001").expect("dial_uri failed");
+
+    // Wait for the call to become Active.
+    for _ in 0..50 {
+        if call.state() == CallState::Active {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert_eq!(call.state(), CallState::Active, "call did not reach Active");
+
+    call.end().unwrap();
+
+    let reason = ended_rx
+        .recv_timeout(Duration::from_secs(3))
+        .expect("on_call_ended not fired");
+    assert!(
+        matches!(reason, EndReason::Local),
+        "expected Local, got {reason:?}"
+    );
+    server.stop();
+}
+
 // --- S5: Inbound call with DTMF callback ---
 
 #[test]
