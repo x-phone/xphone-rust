@@ -402,7 +402,7 @@ call.hold()?;
 call.resume()?;
 
 call.blind_transfer("sip:1003@pbx.example.com")?;
-phone.attended_transfer(&call_a, &call_b)?;
+call_a.attended_transfer(&call_b)?; // works for both Phone and Server calls
 
 call.mute()?;
 call.unmute()?;
