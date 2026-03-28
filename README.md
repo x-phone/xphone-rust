@@ -9,6 +9,14 @@ A Rust library for SIP calling and RTP media. Register with a SIP trunk or PBX, 
 
 > Also available in [Go](https://github.com/x-phone/xphone-go) (the more mature implementation).
 
+## Table of Contents
+
+- [Status](#status--beta) | [Scope and Limitations](#scope-and-limitations) | [Tested Against](#tested-against) | [Use Cases](#use-cases)
+- [Quick Start](#quick-start) | [Connection Modes](#connection-modes) | [Working with Audio](#working-with-audio)
+- [Features](#features) | [Call States](#call-states) | [Call Control](#call-control) | [Media Pipeline](#media-pipeline)
+- [Configuration](#configuration) | [RTP Port Range](#rtp-port-range) | [NAT Traversal](#nat-traversal) | [Opus Codec](#opus-codec) | [G.729 Codec](#g729-codec)
+- [Testing](#testing) | [Example App](#example-app) | [Logging](#logging) | [Stack](#stack) | [Roadmap](#roadmap)
+
 ---
 
 ## Status — Beta
