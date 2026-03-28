@@ -197,6 +197,13 @@ fn fakepbx_hold_resume() {
         "resume re-INVITE not received"
     );
 
+    // Each 200 OK MUST be ACKed (RFC 3261 §13.2.2.4).
+    // Initial INVITE + hold re-INVITE + resume re-INVITE = 3 ACKs.
+    assert!(
+        pbx.wait_for_ack(3, Duration::from_secs(2)),
+        "not all re-INVITE 200 OKs were ACKed (xphone-go#61)"
+    );
+
     call.end().unwrap();
     phone.disconnect().unwrap();
 }
