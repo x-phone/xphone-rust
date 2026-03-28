@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- `Server::dial_uri(sip_uri, from)` — dial an arbitrary SIP URI directly, bypassing peer config resolution. Useful for dynamic outbound trunking.
+
 ## [0.4.2] - 2026-03-28
 
 ### Fixed
