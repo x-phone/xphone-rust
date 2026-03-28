@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+
+- **Trunk server ignoring NOTIFY requests** — incoming NOTIFYs (REFER progress) were rejected with `405 Method Not Allowed`. Now parsed for sipfrag status and dispatched to the call via `fire_notify()`, enabling blind transfer completion in trunk mode.
+- **BlindTransfer silently ignoring transfer failures** — non-2xx NOTIFY status codes (e.g., 403, 480, 503) were silently dropped, leaving the call active indefinitely. Now ends the call with `EndReason::TransferFailed`. 1xx provisionals are correctly ignored.
+
+### Added
+
+- `EndReason::TransferFailed` variant — fired when a REFER transfer is rejected by the remote party (3xx/4xx/5xx/6xx NOTIFY status).
+
 ## [0.4.1] - 2026-03-20
 
 ### Changed

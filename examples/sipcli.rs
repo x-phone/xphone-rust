@@ -837,6 +837,7 @@ fn end_reason_name(r: EndReason) -> String {
         EndReason::Timeout => "media timeout".into(),
         EndReason::Error => "error".into(),
         EndReason::Transfer => "transferred".into(),
+        EndReason::TransferFailed => "transfer failed".into(),
         EndReason::Rejected => "rejected".into(),
         EndReason::Cancelled => "cancelled".into(),
     }

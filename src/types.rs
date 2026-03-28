@@ -76,6 +76,8 @@ pub enum EndReason {
     Error,
     /// Call ended after successful REFER transfer.
     Transfer,
+    /// REFER transfer failed (3xx/4xx/5xx/6xx NOTIFY status).
+    TransferFailed,
     /// Inbound call rejected by local party.
     Rejected,
     /// Outbound call cancelled before receiving 200 OK.
@@ -90,6 +92,7 @@ impl fmt::Display for EndReason {
             EndReason::Timeout => write!(f, "Timeout"),
             EndReason::Error => write!(f, "Error"),
             EndReason::Transfer => write!(f, "Transfer"),
+            EndReason::TransferFailed => write!(f, "TransferFailed"),
             EndReason::Rejected => write!(f, "Rejected"),
             EndReason::Cancelled => write!(f, "Cancelled"),
         }
