@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- **Configurable User-Agent header** — `Config.user_agent` / `PhoneBuilder::user_agent()` sets the User-Agent string in all outgoing SIP requests. Defaults to `"xphone"`. PBXes use this to identify the device.
+
 ## [0.4.5] - 2026-03-29
 
 ### Changed
