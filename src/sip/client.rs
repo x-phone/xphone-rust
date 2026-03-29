@@ -56,6 +56,8 @@ pub struct ClientConfig {
     pub outbound_username: Option<String>,
     /// Password for outbound INVITE auth. Falls back to `password` if `None`.
     pub outbound_password: Option<String>,
+    /// User-Agent header value (default: `"xphone"`).
+    pub user_agent: String,
 }
 
 impl Default for ClientConfig {
@@ -72,6 +74,7 @@ impl Default for ClientConfig {
             outbound_proxy: None,
             outbound_username: None,
             outbound_password: None,
+            user_agent: "xphone".into(),
         }
     }
 }
@@ -299,6 +302,10 @@ impl Client {
     /// Returns the configured username.
     pub fn username(&self) -> &str {
         &self.cfg.username
+    }
+
+    pub fn user_agent(&self) -> &str {
+        &self.cfg.user_agent
     }
 
     /// Returns the INVITE destination: outbound proxy if set, otherwise registrar.
@@ -690,7 +697,7 @@ impl Client {
         msg.set_header("CSeq", &format!("{} INVITE", seq));
         msg.set_header("Contact", &format!("<sip:{}@{}>", self.cfg.username, local));
         msg.set_header("Max-Forwards", "70");
-        msg.set_header("User-Agent", "xphone");
+        msg.set_header("User-Agent", &self.cfg.user_agent);
         msg.set_header("Content-Type", "application/sdp");
         msg.body = sdp.to_vec();
 
@@ -730,7 +737,7 @@ impl Client {
         let (cseq_num, _) = invite.cseq();
         ack.set_header("CSeq", &format!("{} ACK", cseq_num));
         ack.set_header("Max-Forwards", "70");
-        ack.set_header("User-Agent", "xphone");
+        ack.set_header("User-Agent", &self.cfg.user_agent);
         let via = format!(
             "SIP/2.0/{} {};branch={}",
             self.via_transport, self.advertised_addr, branch
@@ -774,7 +781,7 @@ impl Client {
         msg.set_header("CSeq", &format!("{} {}", seq, method));
         msg.set_header("Contact", &format!("<sip:{}@{}>", self.cfg.username, local));
         msg.set_header("Max-Forwards", "70");
-        msg.set_header("User-Agent", "xphone");
+        msg.set_header("User-Agent", &self.cfg.user_agent);
 
         if let Some(extra) = extra_headers {
             for (k, v) in extra {
@@ -825,6 +832,43 @@ mod tests {
         // Via should contain the correct transport.
         assert!(req.header("Via").contains("SIP/2.0/UDP"));
 
+        client.close();
+    }
+
+    #[test]
+    fn custom_user_agent_in_register() {
+        let server = UdpConn::bind("127.0.0.1:0").unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        let cfg = ClientConfig {
+            local_addr: "127.0.0.1:0".into(),
+            server_addr,
+            username: "alice".into(),
+            password: "secret".into(),
+            domain: "example.com".into(),
+            user_agent: "MyApp/2.0".into(),
+            ..Default::default()
+        };
+
+        let client = Client::new(cfg).unwrap();
+
+        let handle = std::thread::spawn(move || {
+            let (data, from) = server.receive(Duration::from_secs(2)).unwrap();
+            let req = super::super::message::parse(&data).unwrap();
+            assert_eq!(req.header("User-Agent"), "MyApp/2.0");
+
+            let mut resp = Message::new_response(200, "OK");
+            resp.set_header("Via", req.header("Via"));
+            resp.set_header("Call-ID", req.header("Call-ID"));
+            resp.set_header("CSeq", req.header("CSeq"));
+            resp.set_header("From", req.header("From"));
+            resp.set_header("To", &format!("{};tag=srv1", req.header("To")));
+            server.send(&resp.to_bytes(), from).unwrap();
+        });
+
+        let result = client.send_register(Duration::from_secs(5));
+        assert!(result.is_ok());
+        handle.join().unwrap();
         client.close();
     }
 

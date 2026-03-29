@@ -91,6 +91,7 @@ impl SipUA {
             outbound_proxy,
             outbound_username: cfg.outbound_username.clone(),
             outbound_password: cfg.outbound_password.clone(),
+            user_agent: cfg.user_agent.clone(),
         };
 
         let client = Arc::new(Client::new(client_cfg)?);

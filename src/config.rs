@@ -89,6 +89,10 @@ pub struct Config {
     /// Requires `stun_server` and/or `turn_server` to produce useful candidates.
     pub ice: bool,
 
+    /// User-Agent string sent in SIP headers.
+    /// Defaults to `"xphone"`. PBXes use this to identify the device.
+    pub user_agent: String,
+
     /// Outbound proxy URI for routing INVITEs (e.g. `"sip:proxy.example.com:5060"`).
     /// When set, outbound INVITEs are sent to this proxy instead of the registrar.
     /// Registration traffic still goes to `host:port`.
@@ -128,6 +132,7 @@ impl Default for Config {
             turn_username: None,
             turn_password: None,
             ice: false,
+            user_agent: "xphone".into(),
             outbound_proxy: None,
             outbound_username: None,
             outbound_password: None,
@@ -330,6 +335,14 @@ impl PhoneBuilder {
     /// Enables ICE-Lite candidate gathering and STUN responder.
     pub fn ice(mut self, enabled: bool) -> Self {
         self.config.ice = enabled;
+        self
+    }
+
+    /// Sets the User-Agent string sent in SIP headers.
+    /// PBXes use this to identify the device (e.g., `"MyApp/1.0"`).
+    /// Defaults to `"xphone"`.
+    pub fn user_agent(mut self, ua: &str) -> Self {
+        self.config.user_agent = ua.into();
         self
     }
 

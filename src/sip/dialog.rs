@@ -142,7 +142,7 @@ impl SipDialogUAC {
             ),
         );
         req.set_header("Max-Forwards", "70");
-        req.set_header("User-Agent", "xphone");
+        req.set_header("User-Agent", self.client.user_agent());
         for route in &self.route_set {
             req.add_header("Route", route);
         }
@@ -336,7 +336,7 @@ impl SipDialogUAS {
             ),
         );
         req.set_header("Max-Forwards", "70");
-        req.set_header("User-Agent", "xphone");
+        req.set_header("User-Agent", self.client.user_agent());
         for route in &self.route_set {
             req.add_header("Route", route);
         }
