@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.5] - 2026-03-29
+
+### Changed
+
+- **`on_*` callbacks now append instead of replace** — calling any `on_*` setter (e.g., `on_ended`, `on_state`, `on_hold`) multiple times now registers all callbacks instead of silently dropping previous ones. Affects `Call`, `Phone`, `Server`, `MockCall`, `MockPhone`, `MwiSubscriber`, and `SubscriptionManager`. `on_video_request` remains single-handler (replace) since only one handler can respond to a video upgrade request.
+- `Error` now derives `Clone`
+
 ## [0.4.4] - 2026-03-28
 
 ### Changed
