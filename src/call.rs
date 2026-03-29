@@ -234,18 +234,18 @@ struct CallInner {
     /// FIR sequence counter, incremented per request_keyframe().
     fir_seq_nr: u8,
 
-    on_ended_fn: Option<Arc<dyn Fn(EndReason) + Send + Sync>>,
+    on_ended_fn: Vec<Arc<dyn Fn(EndReason) + Send + Sync>>,
     on_ended_internal: Option<Arc<dyn Fn(EndReason) + Send + Sync>>,
-    on_media_fn: Option<Arc<dyn Fn() + Send + Sync>>,
-    on_state_fn: Option<Arc<dyn Fn(CallState) + Send + Sync>>,
+    on_media_fn: Vec<Arc<dyn Fn() + Send + Sync>>,
+    on_state_fn: Vec<Arc<dyn Fn(CallState) + Send + Sync>>,
     on_state_internal: Option<Arc<dyn Fn(CallState) + Send + Sync>>,
-    on_dtmf_fn: Option<Arc<dyn Fn(String) + Send + Sync>>,
+    on_dtmf_fn: Vec<Arc<dyn Fn(String) + Send + Sync>>,
     on_dtmf_internal: Option<Arc<dyn Fn(String) + Send + Sync>>,
-    on_hold_fn: Option<Arc<dyn Fn() + Send + Sync>>,
-    on_resume_fn: Option<Arc<dyn Fn() + Send + Sync>>,
-    on_mute_fn: Option<Arc<dyn Fn() + Send + Sync>>,
-    on_unmute_fn: Option<Arc<dyn Fn() + Send + Sync>>,
-    on_video_fn: Option<Arc<dyn Fn() + Send + Sync>>,
+    on_hold_fn: Vec<Arc<dyn Fn() + Send + Sync>>,
+    on_resume_fn: Vec<Arc<dyn Fn() + Send + Sync>>,
+    on_mute_fn: Vec<Arc<dyn Fn() + Send + Sync>>,
+    on_unmute_fn: Vec<Arc<dyn Fn() + Send + Sync>>,
+    on_video_fn: Vec<Arc<dyn Fn() + Send + Sync>>,
     on_video_request_fn: Option<Arc<dyn Fn(VideoUpgradeRequest) + Send + Sync>>,
 
     session_timer: Option<std::thread::JoinHandle<()>>,
@@ -294,18 +294,18 @@ impl Call {
                 video_rtcp_socket: None,
                 video_remote_port: 0,
                 fir_seq_nr: 0,
-                on_ended_fn: None,
+                on_ended_fn: Vec::new(),
                 on_ended_internal: None,
-                on_media_fn: None,
-                on_state_fn: None,
+                on_media_fn: Vec::new(),
+                on_state_fn: Vec::new(),
                 on_state_internal: None,
-                on_dtmf_fn: None,
+                on_dtmf_fn: Vec::new(),
                 on_dtmf_internal: None,
-                on_hold_fn: None,
-                on_resume_fn: None,
-                on_mute_fn: None,
-                on_unmute_fn: None,
-                on_video_fn: None,
+                on_hold_fn: Vec::new(),
+                on_resume_fn: Vec::new(),
+                on_mute_fn: Vec::new(),
+                on_unmute_fn: Vec::new(),
+                on_video_fn: Vec::new(),
                 on_video_request_fn: None,
                 session_timer: None,
                 session_timer_cancel: None,
@@ -347,18 +347,18 @@ impl Call {
                 video_rtcp_socket: None,
                 video_remote_port: 0,
                 fir_seq_nr: 0,
-                on_ended_fn: None,
+                on_ended_fn: Vec::new(),
                 on_ended_internal: None,
-                on_media_fn: None,
-                on_state_fn: None,
+                on_media_fn: Vec::new(),
+                on_state_fn: Vec::new(),
                 on_state_internal: None,
-                on_dtmf_fn: None,
+                on_dtmf_fn: Vec::new(),
                 on_dtmf_internal: None,
-                on_hold_fn: None,
-                on_resume_fn: None,
-                on_mute_fn: None,
-                on_unmute_fn: None,
-                on_video_fn: None,
+                on_hold_fn: Vec::new(),
+                on_resume_fn: Vec::new(),
+                on_mute_fn: Vec::new(),
+                on_unmute_fn: Vec::new(),
+                on_video_fn: Vec::new(),
                 on_video_request_fn: None,
                 session_timer: None,
                 session_timer_cancel: None,
@@ -648,7 +648,7 @@ impl Call {
             let f = Arc::clone(f);
             spawn_callback(move || f(state));
         }
-        if let Some(ref f) = inner.on_state_fn {
+        for f in &inner.on_state_fn {
             let f = Arc::clone(f);
             spawn_callback(move || f(state));
         }
@@ -664,24 +664,24 @@ impl Call {
             let f = Arc::clone(f);
             spawn_callback(move || f(reason));
         }
-        if let Some(ref f) = inner.on_ended_fn {
+        for f in &inner.on_ended_fn {
             let f = Arc::clone(f);
             spawn_callback(move || f(reason));
         }
         // Clear all callbacks to break circular Arc references (Call → callback → Arc<Call>).
         // Without this, the Call can never be dropped because the callbacks captured Arc<Call>.
         inner.on_ended_internal = None;
-        inner.on_ended_fn = None;
+        inner.on_ended_fn.clear();
         inner.on_state_internal = None;
-        inner.on_state_fn = None;
+        inner.on_state_fn.clear();
         inner.on_dtmf_internal = None;
-        inner.on_dtmf_fn = None;
-        inner.on_media_fn = None;
-        inner.on_hold_fn = None;
-        inner.on_resume_fn = None;
-        inner.on_mute_fn = None;
-        inner.on_unmute_fn = None;
-        inner.on_video_fn = None;
+        inner.on_dtmf_fn.clear();
+        inner.on_media_fn.clear();
+        inner.on_hold_fn.clear();
+        inner.on_resume_fn.clear();
+        inner.on_mute_fn.clear();
+        inner.on_unmute_fn.clear();
+        inner.on_video_fn.clear();
         inner.on_video_request_fn = None;
     }
 
@@ -759,7 +759,7 @@ impl Call {
 
         self.start_session_timer();
 
-        if let Some(f) = on_media_fn {
+        for f in on_media_fn {
             spawn_callback(move || f());
         }
         Ok(())
@@ -852,7 +852,7 @@ impl Call {
             }
             on_mute = inner.on_mute_fn.clone();
         }
-        if let Some(f) = on_mute {
+        for f in on_mute {
             spawn_callback(move || f());
         }
         Ok(())
@@ -875,7 +875,7 @@ impl Call {
             }
             on_unmute = inner.on_unmute_fn.clone();
         }
-        if let Some(f) = on_unmute {
+        for f in on_unmute {
             spawn_callback(move || f());
         }
         Ok(())
@@ -898,7 +898,7 @@ impl Call {
             }
             on_mute = inner.on_mute_fn.clone();
         }
-        if let Some(f) = on_mute {
+        for f in on_mute {
             spawn_callback(move || f());
         }
         Ok(())
@@ -921,7 +921,7 @@ impl Call {
             }
             on_unmute = inner.on_unmute_fn.clone();
         }
-        if let Some(f) = on_unmute {
+        for f in on_unmute {
             spawn_callback(move || f());
         }
         Ok(())
@@ -1312,7 +1312,7 @@ impl Call {
                         inner.media_active = true;
                         Self::start_media_pipeline(&mut inner);
                         Self::fire_on_state(&inner, CallState::EarlyMedia);
-                        if let Some(ref f) = inner.on_media_fn {
+                        for f in &inner.on_media_fn {
                             let f = Arc::clone(f);
                             spawn_callback(move || f());
                         }
@@ -1329,7 +1329,7 @@ impl Call {
                         inner.media_active = true;
                         Self::start_media_pipeline(&mut inner);
                         Self::fire_on_state(&inner, CallState::Active);
-                        if let Some(ref f) = inner.on_media_fn {
+                        for f in &inner.on_media_fn {
                             let f = Arc::clone(f);
                             spawn_callback(move || f());
                         }
@@ -1379,14 +1379,12 @@ impl Call {
             let inner = self.inner.lock();
             (inner.on_dtmf_internal.clone(), inner.on_dtmf_fn.clone())
         };
-        match (f_int, f_usr) {
-            (Some(a), Some(b)) => {
-                let d = digit.to_string();
-                a(d.clone());
-                b(d);
-            }
-            (Some(f), None) | (None, Some(f)) => f(digit.to_string()),
-            (None, None) => {}
+        let d = digit.to_string();
+        if let Some(f) = f_int {
+            f(d.clone());
+        }
+        for f in f_usr {
+            f(d.clone());
         }
     }
 
@@ -1405,8 +1403,8 @@ impl Call {
         Self::set_remote_endpoint(&mut inner, &sess);
 
         let dir = sess.dir();
-        let mut hold_fn = None;
-        let mut resume_fn = None;
+        let mut hold_fn = Vec::new();
+        let mut resume_fn = Vec::new();
         let mut new_state = None;
 
         let is_hold_dir =
@@ -1432,10 +1430,10 @@ impl Call {
         }
         drop(inner);
 
-        if let Some(f) = hold_fn {
+        for f in hold_fn {
             spawn_callback(move || f());
         }
-        if let Some(f) = resume_fn {
+        for f in resume_fn {
             spawn_callback(move || f());
         }
     }
@@ -1659,8 +1657,8 @@ impl Call {
         Self::set_remote_endpoint(&mut inner, sess);
 
         let dir = sess.dir();
-        let mut hold_fn = None;
-        let mut resume_fn = None;
+        let mut hold_fn = Vec::new();
+        let mut resume_fn = Vec::new();
         let mut new_state = None;
 
         let is_hold_dir =
@@ -1686,10 +1684,10 @@ impl Call {
         }
         drop(inner);
 
-        if let Some(f) = hold_fn {
+        for f in hold_fn {
             spawn_callback(move || f());
         }
-        if let Some(f) = resume_fn {
+        for f in resume_fn {
             spawn_callback(move || f());
         }
     }
@@ -1917,7 +1915,7 @@ impl Call {
         inner.media_streams.push(video_stream);
 
         // Fire on_video callback so the app can start rendering.
-        if let Some(ref f) = inner.on_video_fn {
+        for f in &inner.on_video_fn {
             let f = Arc::clone(f);
             spawn_callback(move || f());
         }
@@ -1931,52 +1929,61 @@ impl Call {
     // --- Callback setters ---
 
     /// Registers a callback invoked on every state transition.
+    /// Multiple callbacks can be registered; all will fire.
     pub fn on_state(&self, f: impl Fn(CallState) + Send + Sync + 'static) {
-        self.inner.lock().on_state_fn = Some(Arc::new(f));
+        self.inner.lock().on_state_fn.push(Arc::new(f));
     }
 
     /// Registers a callback invoked when the call ends, with the reason.
+    /// Multiple callbacks can be registered; all will fire.
     pub fn on_ended(&self, f: impl Fn(EndReason) + Send + Sync + 'static) {
-        self.inner.lock().on_ended_fn = Some(Arc::new(f));
+        self.inner.lock().on_ended_fn.push(Arc::new(f));
     }
 
     /// Registers a callback invoked when the media session becomes available.
+    /// Multiple callbacks can be registered; all will fire.
     pub fn on_media(&self, f: impl Fn() + Send + Sync + 'static) {
-        self.inner.lock().on_media_fn = Some(Arc::new(f));
+        self.inner.lock().on_media_fn.push(Arc::new(f));
     }
 
     /// Registers a callback invoked when a DTMF digit is received.
+    /// Multiple callbacks can be registered; all will fire.
     pub fn on_dtmf(&self, f: impl Fn(String) + Send + Sync + 'static) {
         let mut inner = self.inner.lock();
-        inner.on_dtmf_fn = Some(Arc::new(f));
+        inner.on_dtmf_fn.push(Arc::new(f));
         if let Some(ref shared) = inner.media_shared {
             Self::sync_dtmf_to_media(&inner, shared);
         }
     }
 
     /// Registers a callback invoked when the call is placed on hold.
+    /// Multiple callbacks can be registered; all will fire.
     pub fn on_hold(&self, f: impl Fn() + Send + Sync + 'static) {
-        self.inner.lock().on_hold_fn = Some(Arc::new(f));
+        self.inner.lock().on_hold_fn.push(Arc::new(f));
     }
 
     /// Registers a callback invoked when the call is resumed from hold.
+    /// Multiple callbacks can be registered; all will fire.
     pub fn on_resume(&self, f: impl Fn() + Send + Sync + 'static) {
-        self.inner.lock().on_resume_fn = Some(Arc::new(f));
+        self.inner.lock().on_resume_fn.push(Arc::new(f));
     }
 
     /// Registers a callback invoked when the call is muted.
+    /// Multiple callbacks can be registered; all will fire.
     pub fn on_mute(&self, f: impl Fn() + Send + Sync + 'static) {
-        self.inner.lock().on_mute_fn = Some(Arc::new(f));
+        self.inner.lock().on_mute_fn.push(Arc::new(f));
     }
 
     /// Registers a callback invoked when the call is unmuted.
+    /// Multiple callbacks can be registered; all will fire.
     pub fn on_unmute(&self, f: impl Fn() + Send + Sync + 'static) {
-        self.inner.lock().on_unmute_fn = Some(Arc::new(f));
+        self.inner.lock().on_unmute_fn.push(Arc::new(f));
     }
 
     /// Registers a callback invoked when video is added to the call (e.g., via re-INVITE).
+    /// Multiple callbacks can be registered; all will fire.
     pub fn on_video(&self, f: impl Fn() + Send + Sync + 'static) {
-        self.inner.lock().on_video_fn = Some(Arc::new(f));
+        self.inner.lock().on_video_fn.push(Arc::new(f));
     }
 
     /// Registers a callback invoked when the remote requests a video upgrade via re-INVITE.
@@ -2009,18 +2016,17 @@ impl Call {
     fn sync_dtmf_to_media(inner: &CallInner, shared: &Arc<media::MediaSharedState>) {
         let f_int = inner.on_dtmf_internal.clone();
         let f_usr = inner.on_dtmf_fn.clone();
-        match (f_int, f_usr) {
-            (Some(a), Some(b)) => {
-                *shared.on_dtmf_fn.lock() = Some(Arc::new(move |d: String| {
-                    a(d.clone());
-                    b(d);
-                }));
-            }
-            (Some(f), None) | (None, Some(f)) => {
-                *shared.on_dtmf_fn.lock() = Some(f);
-            }
-            (None, None) => {}
+        if f_int.is_none() && f_usr.is_empty() {
+            return;
         }
+        *shared.on_dtmf_fn.lock() = Some(Arc::new(move |d: String| {
+            if let Some(ref a) = f_int {
+                a(d.clone());
+            }
+            for f in &f_usr {
+                f(d.clone());
+            }
+        }));
     }
 
     // --- Media channel accessors ---
@@ -3731,5 +3737,69 @@ mod tests {
         call.accept().unwrap();
         call.set_video_codec(VideoCodec::H264);
         assert!(call.add_video(&[VideoCodec::VP8], 10000, 20000).is_err());
+    }
+
+    #[test]
+    fn multiple_on_ended_callbacks_all_fire() {
+        let call = Call::new_inbound(mock_dlg());
+        call.accept().unwrap();
+
+        let count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+
+        let c1 = Arc::clone(&count);
+        call.on_ended(move |_| {
+            c1.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
+        let c2 = Arc::clone(&count);
+        call.on_ended(move |_| {
+            c2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
+
+        call.end().unwrap();
+        // Callbacks fire via spawn_callback — wait briefly.
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(count.load(std::sync::atomic::Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn multiple_on_state_callbacks_all_fire() {
+        let call = Call::new_inbound(mock_dlg());
+
+        let count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+
+        let c1 = Arc::clone(&count);
+        call.on_state(move |_| {
+            c1.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
+        let c2 = Arc::clone(&count);
+        call.on_state(move |_| {
+            c2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
+
+        call.accept().unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        // Active state fires both callbacks.
+        assert_eq!(count.load(std::sync::atomic::Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn multiple_on_hold_callbacks_all_fire() {
+        let call = Call::new_inbound(mock_dlg());
+        call.accept().unwrap();
+
+        let count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let c1 = Arc::clone(&count);
+        call.on_hold(move || {
+            c1.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
+        let c2 = Arc::clone(&count);
+        call.on_hold(move || {
+            c2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
+
+        let hold_sdp = "v=0\r\no=- 1 1 IN IP4 10.0.0.1\r\ns=-\r\nc=IN IP4 10.0.0.1\r\nt=0 0\r\nm=audio 20000 RTP/AVP 0\r\na=sendonly\r\n";
+        call.simulate_reinvite(hold_sdp);
+        std::thread::sleep(std::time::Duration::from_millis(100));
+        assert_eq!(count.load(std::sync::atomic::Ordering::Relaxed), 2);
     }
 }

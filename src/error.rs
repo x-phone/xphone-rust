@@ -1,5 +1,5 @@
 /// Errors returned by [`Phone`](crate::Phone) and [`Call`](crate::Call) methods.
-#[derive(Debug, thiserror::Error)]
+#[derive(Debug, Clone, thiserror::Error)]
 pub enum Error {
     /// Operation requires an active SIP registration.
     #[error("xphone: not registered")]

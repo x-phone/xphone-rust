@@ -76,7 +76,7 @@ impl SubscriptionManager {
     /// Creates a new manager and spawns the background thread.
     pub fn new(tr: Arc<dyn SipTransport>) -> Self {
         let (cmd_tx, cmd_rx) = crossbeam_channel::unbounded();
-        let error_cb: ErrorCallback = Arc::new(Mutex::new(None));
+        let error_cb: ErrorCallback = Arc::new(Mutex::new(Vec::new()));
         let error_cb_clone = Arc::clone(&error_cb);
 
         let handle = std::thread::Builder::new()
@@ -138,7 +138,7 @@ impl SubscriptionManager {
 
     /// Sets the error callback.
     pub fn on_error<F: Fn(String, Error) + Send + Sync + 'static>(&self, f: F) {
-        *self.error_cb.lock() = Some(Arc::new(f));
+        self.error_cb.lock().push(Arc::new(f));
     }
 
     /// Stops the manager thread and joins it.
@@ -157,7 +157,7 @@ impl Drop for SubscriptionManager {
 }
 
 /// Shared error callback type.
-type ErrorCallback = Arc<Mutex<Option<Arc<dyn Fn(String, Error) + Send + Sync>>>>;
+type ErrorCallback = Arc<Mutex<Vec<Arc<dyn Fn(String, Error) + Send + Sync>>>>;
 
 /// Default SUBSCRIBE Expires value.
 const DEFAULT_EXPIRES: u32 = 600;
@@ -326,9 +326,9 @@ fn handle_subscribe(
         }
         Err(e) => {
             warn!(id = id, error = %e, "SUBSCRIBE failed");
-            let cb = error_cb.lock().clone();
-            if let Some(f) = cb {
-                f(uri, e);
+            let cbs = error_cb.lock().clone();
+            for f in &cbs {
+                f(uri.clone(), e.clone());
             }
         }
     }
@@ -395,9 +395,9 @@ fn handle_incoming_notify(
                     }
                     Err(e) => {
                         warn!(id = id, error = %e, "auto-re-subscribe failed");
-                        let cb = error_cb.lock().clone();
-                        if let Some(f) = cb {
-                            f(uri, e);
+                        let cbs = error_cb.lock().clone();
+                        for f in &cbs {
+                            f(uri.clone(), e.clone());
                         }
                     }
                 }
@@ -406,8 +406,8 @@ fn handle_incoming_notify(
 
             // Permanent failure — fire error callback (don't fire subscription callback).
             if reason == "rejected" || reason == "noresource" {
-                let cb = error_cb.lock().clone();
-                if let Some(f) = cb {
+                let cbs = error_cb.lock().clone();
+                for f in &cbs {
                     f(
                         sub.uri.clone(),
                         Error::Other(format!("subscription rejected: {}", reason)),

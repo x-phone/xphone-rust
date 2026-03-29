@@ -30,14 +30,14 @@ struct Inner {
     transfer_to: String,
     headers: HashMap<String, Vec<String>>,
 
-    on_dtmf_fn: Option<Arc<dyn Fn(String) + Send + Sync>>,
-    on_hold_fn: Option<Arc<dyn Fn() + Send + Sync>>,
-    on_resume_fn: Option<Arc<dyn Fn() + Send + Sync>>,
-    on_mute_fn: Option<Arc<dyn Fn() + Send + Sync>>,
-    on_unmute_fn: Option<Arc<dyn Fn() + Send + Sync>>,
-    on_media_fn: Option<Arc<dyn Fn() + Send + Sync>>,
-    on_state_fn: Option<Arc<dyn Fn(CallState) + Send + Sync>>,
-    on_ended_fn: Option<Arc<dyn Fn(EndReason) + Send + Sync>>,
+    on_dtmf_fn: Vec<Arc<dyn Fn(String) + Send + Sync>>,
+    on_hold_fn: Vec<Arc<dyn Fn() + Send + Sync>>,
+    on_resume_fn: Vec<Arc<dyn Fn() + Send + Sync>>,
+    on_mute_fn: Vec<Arc<dyn Fn() + Send + Sync>>,
+    on_unmute_fn: Vec<Arc<dyn Fn() + Send + Sync>>,
+    on_media_fn: Vec<Arc<dyn Fn() + Send + Sync>>,
+    on_state_fn: Vec<Arc<dyn Fn(CallState) + Send + Sync>>,
+    on_ended_fn: Vec<Arc<dyn Fn(EndReason) + Send + Sync>>,
 }
 
 fn mock_call_id() -> String {
@@ -94,14 +94,14 @@ impl MockCall {
                 sent_dtmf: Vec::new(),
                 transfer_to: String::new(),
                 headers: HashMap::new(),
-                on_dtmf_fn: None,
-                on_hold_fn: None,
-                on_resume_fn: None,
-                on_mute_fn: None,
-                on_unmute_fn: None,
-                on_media_fn: None,
-                on_state_fn: None,
-                on_ended_fn: None,
+                on_dtmf_fn: Vec::new(),
+                on_hold_fn: Vec::new(),
+                on_resume_fn: Vec::new(),
+                on_mute_fn: Vec::new(),
+                on_unmute_fn: Vec::new(),
+                on_media_fn: Vec::new(),
+                on_state_fn: Vec::new(),
+                on_ended_fn: Vec::new(),
             }),
         }
     }
@@ -208,7 +208,7 @@ impl MockCall {
 
     /// Accepts a ringing call, transitioning it to `Active`.
     pub fn accept(&self) -> Result<()> {
-        let cb = {
+        let cbs = {
             let mut inner = self.inner.lock();
             if inner.state != CallState::Ringing {
                 return Err(Error::InvalidState);
@@ -217,7 +217,7 @@ impl MockCall {
             inner.start_time = Some(Instant::now());
             inner.on_state_fn.clone()
         };
-        if let Some(f) = cb {
+        for f in cbs {
             f(CallState::Active);
         }
         Ok(())
@@ -225,18 +225,20 @@ impl MockCall {
 
     /// Rejects a ringing call with the given SIP status code and reason.
     pub fn reject(&self, _code: u16, _reason: &str) -> Result<()> {
-        let (state_cb, ended_cb) = {
+        let (state_cbs, ended_cbs) = {
             let mut inner = self.inner.lock();
             if inner.state != CallState::Ringing {
                 return Err(Error::InvalidState);
             }
             inner.state = CallState::Ended;
-            (inner.on_state_fn.clone(), inner.on_ended_fn.clone())
+            let cbs = (inner.on_state_fn.clone(), inner.on_ended_fn.clone());
+            Self::clear_callbacks(&mut inner);
+            cbs
         };
-        if let Some(f) = state_cb {
+        for f in state_cbs {
             f(CallState::Ended);
         }
-        if let Some(f) = ended_cb {
+        for f in ended_cbs {
             f(EndReason::Rejected);
         }
         Ok(())
@@ -244,7 +246,7 @@ impl MockCall {
 
     /// Ends an active, on-hold, or dialing call.
     pub fn end(&self) -> Result<()> {
-        let (reason, state_cb, ended_cb) = {
+        let (reason, state_cbs, ended_cbs) = {
             let mut inner = self.inner.lock();
             let reason = match inner.state {
                 CallState::Dialing | CallState::RemoteRinging | CallState::EarlyMedia => {
@@ -254,12 +256,14 @@ impl MockCall {
                 _ => return Err(Error::InvalidState),
             };
             inner.state = CallState::Ended;
-            (reason, inner.on_state_fn.clone(), inner.on_ended_fn.clone())
+            let cbs = (reason, inner.on_state_fn.clone(), inner.on_ended_fn.clone());
+            Self::clear_callbacks(&mut inner);
+            cbs
         };
-        if let Some(f) = state_cb {
+        for f in state_cbs {
             f(CallState::Ended);
         }
-        if let Some(f) = ended_cb {
+        for f in ended_cbs {
             f(reason);
         }
         Ok(())
@@ -267,7 +271,7 @@ impl MockCall {
 
     /// Places an active call on hold.
     pub fn hold(&self) -> Result<()> {
-        let (state_cb, hold_cb) = {
+        let (state_cbs, hold_cbs) = {
             let mut inner = self.inner.lock();
             if inner.state != CallState::Active {
                 return Err(Error::InvalidState);
@@ -275,10 +279,10 @@ impl MockCall {
             inner.state = CallState::OnHold;
             (inner.on_state_fn.clone(), inner.on_hold_fn.clone())
         };
-        if let Some(f) = state_cb {
+        for f in state_cbs {
             f(CallState::OnHold);
         }
-        if let Some(f) = hold_cb {
+        for f in hold_cbs {
             f();
         }
         Ok(())
@@ -286,7 +290,7 @@ impl MockCall {
 
     /// Resumes a held call back to active.
     pub fn resume(&self) -> Result<()> {
-        let (state_cb, resume_cb) = {
+        let (state_cbs, resume_cbs) = {
             let mut inner = self.inner.lock();
             if inner.state != CallState::OnHold {
                 return Err(Error::InvalidState);
@@ -294,10 +298,10 @@ impl MockCall {
             inner.state = CallState::Active;
             (inner.on_state_fn.clone(), inner.on_resume_fn.clone())
         };
-        if let Some(f) = state_cb {
+        for f in state_cbs {
             f(CallState::Active);
         }
-        if let Some(f) = resume_cb {
+        for f in resume_cbs {
             f();
         }
         Ok(())
@@ -305,7 +309,7 @@ impl MockCall {
 
     /// Mutes the call's outgoing audio.
     pub fn mute(&self) -> Result<()> {
-        let cb = {
+        let cbs = {
             let mut inner = self.inner.lock();
             if inner.state != CallState::Active {
                 return Err(Error::InvalidState);
@@ -316,7 +320,7 @@ impl MockCall {
             inner.muted = true;
             inner.on_mute_fn.clone()
         };
-        if let Some(f) = cb {
+        for f in cbs {
             f();
         }
         Ok(())
@@ -324,7 +328,7 @@ impl MockCall {
 
     /// Unmutes the call's outgoing audio.
     pub fn unmute(&self) -> Result<()> {
-        let cb = {
+        let cbs = {
             let mut inner = self.inner.lock();
             if inner.state != CallState::Active {
                 return Err(Error::InvalidState);
@@ -335,7 +339,7 @@ impl MockCall {
             inner.muted = false;
             inner.on_unmute_fn.clone()
         };
-        if let Some(f) = cb {
+        for f in cbs {
             f();
         }
         Ok(())
@@ -438,62 +442,83 @@ impl MockCall {
 
     /// Ends the call with a specific reason (mirrors `Call::end_with_reason`).
     pub fn end_with_reason(&self, reason: EndReason) {
-        let (state_cb, ended_cb) = {
+        let (state_cbs, ended_cbs) = {
             let mut inner = self.inner.lock();
             if inner.state == CallState::Ended {
                 return;
             }
             inner.state = CallState::Ended;
-            (inner.on_state_fn.clone(), inner.on_ended_fn.clone())
+            let cbs = (inner.on_state_fn.clone(), inner.on_ended_fn.clone());
+            Self::clear_callbacks(&mut inner);
+            cbs
         };
-        if let Some(f) = state_cb {
+        for f in state_cbs {
             f(CallState::Ended);
         }
-        if let Some(f) = ended_cb {
+        for f in ended_cbs {
             f(reason);
         }
+    }
+
+    /// Clears all callbacks to break circular Arc references (MockCall → callback → Arc<MockCall>).
+    fn clear_callbacks(inner: &mut Inner) {
+        inner.on_state_fn.clear();
+        inner.on_ended_fn.clear();
+        inner.on_dtmf_fn.clear();
+        inner.on_hold_fn.clear();
+        inner.on_resume_fn.clear();
+        inner.on_mute_fn.clear();
+        inner.on_unmute_fn.clear();
+        inner.on_media_fn.clear();
     }
 
     // --- Callback setters ---
 
     /// Registers a callback fired when a DTMF digit is received.
     pub fn on_dtmf(&self, f: impl Fn(String) + Send + Sync + 'static) {
-        self.inner.lock().on_dtmf_fn = Some(Arc::new(f));
+        self.inner.lock().on_dtmf_fn.push(Arc::new(f));
     }
 
     /// Registers a callback fired when the call is placed on hold.
+    /// Multiple callbacks can be registered; all will fire.
     pub fn on_hold(&self, f: impl Fn() + Send + Sync + 'static) {
-        self.inner.lock().on_hold_fn = Some(Arc::new(f));
+        self.inner.lock().on_hold_fn.push(Arc::new(f));
     }
 
     /// Registers a callback fired when the call is resumed from hold.
+    /// Multiple callbacks can be registered; all will fire.
     pub fn on_resume(&self, f: impl Fn() + Send + Sync + 'static) {
-        self.inner.lock().on_resume_fn = Some(Arc::new(f));
+        self.inner.lock().on_resume_fn.push(Arc::new(f));
     }
 
     /// Registers a callback fired when the call is muted.
+    /// Multiple callbacks can be registered; all will fire.
     pub fn on_mute(&self, f: impl Fn() + Send + Sync + 'static) {
-        self.inner.lock().on_mute_fn = Some(Arc::new(f));
+        self.inner.lock().on_mute_fn.push(Arc::new(f));
     }
 
     /// Registers a callback fired when the call is unmuted.
+    /// Multiple callbacks can be registered; all will fire.
     pub fn on_unmute(&self, f: impl Fn() + Send + Sync + 'static) {
-        self.inner.lock().on_unmute_fn = Some(Arc::new(f));
+        self.inner.lock().on_unmute_fn.push(Arc::new(f));
     }
 
     /// Registers a callback fired when media starts flowing.
+    /// Multiple callbacks can be registered; all will fire.
     pub fn on_media(&self, f: impl Fn() + Send + Sync + 'static) {
-        self.inner.lock().on_media_fn = Some(Arc::new(f));
+        self.inner.lock().on_media_fn.push(Arc::new(f));
     }
 
     /// Registers a callback fired on every state transition.
+    /// Multiple callbacks can be registered; all will fire.
     pub fn on_state(&self, f: impl Fn(CallState) + Send + Sync + 'static) {
-        self.inner.lock().on_state_fn = Some(Arc::new(f));
+        self.inner.lock().on_state_fn.push(Arc::new(f));
     }
 
     /// Registers a callback fired when the call ends, with the reason.
+    /// Multiple callbacks can be registered; all will fire.
     pub fn on_ended(&self, f: impl Fn(EndReason) + Send + Sync + 'static) {
-        self.inner.lock().on_ended_fn = Some(Arc::new(f));
+        self.inner.lock().on_ended_fn.push(Arc::new(f));
     }
 
     // --- Test setters ---
@@ -592,8 +617,8 @@ impl MockCall {
 
     /// Simulates receiving a DTMF digit, firing the on_dtmf callback.
     pub fn simulate_dtmf(&self, digit: &str) {
-        let cb = self.inner.lock().on_dtmf_fn.clone();
-        if let Some(f) = cb {
+        let cbs = self.inner.lock().on_dtmf_fn.clone();
+        for f in cbs {
             f(digit.to_string());
         }
     }
@@ -903,5 +928,42 @@ mod tests {
         c.end_with_reason(EndReason::Transfer);
         assert_eq!(c.state(), CallState::Ended);
         assert_eq!(*reason.lock(), Some(EndReason::Transfer));
+    }
+
+    #[test]
+    fn multiple_on_ended_callbacks_all_fire() {
+        let c = MockCall::new();
+        c.accept().unwrap();
+
+        let count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let c1 = Arc::clone(&count);
+        c.on_ended(move |_| {
+            c1.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
+        let c2 = Arc::clone(&count);
+        c.on_ended(move |_| {
+            c2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
+
+        c.end().unwrap();
+        assert_eq!(count.load(std::sync::atomic::Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn multiple_on_state_callbacks_all_fire() {
+        let c = MockCall::new();
+
+        let count = Arc::new(std::sync::atomic::AtomicU32::new(0));
+        let c1 = Arc::clone(&count);
+        c.on_state(move |_| {
+            c1.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
+        let c2 = Arc::clone(&count);
+        c.on_state(move |_| {
+            c2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        });
+
+        c.accept().unwrap();
+        assert_eq!(count.load(std::sync::atomic::Ordering::Relaxed), 2);
     }
 }

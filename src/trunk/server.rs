@@ -45,10 +45,10 @@ struct Inner {
     local_addr: Option<SocketAddr>,
     dialogs: DialogMap,
 
-    incoming_fn: Option<Arc<dyn Fn(Arc<Call>) + Send + Sync>>,
-    on_call_state_fn: Option<CallStateCb>,
-    on_call_ended_fn: Option<CallEndedCb>,
-    on_call_dtmf_fn: Option<CallDtmfCb>,
+    incoming_fn: Vec<Arc<dyn Fn(Arc<Call>) + Send + Sync>>,
+    on_call_state_fn: Vec<CallStateCb>,
+    on_call_ended_fn: Vec<CallEndedCb>,
+    on_call_dtmf_fn: Vec<CallDtmfCb>,
 }
 
 /// SIP trunk host server — accept and place calls directly with trusted SIP peers.
@@ -102,10 +102,10 @@ impl Server {
                 sip_tx: None,
                 local_addr: None,
                 dialogs: Arc::new(Mutex::new(HashMap::new())),
-                incoming_fn: None,
-                on_call_state_fn: None,
-                on_call_ended_fn: None,
-                on_call_dtmf_fn: None,
+                incoming_fn: Vec::new(),
+                on_call_state_fn: Vec::new(),
+                on_call_ended_fn: Vec::new(),
+                on_call_dtmf_fn: Vec::new(),
             })),
         }
     }
@@ -118,31 +118,34 @@ impl Server {
     where
         F: Fn(Arc<Call>) + Send + Sync + 'static,
     {
-        self.inner.lock().incoming_fn = Some(Arc::new(f));
+        self.inner.lock().incoming_fn.push(Arc::new(f));
     }
 
     /// Registers a callback for call state changes on any call.
+    /// Multiple callbacks can be registered; all will fire.
     pub fn on_call_state<F>(&self, f: F)
     where
         F: Fn(Arc<Call>, CallState) + Send + Sync + 'static,
     {
-        self.inner.lock().on_call_state_fn = Some(Arc::new(f));
+        self.inner.lock().on_call_state_fn.push(Arc::new(f));
     }
 
     /// Registers a callback for call ended events on any call.
+    /// Multiple callbacks can be registered; all will fire.
     pub fn on_call_ended<F>(&self, f: F)
     where
         F: Fn(Arc<Call>, EndReason) + Send + Sync + 'static,
     {
-        self.inner.lock().on_call_ended_fn = Some(Arc::new(f));
+        self.inner.lock().on_call_ended_fn.push(Arc::new(f));
     }
 
     /// Registers a callback for DTMF events on any call.
+    /// Multiple callbacks can be registered; all will fire.
     pub fn on_call_dtmf<F>(&self, f: F)
     where
         F: Fn(Arc<Call>, String) + Send + Sync + 'static,
     {
-        self.inner.lock().on_call_dtmf_fn = Some(Arc::new(f));
+        self.inner.lock().on_call_dtmf_fn.push(Arc::new(f));
     }
 
     /// Places an outbound call to a named peer.
@@ -601,16 +604,18 @@ impl Server {
             on_call_dtmf_fn,
         );
 
-        // Fire incoming callback.
-        let incoming_fn = self.inner.lock().incoming_fn.clone();
-        if let Some(f) = incoming_fn {
-            f(call);
-        } else {
+        // Fire incoming callbacks.
+        let incoming_fns = self.inner.lock().incoming_fn.clone();
+        if incoming_fns.is_empty() {
             warn!("no on_incoming handler, rejecting call");
             if let Some(entry) = dialogs.lock().remove(&sip_call_id) {
                 if let Some(c) = entry.call {
                     let _ = c.reject(480, "No handler");
                 }
+            }
+        } else {
+            for f in &incoming_fns {
+                f(Arc::clone(&call));
             }
         }
     }
@@ -902,34 +907,38 @@ fn wire_call_callbacks(
     sip_call_id: &str,
     _server_inner: &Arc<Mutex<Inner>>,
     dialogs: &DialogMap,
-    on_call_state_fn: Option<CallStateCb>,
-    on_call_ended_fn: Option<CallEndedCb>,
-    on_call_dtmf_fn: Option<CallDtmfCb>,
+    on_call_state_fns: Vec<CallStateCb>,
+    on_call_ended_fns: Vec<CallEndedCb>,
+    on_call_dtmf_fns: Vec<CallDtmfCb>,
 ) {
-    if let Some(f) = on_call_state_fn {
+    if !on_call_state_fns.is_empty() {
         let call2 = call.clone();
         call.on_state(move |state| {
-            f(call2.clone(), state);
+            for f in &on_call_state_fns {
+                f(call2.clone(), state);
+            }
         });
     }
 
-    // Always wire on_ended for cleanup; optionally invoke user callback.
+    // Always wire on_ended for cleanup; optionally invoke user callbacks.
     {
         let call2 = call.clone();
         let sip_call_id = sip_call_id.to_string();
         let dialogs = dialogs.clone();
         call.on_ended(move |reason| {
             dialogs.lock().remove(&sip_call_id);
-            if let Some(ref f) = on_call_ended_fn {
+            for f in &on_call_ended_fns {
                 f(call2.clone(), reason);
             }
         });
     }
 
-    if let Some(f) = on_call_dtmf_fn {
+    if !on_call_dtmf_fns.is_empty() {
         let call2 = call.clone();
         call.on_dtmf(move |digit| {
-            f(call2.clone(), digit);
+            for f in &on_call_dtmf_fns {
+                f(call2.clone(), digit.clone());
+            }
         });
     }
 }

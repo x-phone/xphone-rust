@@ -19,7 +19,7 @@ const DEFAULT_EXPIRES: u32 = 600;
 
 struct Inner {
     status: VoicemailStatus,
-    on_voicemail: Option<Arc<dyn Fn(VoicemailStatus) + Send + Sync>>,
+    on_voicemail: Vec<Arc<dyn Fn(VoicemailStatus) + Send + Sync>>,
     stopped: bool,
 }
 
@@ -41,7 +41,7 @@ impl MwiSubscriber {
             voicemail_uri,
             inner: Arc::new(Mutex::new(Inner {
                 status: VoicemailStatus::default(),
-                on_voicemail: None,
+                on_voicemail: Vec::new(),
                 stopped: false,
             })),
             stop_tx: Mutex::new(None),
@@ -104,7 +104,7 @@ impl MwiSubscriber {
     }
 
     pub fn on_voicemail<F: Fn(VoicemailStatus) + Send + Sync + 'static>(&self, f: F) {
-        self.inner.lock().on_voicemail = Some(Arc::new(f));
+        self.inner.lock().on_voicemail.push(Arc::new(f));
     }
 
     /// Returns the most recent voicemail status.
@@ -205,14 +205,15 @@ fn handle_mwi_notify(inner: &Arc<Mutex<Inner>>, body: &str) {
         "MWI status update"
     );
 
-    let cb = {
+    let cbs = {
         let mut guard = inner.lock();
         guard.status = status.clone();
         guard.on_voicemail.clone()
     };
 
-    if let Some(f) = cb {
-        spawn_callback(move || f(status));
+    for f in cbs {
+        let s = status.clone();
+        spawn_callback(move || f(s));
     }
 }
 

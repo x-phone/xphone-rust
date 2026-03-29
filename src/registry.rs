@@ -12,9 +12,9 @@ use crate::types::PhoneState;
 
 struct Inner {
     state: PhoneState,
-    on_registered: Option<Arc<dyn Fn() + Send + Sync>>,
-    on_unregistered: Option<Arc<dyn Fn() + Send + Sync>>,
-    on_error: Option<Arc<dyn Fn(Error) + Send + Sync>>,
+    on_registered: Vec<Arc<dyn Fn() + Send + Sync>>,
+    on_unregistered: Vec<Arc<dyn Fn() + Send + Sync>>,
+    on_error: Vec<Arc<dyn Fn(Error) + Send + Sync>>,
     reregistering: bool,
     stopped: bool,
     /// Handle for the re-registration thread spawned by handle_drop.
@@ -40,9 +40,9 @@ impl Registry {
             cfg,
             inner: Arc::new(Mutex::new(Inner {
                 state: PhoneState::Disconnected,
-                on_registered: None,
-                on_unregistered: None,
-                on_error: None,
+                on_registered: Vec::new(),
+                on_unregistered: Vec::new(),
+                on_error: Vec::new(),
                 reregistering: false,
                 stopped: false,
                 rereg_thread: None,
@@ -127,7 +127,7 @@ impl Registry {
         let cb: Arc<dyn Fn() + Send + Sync> = Arc::new(f);
         let mut inner = self.inner.lock();
         let already = inner.state == PhoneState::Registered;
-        inner.on_registered = Some(Arc::clone(&cb));
+        inner.on_registered.push(Arc::clone(&cb));
         drop(inner);
 
         if already {
@@ -136,11 +136,11 @@ impl Registry {
     }
 
     pub fn on_unregistered<F: Fn() + Send + Sync + 'static>(&self, f: F) {
-        self.inner.lock().on_unregistered = Some(Arc::new(f));
+        self.inner.lock().on_unregistered.push(Arc::new(f));
     }
 
     pub fn on_error<F: Fn(Error) + Send + Sync + 'static>(&self, f: F) {
-        self.inner.lock().on_error = Some(Arc::new(f));
+        self.inner.lock().on_error.push(Arc::new(f));
     }
 
     pub fn state(&self) -> PhoneState {
@@ -173,12 +173,12 @@ impl Registry {
 
             if msg.status_code == 200 {
                 info!("REGISTER success — registered");
-                let cb = {
+                let cbs = {
                     let mut inner = self.inner.lock();
                     inner.state = PhoneState::Registered;
                     inner.on_registered.clone()
                 };
-                if let Some(f) = cb {
+                for f in cbs {
                     spawn_callback(move || f());
                 }
                 return Ok(());
@@ -190,13 +190,14 @@ impl Registry {
             max_retry = self.cfg.register_max_retry,
             "REGISTER failed — all retries exhausted"
         );
-        let cb = {
+        let cbs = {
             let mut inner = self.inner.lock();
             inner.state = PhoneState::RegistrationFailed;
             inner.on_error.clone()
         };
-        if let Some(f) = cb {
-            spawn_callback(move || f(Error::RegistrationFailed));
+        for f in cbs {
+            let err = Error::RegistrationFailed;
+            spawn_callback(move || f(err));
         }
         Err(Error::RegistrationFailed)
     }
@@ -211,7 +212,7 @@ impl Drop for Registry {
 /// Called when the transport connection drops.
 fn handle_drop(inner: &Arc<Mutex<Inner>>, tr: &Arc<dyn SipTransport>, cfg: &Config) {
     warn!("transport drop detected — attempting re-registration");
-    let (cb, should_reregister) = {
+    let (cbs, should_reregister) = {
         let mut guard = inner.lock();
         if guard.state == PhoneState::Disconnected || guard.reregistering || guard.stopped {
             return;
@@ -221,7 +222,7 @@ fn handle_drop(inner: &Arc<Mutex<Inner>>, tr: &Arc<dyn SipTransport>, cfg: &Conf
         (guard.on_unregistered.clone(), true)
     };
 
-    if let Some(f) = cb {
+    for f in cbs {
         spawn_callback(move || f());
     }
 
@@ -257,25 +258,26 @@ fn reregister(inner: &Arc<Mutex<Inner>>, tr: &Arc<dyn SipTransport>, cfg: &Confi
         };
 
         if msg.status_code == 200 {
-            let cb = {
+            let cbs = {
                 let mut guard = inner.lock();
                 guard.state = PhoneState::Registered;
                 guard.on_registered.clone()
             };
-            if let Some(f) = cb {
+            for f in cbs {
                 spawn_callback(move || f());
             }
             return Ok(());
         }
     }
 
-    let cb = {
+    let cbs = {
         let mut guard = inner.lock();
         guard.state = PhoneState::RegistrationFailed;
         guard.on_error.clone()
     };
-    if let Some(f) = cb {
-        spawn_callback(move || f(Error::RegistrationFailed));
+    for f in cbs {
+        let err = Error::RegistrationFailed;
+        spawn_callback(move || f(err));
     }
     Err(Error::RegistrationFailed)
 }

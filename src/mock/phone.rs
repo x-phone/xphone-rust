@@ -15,13 +15,13 @@ type BlfCallback = Arc<dyn Fn(ExtensionStatus, Option<ExtensionState>) + Send + 
 
 struct Inner {
     state: PhoneState,
-    on_incoming_fn: Option<Arc<dyn Fn(Arc<MockCall>) + Send + Sync>>,
-    on_registered_fn: Option<Arc<dyn Fn() + Send + Sync>>,
-    on_unregistered_fn: Option<Arc<dyn Fn() + Send + Sync>>,
-    on_error_fn: Option<Arc<dyn Fn(Error) + Send + Sync>>,
-    on_voicemail_fn: Option<Arc<dyn Fn(VoicemailStatus) + Send + Sync>>,
-    on_message_fn: Option<Arc<dyn Fn(SipMessage) + Send + Sync>>,
-    on_subscription_error_fn: Option<Arc<dyn Fn(String, Error) + Send + Sync>>,
+    on_incoming_fn: Vec<Arc<dyn Fn(Arc<MockCall>) + Send + Sync>>,
+    on_registered_fn: Vec<Arc<dyn Fn() + Send + Sync>>,
+    on_unregistered_fn: Vec<Arc<dyn Fn() + Send + Sync>>,
+    on_error_fn: Vec<Arc<dyn Fn(Error) + Send + Sync>>,
+    on_voicemail_fn: Vec<Arc<dyn Fn(VoicemailStatus) + Send + Sync>>,
+    on_message_fn: Vec<Arc<dyn Fn(SipMessage) + Send + Sync>>,
+    on_subscription_error_fn: Vec<Arc<dyn Fn(String, Error) + Send + Sync>>,
     last_call: Option<Arc<MockCall>>,
     calls: HashMap<String, Arc<MockCall>>,
     sent_messages: Vec<SipMessage>,
@@ -51,13 +51,13 @@ impl MockPhone {
         Self {
             inner: Mutex::new(Inner {
                 state: PhoneState::Disconnected,
-                on_incoming_fn: None,
-                on_registered_fn: None,
-                on_unregistered_fn: None,
-                on_error_fn: None,
-                on_voicemail_fn: None,
-                on_message_fn: None,
-                on_subscription_error_fn: None,
+                on_incoming_fn: Vec::new(),
+                on_registered_fn: Vec::new(),
+                on_unregistered_fn: Vec::new(),
+                on_error_fn: Vec::new(),
+                on_voicemail_fn: Vec::new(),
+                on_message_fn: Vec::new(),
+                on_subscription_error_fn: Vec::new(),
                 last_call: None,
                 calls: HashMap::new(),
                 sent_messages: Vec::new(),
@@ -70,7 +70,7 @@ impl MockPhone {
 
     /// Connects and registers the phone. Fires the on_registered callback.
     pub fn connect(&self) -> Result<()> {
-        let cb = {
+        let cbs = {
             let mut inner = self.inner.lock();
             if inner.state != PhoneState::Disconnected {
                 return Err(Error::AlreadyConnected);
@@ -78,7 +78,7 @@ impl MockPhone {
             inner.state = PhoneState::Registered;
             inner.on_registered_fn.clone()
         };
-        if let Some(f) = cb {
+        for f in cbs {
             f();
         }
         Ok(())
@@ -86,7 +86,7 @@ impl MockPhone {
 
     /// Disconnects the phone. Ends all active calls and fires the on_unregistered callback.
     pub fn disconnect(&self) -> Result<()> {
-        let (cb, active_calls) = {
+        let (cbs, active_calls) = {
             let mut inner = self.inner.lock();
             if inner.state == PhoneState::Disconnected {
                 return Err(Error::NotConnected);
@@ -102,7 +102,7 @@ impl MockPhone {
                 call.end().ok();
             }
         }
-        if let Some(f) = cb {
+        for f in cbs {
             f();
         }
         Ok(())
@@ -126,32 +126,37 @@ impl MockPhone {
 
     /// Registers a callback fired when an incoming call arrives.
     pub fn on_incoming<F: Fn(Arc<MockCall>) + Send + Sync + 'static>(&self, f: F) {
-        self.inner.lock().on_incoming_fn = Some(Arc::new(f));
+        self.inner.lock().on_incoming_fn.push(Arc::new(f));
     }
 
     /// Registers a callback fired when the phone becomes registered.
+    /// Multiple callbacks can be registered; all will fire.
     pub fn on_registered<F: Fn() + Send + Sync + 'static>(&self, f: F) {
-        self.inner.lock().on_registered_fn = Some(Arc::new(f));
+        self.inner.lock().on_registered_fn.push(Arc::new(f));
     }
 
     /// Registers a callback fired when the phone becomes unregistered.
+    /// Multiple callbacks can be registered; all will fire.
     pub fn on_unregistered<F: Fn() + Send + Sync + 'static>(&self, f: F) {
-        self.inner.lock().on_unregistered_fn = Some(Arc::new(f));
+        self.inner.lock().on_unregistered_fn.push(Arc::new(f));
     }
 
     /// Registers a callback fired on errors.
+    /// Multiple callbacks can be registered; all will fire.
     pub fn on_error<F: Fn(Error) + Send + Sync + 'static>(&self, f: F) {
-        self.inner.lock().on_error_fn = Some(Arc::new(f));
+        self.inner.lock().on_error_fn.push(Arc::new(f));
     }
 
     /// Registers a callback fired on voicemail (MWI) status updates.
+    /// Multiple callbacks can be registered; all will fire.
     pub fn on_voicemail<F: Fn(VoicemailStatus) + Send + Sync + 'static>(&self, f: F) {
-        self.inner.lock().on_voicemail_fn = Some(Arc::new(f));
+        self.inner.lock().on_voicemail_fn.push(Arc::new(f));
     }
 
     /// Registers a callback fired on incoming SIP MESSAGE.
+    /// Multiple callbacks can be registered; all will fire.
     pub fn on_message<F: Fn(SipMessage) + Send + Sync + 'static>(&self, f: F) {
-        self.inner.lock().on_message_fn = Some(Arc::new(f));
+        self.inner.lock().on_message_fn.push(Arc::new(f));
     }
 
     /// Sends a SIP MESSAGE (mock: records the message for inspection).
@@ -231,7 +236,7 @@ impl MockPhone {
     where
         F: Fn(String, Error) + Send + Sync + 'static,
     {
-        self.inner.lock().on_subscription_error_fn = Some(Arc::new(f));
+        self.inner.lock().on_subscription_error_fn.push(Arc::new(f));
     }
 
     /// Returns the current phone state.
@@ -246,29 +251,29 @@ impl MockPhone {
         let call = Arc::new(MockCall::new());
         call.set_remote_uri(from);
 
-        let cb = {
+        let cbs = {
             let mut inner = self.inner.lock();
             inner.last_call = Some(Arc::clone(&call));
             inner.calls.insert(call.call_id(), Arc::clone(&call));
             inner.on_incoming_fn.clone()
         };
-        if let Some(f) = cb {
-            f(call);
+        for f in &cbs {
+            f(Arc::clone(&call));
         }
     }
 
     /// Fires the OnError callback with the given error.
     pub fn simulate_error(&self, err: Error) {
-        let cb = self.inner.lock().on_error_fn.clone();
-        if let Some(f) = cb {
-            f(err);
+        let cbs = self.inner.lock().on_error_fn.clone();
+        for f in &cbs {
+            f(err.clone());
         }
     }
 
     /// Simulates an incoming SIP MESSAGE and fires the on_message callback.
     pub fn simulate_message(&self, from: &str, body: &str) {
-        let cb = self.inner.lock().on_message_fn.clone();
-        if let Some(f) = cb {
+        let cbs = self.inner.lock().on_message_fn.clone();
+        for f in cbs {
             f(SipMessage {
                 from: from.to_string(),
                 to: String::new(),
@@ -316,9 +321,9 @@ impl MockPhone {
 
     /// Simulates a subscription error.
     pub fn simulate_subscription_error(&self, uri: &str, err: Error) {
-        let cb = self.inner.lock().on_subscription_error_fn.clone();
-        if let Some(f) = cb {
-            f(uri.to_string(), err);
+        let cbs = self.inner.lock().on_subscription_error_fn.clone();
+        for f in &cbs {
+            f(uri.to_string(), err.clone());
         }
     }
 
@@ -329,9 +334,9 @@ impl MockPhone {
 
     /// Fires the OnVoicemail callback with the given status.
     pub fn simulate_mwi(&self, status: VoicemailStatus) {
-        let cb = self.inner.lock().on_voicemail_fn.clone();
-        if let Some(f) = cb {
-            f(status);
+        let cbs = self.inner.lock().on_voicemail_fn.clone();
+        for f in cbs {
+            f(status.clone());
         }
     }
 

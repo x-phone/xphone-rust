@@ -29,20 +29,20 @@ struct Inner {
     tr: Option<Arc<dyn SipTransport>>,
     reg: Option<Arc<Registry>>,
     mwi: Option<Arc<MwiSubscriber>>,
-    incoming: Option<Arc<dyn Fn(Arc<Call>) + Send + Sync>>,
+    incoming: Vec<Arc<dyn Fn(Arc<Call>) + Send + Sync>>,
     calls: HashMap<String, Arc<Call>>,
 
-    on_registered_fn: Option<Arc<dyn Fn() + Send + Sync>>,
-    on_unregistered_fn: Option<Arc<dyn Fn() + Send + Sync>>,
-    on_error_fn: Option<Arc<dyn Fn(Error) + Send + Sync>>,
-    on_voicemail_fn: Option<Arc<dyn Fn(VoicemailStatus) + Send + Sync>>,
-    on_message_fn: Option<Arc<dyn Fn(SipMessage) + Send + Sync>>,
-    on_subscription_error_fn: Option<Arc<dyn Fn(String, Error) + Send + Sync>>,
+    on_registered_fn: Vec<Arc<dyn Fn() + Send + Sync>>,
+    on_unregistered_fn: Vec<Arc<dyn Fn() + Send + Sync>>,
+    on_error_fn: Vec<Arc<dyn Fn(Error) + Send + Sync>>,
+    on_voicemail_fn: Vec<Arc<dyn Fn(VoicemailStatus) + Send + Sync>>,
+    on_message_fn: Vec<Arc<dyn Fn(SipMessage) + Send + Sync>>,
+    on_subscription_error_fn: Vec<Arc<dyn Fn(String, Error) + Send + Sync>>,
 
     // Phone-level call callbacks — auto-wired to every new call.
-    on_call_state_fn: Option<CallStateCb>,
-    on_call_ended_fn: Option<CallEndedCb>,
-    on_call_dtmf_fn: Option<CallDtmfCb>,
+    on_call_state_fn: Vec<CallStateCb>,
+    on_call_ended_fn: Vec<CallEndedCb>,
+    on_call_dtmf_fn: Vec<CallDtmfCb>,
 
     /// DTMF mode from config, applied to every new call.
     dtmf_mode: crate::config::DtmfMode,
@@ -72,17 +72,17 @@ impl Phone {
                 tr: None,
                 reg: None,
                 mwi: None,
-                incoming: None,
+                incoming: Vec::new(),
                 calls: HashMap::new(),
-                on_registered_fn: None,
-                on_unregistered_fn: None,
-                on_error_fn: None,
-                on_voicemail_fn: None,
-                on_message_fn: None,
-                on_subscription_error_fn: None,
-                on_call_state_fn: None,
-                on_call_ended_fn: None,
-                on_call_dtmf_fn: None,
+                on_registered_fn: Vec::new(),
+                on_unregistered_fn: Vec::new(),
+                on_error_fn: Vec::new(),
+                on_voicemail_fn: Vec::new(),
+                on_message_fn: Vec::new(),
+                on_subscription_error_fn: Vec::new(),
+                on_call_state_fn: Vec::new(),
+                on_call_ended_fn: Vec::new(),
+                on_call_dtmf_fn: Vec::new(),
                 dtmf_mode,
                 subscription_mgr: None,
                 blf_watchers: HashMap::new(),
@@ -112,20 +112,24 @@ impl Phone {
         let reg = Arc::new(Registry::new(Arc::clone(&tr), self.cfg.clone()));
 
         // Apply buffered callbacks to the registry.
-        {
+        // Clone the Vecs before iterating to avoid holding the Phone lock
+        // during Registry method calls (prevents lock-ordering issues).
+        let (reg_cbs, unreg_cbs, err_cbs) = {
             let inner = self.inner.lock();
-            if let Some(ref f) = inner.on_registered_fn {
-                let f = Arc::clone(f);
-                reg.on_registered(move || f());
-            }
-            if let Some(ref f) = inner.on_unregistered_fn {
-                let f = Arc::clone(f);
-                reg.on_unregistered(move || f());
-            }
-            if let Some(ref f) = inner.on_error_fn {
-                let f = Arc::clone(f);
-                reg.on_error(move |e| f(e));
-            }
+            (
+                inner.on_registered_fn.clone(),
+                inner.on_unregistered_fn.clone(),
+                inner.on_error_fn.clone(),
+            )
+        };
+        for f in reg_cbs {
+            reg.on_registered(move || f());
+        }
+        for f in unreg_cbs {
+            reg.on_unregistered(move || f());
+        }
+        for f in err_cbs {
+            reg.on_error(move |e| f(e));
         }
 
         // Perform registration.
@@ -194,9 +198,9 @@ impl Phone {
         tr.on_subscription_notify(Box::new(move |event, ct, body, sub_state, from_uri| {
             sub_mgr_clone.handle_notify(event, ct, body, sub_state, from_uri);
         }));
-        // Apply buffered on_subscription_error callback.
-        if let Some(ref f) = self.inner.lock().on_subscription_error_fn {
-            let f = Arc::clone(f);
+        // Apply buffered on_subscription_error callbacks.
+        let sub_err_cbs = self.inner.lock().on_subscription_error_fn.clone();
+        for f in sub_err_cbs {
             sub_mgr.on_error(move |uri, err| f(uri, err));
         }
 
@@ -204,9 +208,9 @@ impl Phone {
         let mwi = if reg_result.is_ok() {
             if let Some(ref vm_uri) = self.cfg.voicemail_uri {
                 let sub = Arc::new(MwiSubscriber::new(Arc::clone(&tr), vm_uri.clone()));
-                // Apply buffered on_voicemail callback.
-                if let Some(ref f) = self.inner.lock().on_voicemail_fn {
-                    let f = Arc::clone(f);
+                // Apply buffered on_voicemail callbacks.
+                let vm_cbs = self.inner.lock().on_voicemail_fn.clone();
+                for f in vm_cbs {
                     sub.on_voicemail(move |s| f(s));
                 }
                 sub.start();
@@ -233,20 +237,20 @@ impl Phone {
     /// Disconnects the phone: ends all active calls, stops registry, and closes transport.
     pub fn disconnect(&self) -> Result<()> {
         info!("Phone disconnecting");
-        let (reg, tr, unreg_fn, active_calls, mwi, sub_mgr) = {
+        let (reg, tr, unreg_fns, active_calls, mwi, sub_mgr) = {
             let mut inner = self.inner.lock();
             if inner.state == PhoneState::Disconnected {
                 return Err(Error::NotConnected);
             }
             let reg = inner.reg.take();
             let tr = inner.tr.take();
-            let unreg_fn = inner.on_unregistered_fn.clone();
+            let unreg_fns = inner.on_unregistered_fn.clone();
             let active_calls: Vec<Arc<Call>> = inner.calls.drain().map(|(_, c)| c).collect();
             let mwi = inner.mwi.take();
             let sub_mgr = inner.subscription_mgr.take();
             inner.blf_watchers.clear();
             inner.state = PhoneState::Disconnected;
-            (reg, tr, unreg_fn, active_calls, mwi, sub_mgr)
+            (reg, tr, unreg_fns, active_calls, mwi, sub_mgr)
         };
 
         // End all active calls so their resources (media, sockets, SRTP) are released.
@@ -266,7 +270,7 @@ impl Phone {
         if let Some(tr) = tr {
             let _ = tr.close();
         }
-        if let Some(f) = unreg_fn {
+        for f in unreg_fns {
             crate::callback_pool::spawn_callback(move || f());
         }
 
@@ -446,15 +450,16 @@ impl Phone {
     /// The callback fires for every incoming INVITE, even during an active call (call waiting).
     /// The application decides whether to accept, reject (486 Busy), or ignore the new call.
     pub fn on_incoming<F: Fn(Arc<Call>) + Send + Sync + 'static>(&self, f: F) {
-        self.inner.lock().incoming = Some(Arc::new(f));
+        self.inner.lock().incoming.push(Arc::new(f));
     }
 
-    /// Sets the callback for successful registration.
+    /// Registers a callback for successful registration.
+    /// Multiple callbacks can be registered; all will fire.
     pub fn on_registered<F: Fn() + Send + Sync + 'static>(&self, f: F) {
         let cb: Arc<dyn Fn() + Send + Sync> = Arc::new(f);
         let reg = {
             let mut inner = self.inner.lock();
-            inner.on_registered_fn = Some(Arc::clone(&cb));
+            inner.on_registered_fn.push(Arc::clone(&cb));
             inner.reg.clone()
         };
         if let Some(reg) = reg {
@@ -463,12 +468,13 @@ impl Phone {
         }
     }
 
-    /// Sets the callback for loss of registration.
+    /// Registers a callback for loss of registration.
+    /// Multiple callbacks can be registered; all will fire.
     pub fn on_unregistered<F: Fn() + Send + Sync + 'static>(&self, f: F) {
         let cb: Arc<dyn Fn() + Send + Sync> = Arc::new(f);
         let reg = {
             let mut inner = self.inner.lock();
-            inner.on_unregistered_fn = Some(Arc::clone(&cb));
+            inner.on_unregistered_fn.push(Arc::clone(&cb));
             inner.reg.clone()
         };
         if let Some(reg) = reg {
@@ -477,12 +483,13 @@ impl Phone {
         }
     }
 
-    /// Sets the callback for registration errors.
+    /// Registers a callback for registration errors.
+    /// Multiple callbacks can be registered; all will fire.
     pub fn on_error<F: Fn(Error) + Send + Sync + 'static>(&self, f: F) {
         let cb: Arc<dyn Fn(Error) + Send + Sync> = Arc::new(f);
         let reg = {
             let mut inner = self.inner.lock();
-            inner.on_error_fn = Some(Arc::clone(&cb));
+            inner.on_error_fn.push(Arc::clone(&cb));
             inner.reg.clone()
         };
         if let Some(reg) = reg {
@@ -491,13 +498,13 @@ impl Phone {
         }
     }
 
-    /// Sets the callback for voicemail (MWI) status updates.
-    /// Fires whenever a NOTIFY with `application/simple-message-summary` is received.
+    /// Registers a callback for voicemail (MWI) status updates.
+    /// Multiple callbacks can be registered; all will fire.
     pub fn on_voicemail<F: Fn(VoicemailStatus) + Send + Sync + 'static>(&self, f: F) {
         let cb: Arc<dyn Fn(VoicemailStatus) + Send + Sync> = Arc::new(f);
         let mwi = {
             let mut inner = self.inner.lock();
-            inner.on_voicemail_fn = Some(Arc::clone(&cb));
+            inner.on_voicemail_fn.push(Arc::clone(&cb));
             inner.mwi.clone()
         };
         if let Some(mwi) = mwi {
@@ -506,9 +513,10 @@ impl Phone {
         }
     }
 
-    /// Sets the callback for incoming SIP MESSAGE (instant messages, RFC 3428).
+    /// Registers a callback for incoming SIP MESSAGE (instant messages, RFC 3428).
+    /// Multiple callbacks can be registered; all will fire.
     pub fn on_message<F: Fn(SipMessage) + Send + Sync + 'static>(&self, f: F) {
-        self.inner.lock().on_message_fn = Some(Arc::new(f));
+        self.inner.lock().on_message_fn.push(Arc::new(f));
     }
 
     /// Sends a SIP MESSAGE with `text/plain` content type.
@@ -672,7 +680,7 @@ impl Phone {
     {
         let mut inner = self.inner.lock();
         let f: Arc<dyn Fn(String, Error) + Send + Sync> = Arc::new(f);
-        inner.on_subscription_error_fn = Some(Arc::clone(&f));
+        inner.on_subscription_error_fn.push(Arc::clone(&f));
         // If subscription manager already exists, wire it.
         if let Some(ref mgr) = inner.subscription_mgr {
             let f = Arc::clone(&f);
@@ -690,28 +698,28 @@ impl Phone {
         &self.cfg.host
     }
 
-    /// Sets a callback that fires for every call state change (all calls).
-    /// Receives `(call, state)`.
+    /// Registers a callback that fires for every call state change (all calls).
+    /// Multiple callbacks can be registered; all will fire.
     pub fn on_call_state<F: Fn(Arc<Call>, crate::types::CallState) + Send + Sync + 'static>(
         &self,
         f: F,
     ) {
-        self.inner.lock().on_call_state_fn = Some(Arc::new(f));
+        self.inner.lock().on_call_state_fn.push(Arc::new(f));
     }
 
-    /// Sets a callback that fires when any call ends.
-    /// Receives `(call, reason)`.
+    /// Registers a callback that fires when any call ends.
+    /// Multiple callbacks can be registered; all will fire.
     pub fn on_call_ended<F: Fn(Arc<Call>, crate::types::EndReason) + Send + Sync + 'static>(
         &self,
         f: F,
     ) {
-        self.inner.lock().on_call_ended_fn = Some(Arc::new(f));
+        self.inner.lock().on_call_ended_fn.push(Arc::new(f));
     }
 
-    /// Sets a callback that fires for DTMF digits received on any call.
-    /// Receives `(call, digit)`.
+    /// Registers a callback that fires for DTMF digits received on any call.
+    /// Multiple callbacks can be registered; all will fire.
     pub fn on_call_dtmf<F: Fn(Arc<Call>, String) + Send + Sync + 'static>(&self, f: F) {
-        self.inner.lock().on_call_dtmf_fn = Some(Arc::new(f));
+        self.inner.lock().on_call_dtmf_fn.push(Arc::new(f));
     }
 
     /// Looks up an active call by dialog ID.
@@ -760,7 +768,7 @@ fn local_ip_for(host: &str) -> String {
 
 /// Handles an incoming INVITE from the transport.
 fn handle_incoming(inner: &Arc<Mutex<Inner>>, from: &str, to: &str) {
-    let (tr, incoming_fn) = {
+    let (tr, incoming_fns) = {
         let guard = inner.lock();
         (guard.tr.clone(), guard.incoming.clone())
     };
@@ -783,9 +791,9 @@ fn handle_incoming(inner: &Arc<Mutex<Inner>>, from: &str, to: &str) {
     // Log incoming call details (suppress unused warnings).
     let _ = (from, to);
 
-    // Fire OnIncoming callback.
-    if let Some(f) = incoming_fn {
-        f(call);
+    // Fire OnIncoming callbacks.
+    for f in &incoming_fns {
+        f(Arc::clone(&call));
     }
 
     // Send 180 Ringing.
@@ -797,7 +805,7 @@ fn handle_incoming(inner: &Arc<Mutex<Inner>>, from: &str, to: &str) {
 /// Wire phone-level call callbacks onto an individual call.
 fn wire_phone_call_callbacks(inner: &Arc<Mutex<Inner>>, call: &Arc<Call>) {
     // Copy callbacks and config out of Phone lock, then drop it before acquiring Call lock.
-    let (state_fn, ended_fn, dtmf_fn, dtmf_mode) = {
+    let (state_fns, ended_fns, dtmf_fns, dtmf_mode) = {
         let locked = inner.lock();
         (
             locked.on_call_state_fn.clone(),
@@ -809,12 +817,16 @@ fn wire_phone_call_callbacks(inner: &Arc<Mutex<Inner>>, call: &Arc<Call>) {
 
     call.set_dtmf_mode(dtmf_mode);
 
-    if let Some(f) = state_fn {
+    if !state_fns.is_empty() {
         let c = Arc::clone(call);
-        call.on_state_internal(move |s| f(Arc::clone(&c), s));
+        call.on_state_internal(move |s| {
+            for f in &state_fns {
+                f(Arc::clone(&c), s);
+            }
+        });
     }
 
-    // Combine phone-level on_ended callback with call-tracking cleanup
+    // Combine phone-level on_ended callbacks with call-tracking cleanup
     // into a single on_ended_internal closure so neither overwrites the other.
     {
         let inner_clone = Arc::clone(inner);
@@ -823,16 +835,20 @@ fn wire_phone_call_callbacks(inner: &Arc<Mutex<Inner>>, call: &Arc<Call>) {
         call.on_ended_internal(move |r| {
             // Call-tracking cleanup.
             inner_clone.lock().calls.remove(&call_id);
-            // Phone-level on_call_ended callback.
-            if let Some(ref f) = ended_fn {
+            // Phone-level on_call_ended callbacks.
+            for f in &ended_fns {
                 f(Arc::clone(&c), r);
             }
         });
     }
 
-    if let Some(f) = dtmf_fn {
+    if !dtmf_fns.is_empty() {
         let c = Arc::clone(call);
-        call.on_dtmf_internal(move |d| f(Arc::clone(&c), d));
+        call.on_dtmf_internal(move |d| {
+            for f in &dtmf_fns {
+                f(Arc::clone(&c), d.clone());
+            }
+        });
     }
 }
 
@@ -857,7 +873,7 @@ fn handle_dialog_incoming(
     }
 
     info!(from = _from, to = _to, "Phone handling incoming INVITE");
-    let incoming_fn = inner.lock().incoming.clone();
+    let incoming_fns = inner.lock().incoming.clone();
 
     // Allocate an RTP socket for this call (ephemeral port if range is 0,0).
     let (rtp_socket, actual_port) = match crate::media::listen_rtp_port(rtp_port_min, rtp_port_max)
@@ -920,9 +936,9 @@ fn handle_dialog_incoming(
     // Send 180 Ringing via dialog.
     let _ = call.dlg_respond(180, "Ringing");
 
-    // Fire OnIncoming callback.
-    if let Some(f) = incoming_fn {
-        f(call);
+    // Fire OnIncoming callbacks.
+    for f in &incoming_fns {
+        f(Arc::clone(&call));
     }
 }
 
@@ -972,8 +988,8 @@ fn handle_notify(inner: &Arc<Mutex<Inner>>, call_id: &str, code: u16) {
 /// Handles an incoming SIP MESSAGE — fires the on_message callback.
 fn handle_message(inner: &Arc<Mutex<Inner>>, from: &str, content_type: &str, body: &str) {
     info!(from = %from, "Phone handling MESSAGE");
-    let cb = inner.lock().on_message_fn.clone();
-    if let Some(f) = cb {
+    let cbs = inner.lock().on_message_fn.clone();
+    for f in cbs {
         let msg = SipMessage {
             from: from.to_string(),
             to: String::new(),
