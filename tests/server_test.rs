@@ -565,8 +565,57 @@ fn server_listen_with_socket() {
     );
     assert_eq!(server.call_count(), 1);
 
+    // Verify Contact header contains the actual bound port (not 5060).
+    let response = oc.response();
+    let contact = response.header("Contact").expect("missing Contact header");
+    assert!(
+        contact.contains(&server_addr),
+        "Contact header should contain bound address {server_addr}, got: {contact}"
+    );
+
     let bye_code = oc.send_bye().expect("send_bye failed");
     assert_eq!(bye_code, 200);
 
     server.stop();
+}
+
+// --- S11: listen_with_socket — stop() cleans up calls and state ---
+
+#[test]
+fn server_listen_with_socket_stop_clears_state() {
+    let pbx = FakePBX::new(&[]);
+    let server = make_server(&pbx);
+    server.on_incoming(|call| {
+        call.accept().unwrap();
+    });
+
+    let std_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let server_addr = std_socket.local_addr().unwrap().to_string();
+
+    let s = server.clone();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async { s.listen_with_socket(std_socket).await.unwrap() });
+    });
+
+    for _ in 0..200 {
+        if server.local_addr().is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(server.local_addr().is_some());
+
+    // Create an active call.
+    let target = format!("sip:1002@{server_addr}");
+    let offer_sdp = sdp::sdp("127.0.0.1", 23000, &[sdp::PCMU]);
+    let _oc = pbx
+        .send_invite(&target, &offer_sdp)
+        .expect("send_invite failed");
+    assert_eq!(server.call_count(), 1);
+
+    // stop() should end all calls and clear local_addr.
+    server.stop();
+    assert_eq!(server.call_count(), 0);
+    assert!(server.local_addr().is_none());
 }
