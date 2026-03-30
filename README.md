@@ -208,6 +208,14 @@ server.listen().await?;
 
 Peers are authenticated by IP/CIDR or SIP digest auth. Per-peer codec and RTP address overrides are supported.
 
+For zero-downtime deploys, use `listen_with_socket()` with a pre-bound socket (e.g., with `SO_REUSEPORT`):
+
+```rust
+let socket = std::net::UdpSocket::bind("0.0.0.0:5080").unwrap();
+// socket2::Socket can set SO_REUSEPORT before binding
+server.listen_with_socket(socket).await?;
+```
+
 > **Which mode?** Use **Phone** when you register to a SIP server (most setups). Use **Server** when SIP peers send INVITEs directly to your application (Twilio SIP Trunk, direct PBX routing, peer-to-peer).
 
 ---
