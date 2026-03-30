@@ -297,10 +297,36 @@ impl Server {
                 .await
                 .map_err(|e| Error::Other(format!("bind failed: {e}")))?,
         );
+        self.listen_inner(socket).await
+    }
+
+    /// Starts the SIP trunk server using a pre-bound UDP socket.
+    ///
+    /// Use this when you need control over the socket (e.g., `SO_REUSEPORT` for
+    /// zero-downtime deploys). The socket must already be bound to the desired address.
+    ///
+    /// ```rust,ignore
+    /// let std_socket = std::net::UdpSocket::bind("0.0.0.0:5080").unwrap();
+    /// // set_nonblocking is called automatically by listen_with_socket
+    /// let server = Server::new(config);
+    /// server.listen_with_socket(std_socket).await.unwrap();
+    /// ```
+    pub async fn listen_with_socket(&self, socket: std::net::UdpSocket) -> Result<()> {
+        socket
+            .set_nonblocking(true)
+            .map_err(|e| Error::Other(format!("set_nonblocking failed: {e}")))?;
+        let socket = Arc::new(
+            UdpSocket::from_std(socket)
+                .map_err(|e| Error::Other(format!("from_std failed: {e}")))?,
+        );
+        self.listen_inner(socket).await
+    }
+
+    async fn listen_inner(&self, socket: Arc<UdpSocket>) -> Result<()> {
         let local_addr = socket
             .local_addr()
             .map_err(|e| Error::Other(format!("local_addr failed: {e}")))?;
-        info!("trunk server listening on {}", self.config.listen);
+        info!("trunk server listening on {}", local_addr);
 
         let (sip_tx, mut sip_rx) = mpsc::channel::<SipOutgoing>(4096);
 

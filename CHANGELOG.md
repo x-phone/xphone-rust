@@ -7,6 +7,7 @@ All notable changes to this project will be documented in this file.
 ### Added
 
 - **Configurable User-Agent header** — `Config.user_agent` / `PhoneBuilder::user_agent()` sets the User-Agent string in all outgoing SIP requests. Defaults to `"xphone"`. PBXes use this to identify the device.
+- **`Server::listen_with_socket()`** — start the SIP trunk server with a pre-bound UDP socket. Enables `SO_REUSEPORT` for zero-downtime deploys and other custom socket options without the library needing to know about deployment topology.
 
 ## [0.4.5] - 2026-03-29
 

@@ -517,3 +517,56 @@ fn server_find_call_and_calls() {
 
     server.stop();
 }
+
+// --- S10: listen_with_socket — pre-bound socket works like listen() ---
+
+#[test]
+fn server_listen_with_socket() {
+    let pbx = FakePBX::new(&[]);
+    let server = make_server(&pbx);
+
+    let accepted = Arc::new(AtomicBool::new(false));
+    let a = accepted.clone();
+
+    server.on_incoming(move |call| {
+        a.store(true, Ordering::SeqCst);
+        call.accept().unwrap();
+    });
+
+    // Pre-bind a socket and pass it to the server.
+    let std_socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+    let server_addr = std_socket.local_addr().unwrap().to_string();
+
+    let s = server.clone();
+    std::thread::spawn(move || {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async { s.listen_with_socket(std_socket).await.unwrap() });
+    });
+
+    // Wait for server to be ready.
+    for _ in 0..200 {
+        if server.local_addr().is_some() {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    assert!(server.local_addr().is_some(), "server did not start");
+
+    // FakePBX sends INVITE to the pre-bound socket address.
+    let target = format!("sip:1002@{server_addr}");
+    let offer_sdp = sdp::sdp("127.0.0.1", 22000, &[sdp::PCMU]);
+    let oc = pbx
+        .send_invite(&target, &offer_sdp)
+        .expect("send_invite failed");
+
+    assert!(
+        accepted.load(Ordering::SeqCst),
+        "on_incoming was not called"
+    );
+    assert_eq!(server.call_count(), 1);
+
+    let bye_code = oc.send_bye().expect("send_bye failed");
+    assert_eq!(bye_code, 200);
+
+    server.stop();
+}
