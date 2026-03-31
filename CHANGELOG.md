@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- **`Server::on_options()` callback** — control the SIP OPTIONS response code for health checks. Returns `200` by default; set to `503` during drain for load balancer integration (e.g., Kamailio, OpenSIPS).
+
 ## [0.4.6] - 2026-03-30
 
 ### Added
