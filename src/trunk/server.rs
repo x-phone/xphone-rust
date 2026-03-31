@@ -49,6 +49,7 @@ struct Inner {
     on_call_state_fn: Vec<CallStateCb>,
     on_call_ended_fn: Vec<CallEndedCb>,
     on_call_dtmf_fn: Vec<CallDtmfCb>,
+    on_options_fn: Option<Arc<dyn Fn() -> u16 + Send + Sync>>,
 }
 
 /// SIP trunk host server — accept and place calls directly with trusted SIP peers.
@@ -106,6 +107,7 @@ impl Server {
                 on_call_state_fn: Vec::new(),
                 on_call_ended_fn: Vec::new(),
                 on_call_dtmf_fn: Vec::new(),
+                on_options_fn: None,
             })),
         }
     }
@@ -146,6 +148,24 @@ impl Server {
         F: Fn(Arc<Call>, String) + Send + Sync + 'static,
     {
         self.inner.lock().on_call_dtmf_fn.push(Arc::new(f));
+    }
+
+    /// Sets a handler for incoming SIP OPTIONS requests (health checks).
+    ///
+    /// The callback returns the SIP status code to send back (e.g., `200` for
+    /// healthy, `503` for draining). When no handler is set, the server
+    /// automatically responds `200 OK`. Replaces any previously set handler.
+    ///
+    /// ```rust,ignore
+    /// server.on_options(move || {
+    ///     if draining.load(Ordering::Relaxed) { 503 } else { 200 }
+    /// });
+    /// ```
+    pub fn on_options<F>(&self, f: F)
+    where
+        F: Fn() -> u16 + Send + Sync + 'static,
+    {
+        self.inner.lock().on_options_fn = Some(Arc::new(f));
     }
 
     /// Places an outbound call to a named peer.
@@ -375,7 +395,10 @@ impl Server {
             }
 
             match msg.method.as_str() {
-                "OPTIONS" => handle_options(&socket, addr, &msg).await,
+                "OPTIONS" => {
+                    let cb = self.inner.lock().on_options_fn.clone();
+                    handle_options(&socket, addr, &msg, cb.as_deref()).await;
+                }
                 "INVITE" => {
                     self.handle_invite(&socket, local_addr, addr, msg, &dialogs, &sip_tx)
                         .await
@@ -732,11 +755,34 @@ impl Server {
     }
 }
 
+fn sip_reason_phrase(code: u16) -> &'static str {
+    match code {
+        200 => "OK",
+        400 => "Bad Request",
+        403 => "Forbidden",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        408 => "Request Timeout",
+        480 => "Temporarily Unavailable",
+        486 => "Busy Here",
+        500 => "Internal Server Error",
+        503 => "Service Unavailable",
+        _ => "Unknown",
+    }
+}
+
 // ── Free functions ──
 
-async fn handle_options(socket: &UdpSocket, addr: SocketAddr, msg: &Message) {
-    debug!("OPTIONS from {addr}");
-    let mut resp = Message::new_response(200, "OK");
+async fn handle_options(
+    socket: &UdpSocket,
+    addr: SocketAddr,
+    msg: &Message,
+    on_options: Option<&(dyn Fn() -> u16 + Send + Sync)>,
+) {
+    let code = on_options.map_or(200, |f| f());
+    let reason = sip_reason_phrase(code);
+    debug!("OPTIONS from {addr} → {code} {reason}");
+    let mut resp = Message::new_response(code, reason);
     copy_dialog_headers(msg, &mut resp);
     resp.set_header("Allow", "INVITE,ACK,BYE,CANCEL,OPTIONS");
     let data = resp.to_bytes();
@@ -1362,5 +1408,59 @@ mod tests {
 
         // Empty body — should not dispatch, just log debug.
         handle_notify(&socket, addr, &notify, &dialogs).await;
+    }
+
+    #[tokio::test]
+    async fn handle_options_default_200() {
+        let server_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client_sock.local_addr().unwrap();
+
+        let mut opts = Message::new_request("OPTIONS", "sip:xphone@127.0.0.1:5080");
+        opts.set_header(
+            "Via",
+            &format!("SIP/2.0/UDP {client_addr};branch=z9hG4bKopt1"),
+        );
+        opts.set_header("From", "<sip:kam@proxy>;tag=from1");
+        opts.set_header("To", "<sip:xphone@server>");
+        opts.set_header("Call-ID", "options-test-1");
+        opts.set_header("CSeq", "1 OPTIONS");
+
+        handle_options(&server_sock, client_addr, &opts, None).await;
+
+        let mut buf = [0u8; 4096];
+        let (n, _) = client_sock.recv_from(&mut buf).await.unwrap();
+        let resp = message::parse(&buf[..n]).unwrap();
+        assert!(resp.is_response());
+        assert_eq!(resp.status_code, 200);
+        assert_eq!(resp.reason, "OK");
+        assert!(resp.header("Allow").contains("OPTIONS"));
+    }
+
+    #[tokio::test]
+    async fn handle_options_custom_503() {
+        let server_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_sock = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let client_addr = client_sock.local_addr().unwrap();
+
+        let mut opts = Message::new_request("OPTIONS", "sip:xphone@127.0.0.1:5080");
+        opts.set_header(
+            "Via",
+            &format!("SIP/2.0/UDP {client_addr};branch=z9hG4bKopt2"),
+        );
+        opts.set_header("From", "<sip:kam@proxy>;tag=from2");
+        opts.set_header("To", "<sip:xphone@server>");
+        opts.set_header("Call-ID", "options-test-2");
+        opts.set_header("CSeq", "1 OPTIONS");
+
+        let cb: Arc<dyn Fn() -> u16 + Send + Sync> = Arc::new(|| 503);
+        handle_options(&server_sock, client_addr, &opts, Some(cb.as_ref())).await;
+
+        let mut buf = [0u8; 4096];
+        let (n, _) = client_sock.recv_from(&mut buf).await.unwrap();
+        let resp = message::parse(&buf[..n]).unwrap();
+        assert!(resp.is_response());
+        assert_eq!(resp.status_code, 503);
+        assert_eq!(resp.reason, "Service Unavailable");
     }
 }
