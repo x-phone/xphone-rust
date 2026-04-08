@@ -1,5 +1,6 @@
 use std::time::Duration;
 
+use crate::sip::auth::Credentials;
 use crate::sip::conn::TlsConfig;
 use crate::types::{Codec, VideoCodec};
 
@@ -388,6 +389,9 @@ pub struct DialOptions {
     pub timeout: Duration,
     /// Codec list that overrides the phone-level preferences for this call.
     pub codec_override: Vec<Codec>,
+    /// Per-call auth credentials for 401/407 challenges. Overrides config-level
+    /// `outbound_username` / `outbound_password` for this call only.
+    pub auth: Option<Credentials>,
     /// Enable video in the SDP offer.
     pub video: bool,
     /// Video codecs in preference order. Defaults to `[H264, VP8]` when
@@ -403,6 +407,7 @@ impl Default for DialOptions {
             early_media: false,
             timeout: Duration::from_secs(30),
             codec_override: Vec::new(),
+            auth: None,
             video: false,
             video_codecs: Vec::new(),
         }
@@ -443,6 +448,16 @@ impl DialOptionsBuilder {
     /// Sets the dial timeout.
     pub fn timeout(mut self, d: Duration) -> Self {
         self.opts.timeout = d;
+        self
+    }
+
+    /// Sets per-call authentication credentials for 401/407 proxy auth.
+    /// Overrides config-level `outbound_username` / `outbound_password` for this call only.
+    pub fn auth(mut self, username: &str, password: &str) -> Self {
+        self.opts.auth = Some(Credentials {
+            username: username.into(),
+            password: password.into(),
+        });
         self
     }
 
@@ -712,5 +727,35 @@ mod tests {
             .build();
         assert!(opts.video);
         assert_eq!(opts.video_codecs, vec![VideoCodec::H264]);
+    }
+
+    #[test]
+    fn dial_options_defaults_no_auth() {
+        let opts = DialOptions::default();
+        assert!(opts.auth.is_none());
+    }
+
+    #[test]
+    fn dial_options_builder_auth() {
+        let opts = DialOptionsBuilder::new()
+            .auth("trunk-user", "trunk-pass")
+            .build();
+        let creds = opts.auth.unwrap();
+        assert_eq!(creds.username, "trunk-user");
+        assert_eq!(creds.password, "trunk-pass");
+    }
+
+    #[test]
+    fn dial_options_builder_auth_with_other_options() {
+        let opts = DialOptionsBuilder::new()
+            .caller_id("Bob")
+            .auth("proxy-user", "proxy-pass")
+            .early_media()
+            .build();
+        assert_eq!(opts.caller_id, Some("Bob".into()));
+        let creds = opts.auth.unwrap();
+        assert_eq!(creds.username, "proxy-user");
+        assert_eq!(creds.password, "proxy-pass");
+        assert!(opts.early_media);
     }
 }

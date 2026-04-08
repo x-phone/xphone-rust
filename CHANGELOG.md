@@ -2,6 +2,12 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- **Per-call SIP auth credentials** — `DialOptions::auth` (`Option<Credentials>`) overrides config-level `outbound_username` / `outbound_password` for a single outbound call. Enables dialing through multiple SIP trunks with distinct proxy auth without creating separate `Phone` instances. Also available via `DialOptionsBuilder::auth("user", "pass")`. `Credentials` is now re-exported from the crate root. (xphone-go#90)
+
 ## [0.4.7] - 2026-03-31
 
 ### Added

@@ -35,6 +35,7 @@ pub use call::{Call, VideoUpgradeRequest};
 pub use config::{Config, DialOptions, DtmfMode, PhoneBuilder};
 pub use error::{Error, Result};
 pub use phone::Phone;
+pub use sip::auth::Credentials;
 pub use sip::conn::TlsConfig;
 pub use subscription::SubId;
 pub use trunk::config::{PeerAuthConfig, PeerConfig, ServerConfig};
