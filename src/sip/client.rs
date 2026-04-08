@@ -343,6 +343,7 @@ impl Client {
         sdp: &[u8],
         timeout: Duration,
         extra_headers: Option<&HashMap<String, String>>,
+        auth_override: Option<&Credentials>,
     ) -> Result<InviteResult> {
         let mut current_target = target_uri.to_string();
         let mut redirects: u8 = 0;
@@ -351,7 +352,13 @@ impl Client {
             if redirects > 0 {
                 info!(hop = redirects, target = %current_target, "SIP >>> following 3xx redirect");
             }
-            match self.send_invite_once(&current_target, sdp, timeout, extra_headers)? {
+            match self.send_invite_once(
+                &current_target,
+                sdp,
+                timeout,
+                extra_headers,
+                auth_override,
+            )? {
                 ConsumeResult::Success(result) => return Ok(*result),
                 ConsumeResult::Redirect(new_target) => {
                     redirects += 1;
@@ -374,6 +381,7 @@ impl Client {
         sdp: &[u8],
         timeout: Duration,
         extra_headers: Option<&HashMap<String, String>>,
+        auth_override: Option<&Credentials>,
     ) -> Result<ConsumeResult> {
         if *self.closed.lock() {
             return Err(Error::Other("sip: client closed".into()));
@@ -398,10 +406,13 @@ impl Client {
             let auth_hdr = resp.header(auth_hdr_name);
             let ch = auth::parse_challenge(auth_hdr)
                 .map_err(|_| Error::Other("sip: auth challenge parse failed".into()))?;
-            // Use outbound credentials for INVITE auth when available.
-            let creds = Credentials {
-                username: self.outbound_username().to_string(),
-                password: self.outbound_password().to_string(),
+            // Per-call auth overrides config-level outbound credentials.
+            let creds = match auth_override {
+                Some(ov) => ov.clone(),
+                None => Credentials {
+                    username: self.outbound_username().to_string(),
+                    password: self.outbound_password().to_string(),
+                },
             };
             let auth_val = auth::build_authorization(&ch, &creds, "INVITE", target_uri);
             let auth_resp_hdr = if resp.status_code == 401 {
@@ -994,7 +1005,13 @@ mod tests {
 
         let sdp = b"v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 10000 RTP/AVP 0\r\n";
         let result = client
-            .send_invite("sip:1002@pbx.local", sdp, Duration::from_secs(5), None)
+            .send_invite(
+                "sip:1002@pbx.local",
+                sdp,
+                Duration::from_secs(5),
+                None,
+                None,
+            )
             .unwrap();
 
         // Should have followed redirect to 1003.
@@ -1038,7 +1055,13 @@ mod tests {
         });
 
         let sdp = b"v=0\r\n";
-        let result = client.send_invite("sip:1002@pbx.local", sdp, Duration::from_secs(5), None);
+        let result = client.send_invite(
+            "sip:1002@pbx.local",
+            sdp,
+            Duration::from_secs(5),
+            None,
+            None,
+        );
         assert!(result.is_err());
         assert!(result.unwrap_err().to_string().contains("no Contact URI"));
 
@@ -1083,7 +1106,13 @@ mod tests {
         });
 
         let sdp = b"v=0\r\n";
-        let result = client.send_invite("sip:1002@pbx.local", sdp, Duration::from_secs(5), None);
+        let result = client.send_invite(
+            "sip:1002@pbx.local",
+            sdp,
+            Duration::from_secs(5),
+            None,
+            None,
+        );
         assert!(result.is_err());
         assert!(result
             .unwrap_err()
@@ -1172,7 +1201,13 @@ mod tests {
 
         let sdp = b"v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 10000 RTP/AVP 0\r\n";
         let result = client
-            .send_invite("sip:1002@pbx.local", sdp, Duration::from_secs(5), None)
+            .send_invite(
+                "sip:1002@pbx.local",
+                sdp,
+                Duration::from_secs(5),
+                None,
+                None,
+            )
             .unwrap();
 
         assert_eq!(result.response.status_code, 200);
@@ -1251,11 +1286,182 @@ mod tests {
 
         let sdp = b"v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 10000 RTP/AVP 0\r\n";
         let result = client
-            .send_invite("sip:1002@pbx.local", sdp, Duration::from_secs(5), None)
+            .send_invite(
+                "sip:1002@pbx.local",
+                sdp,
+                Duration::from_secs(5),
+                None,
+                None,
+            )
             .unwrap();
 
         assert_eq!(result.response.status_code, 200);
         assert!(result.invite.request_uri.contains("1003"));
+
+        client.close();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn send_invite_per_call_auth_override_on_407() {
+        let server = UdpConn::bind("127.0.0.1:0").unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        // Config-level credentials are "1001"/"config-pass".
+        let cfg = ClientConfig {
+            local_addr: "127.0.0.1:0".into(),
+            server_addr,
+            username: "1001".into(),
+            password: "config-pass".into(),
+            domain: "pbx.local".into(),
+            ..Default::default()
+        };
+        let client = Client::new(cfg).unwrap();
+
+        let handle = std::thread::spawn(move || {
+            // First INVITE → 407 Proxy Authentication Required.
+            let (data, from) = server.receive(Duration::from_secs(2)).unwrap();
+            let req = super::super::message::parse(&data).unwrap();
+            assert_eq!(req.method, "INVITE");
+
+            let mut resp = Message::new_response(407, "Proxy Authentication Required");
+            resp.set_header("Via", req.header("Via"));
+            resp.set_header("Call-ID", req.header("Call-ID"));
+            resp.set_header("CSeq", req.header("CSeq"));
+            resp.set_header("From", req.header("From"));
+            resp.set_header("To", req.header("To"));
+            resp.set_header(
+                "Proxy-Authenticate",
+                r#"Digest realm="trunk.provider.com",nonce="percall123",algorithm=MD5"#,
+            );
+            server.send(&resp.to_bytes(), from).unwrap();
+
+            // Second INVITE (with per-call auth) → verify Proxy-Authorization uses
+            // the per-call username "trunk-user", not the config-level "1001".
+            let (data, from) = server.receive(Duration::from_secs(2)).unwrap();
+            let req = super::super::message::parse(&data).unwrap();
+            assert_eq!(req.method, "INVITE");
+            let proxy_auth = req.header("Proxy-Authorization");
+            assert!(
+                proxy_auth.contains("Digest "),
+                "expected Proxy-Authorization header"
+            );
+            assert!(
+                proxy_auth.contains(r#"username="trunk-user""#),
+                "expected per-call username, got: {proxy_auth}"
+            );
+
+            let mut resp = Message::new_response(200, "OK");
+            resp.set_header("Via", req.header("Via"));
+            resp.set_header("Call-ID", req.header("Call-ID"));
+            resp.set_header("CSeq", req.header("CSeq"));
+            resp.set_header("From", req.header("From"));
+            resp.set_header("To", &format!("{};tag=percall", req.header("To")));
+            resp.set_header("Contact", "<sip:1002@trunk.provider.com>");
+            resp.body = b"v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 20000 RTP/AVP 0\r\n".to_vec();
+            server.send(&resp.to_bytes(), from).unwrap();
+
+            // ACK for 200.
+            let (data, _) = server.receive(Duration::from_secs(2)).unwrap();
+            let ack = super::super::message::parse(&data).unwrap();
+            assert_eq!(ack.method, "ACK");
+        });
+
+        let sdp = b"v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 10000 RTP/AVP 0\r\n";
+        let auth_override = Credentials {
+            username: "trunk-user".into(),
+            password: "trunk-pass".into(),
+        };
+        let result = client
+            .send_invite(
+                "sip:1002@pbx.local",
+                sdp,
+                Duration::from_secs(5),
+                None,
+                Some(&auth_override),
+            )
+            .unwrap();
+
+        assert_eq!(result.response.status_code, 200);
+
+        client.close();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn send_invite_without_auth_override_uses_config_creds() {
+        let server = UdpConn::bind("127.0.0.1:0").unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        let cfg = ClientConfig {
+            local_addr: "127.0.0.1:0".into(),
+            server_addr,
+            username: "1001".into(),
+            password: "config-pass".into(),
+            domain: "pbx.local".into(),
+            outbound_username: Some("outbound-user".into()),
+            outbound_password: Some("outbound-pass".into()),
+            ..Default::default()
+        };
+        let client = Client::new(cfg).unwrap();
+
+        let handle = std::thread::spawn(move || {
+            // 401 challenge.
+            let (data, from) = server.receive(Duration::from_secs(2)).unwrap();
+            let req = super::super::message::parse(&data).unwrap();
+            assert_eq!(req.method, "INVITE");
+
+            let mut resp = Message::new_response(401, "Unauthorized");
+            resp.set_header("Via", req.header("Via"));
+            resp.set_header("Call-ID", req.header("Call-ID"));
+            resp.set_header("CSeq", req.header("CSeq"));
+            resp.set_header("From", req.header("From"));
+            resp.set_header("To", req.header("To"));
+            resp.set_header(
+                "WWW-Authenticate",
+                r#"Digest realm="asterisk",nonce="nonce456",algorithm=MD5"#,
+            );
+            server.send(&resp.to_bytes(), from).unwrap();
+
+            // Second INVITE — no per-call override, should use outbound_username.
+            let (data, from) = server.receive(Duration::from_secs(2)).unwrap();
+            let req = super::super::message::parse(&data).unwrap();
+            assert_eq!(req.method, "INVITE");
+            let auth = req.header("Authorization");
+            assert!(
+                auth.contains(r#"username="outbound-user""#),
+                "expected config-level outbound username, got: {auth}"
+            );
+
+            let mut resp = Message::new_response(200, "OK");
+            resp.set_header("Via", req.header("Via"));
+            resp.set_header("Call-ID", req.header("Call-ID"));
+            resp.set_header("CSeq", req.header("CSeq"));
+            resp.set_header("From", req.header("From"));
+            resp.set_header("To", &format!("{};tag=cfg", req.header("To")));
+            resp.set_header("Contact", "<sip:1002@pbx.local>");
+            resp.body = b"v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 20000 RTP/AVP 0\r\n".to_vec();
+            server.send(&resp.to_bytes(), from).unwrap();
+
+            // ACK.
+            let (data, _) = server.receive(Duration::from_secs(2)).unwrap();
+            let ack = super::super::message::parse(&data).unwrap();
+            assert_eq!(ack.method, "ACK");
+        });
+
+        let sdp = b"v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=-\r\nc=IN IP4 127.0.0.1\r\nt=0 0\r\nm=audio 10000 RTP/AVP 0\r\n";
+        // No auth_override — should fall back to outbound_username/outbound_password.
+        let result = client
+            .send_invite(
+                "sip:1002@pbx.local",
+                sdp,
+                Duration::from_secs(5),
+                None,
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(result.response.status_code, 200);
 
         client.close();
         handle.join().unwrap();

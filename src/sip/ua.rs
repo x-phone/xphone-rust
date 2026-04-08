@@ -468,9 +468,15 @@ impl SipTransport for SipUA {
         }
         let extra_ref = if extra.is_empty() { None } else { Some(&extra) };
 
-        let result = self
-            .client
-            .send_invite(&target_uri, local_sdp, timeout, extra_ref)?;
+        let auth_override = &opts.auth;
+
+        let result = self.client.send_invite(
+            &target_uri,
+            local_sdp,
+            timeout,
+            extra_ref,
+            auth_override.as_ref(),
+        )?;
         let remote_sdp = String::from_utf8_lossy(&result.response.body).to_string();
         info!(
             status = result.response.status_code,
