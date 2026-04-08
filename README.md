@@ -327,6 +327,7 @@ fn pcm_to_f32(frame: &[i16]) -> Vec<f32> {
 - Early media (183 Session Progress)
 - Outbound proxy routing (`Config::outbound_proxy`)
 - Separate outbound credentials (`outbound_username` / `outbound_password`)
+- Per-call auth credentials (`DialOptions::auth`) for multi-trunk proxy auth
 - P-Asserted-Identity for caller ID (`DialOptions::caller_id`)
 - Custom headers on outbound INVITEs (`DialOptions::custom_headers`)
 - `Server::dial_uri` — dial arbitrary SIP URIs without pre-configured peers
