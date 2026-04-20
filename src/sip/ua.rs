@@ -84,6 +84,7 @@ impl SipUA {
             server_addr,
             username: cfg.username.clone(),
             password: cfg.password.clone(),
+            auth_username: cfg.auth_username.clone(),
             domain: cfg.host.clone(),
             transport: transport.clone(),
             tls_config: cfg.tls_config.clone(),
