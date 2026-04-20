@@ -19,9 +19,13 @@ pub enum Error {
     /// All ports in the configured RTP port range are in use.
     #[error("xphone: RTP port range exhausted")]
     NoRtpPortAvailable,
-    /// SIP REGISTER request was rejected by the server.
-    #[error("xphone: registration failed")]
-    RegistrationFailed,
+    /// SIP REGISTER request was rejected, or all retries were exhausted.
+    /// `code` is the last SIP status observed across retry attempts (`0` when
+    /// no response was received, e.g. transport failure). `reason` carries the
+    /// corresponding reason-phrase, or a transport error description when
+    /// `code == 0`.
+    #[error("{}", format_registration_failed(*code, reason))]
+    RegistrationFailed { code: u16, reason: String },
     /// SIP REFER (blind transfer) was rejected or failed.
     #[error("xphone: transfer failed")]
     TransferFailed,
@@ -66,6 +70,17 @@ pub enum Error {
 /// Convenience alias for `std::result::Result<T, Error>`.
 pub type Result<T> = std::result::Result<T, Error>;
 
+/// Formats [`Error::RegistrationFailed`] suppressing `code` when it is `0`
+/// (pure transport failure) and suppressing `reason` when empty.
+fn format_registration_failed(code: u16, reason: &str) -> String {
+    match (code, reason.is_empty()) {
+        (0, true) => "xphone: registration failed".into(),
+        (0, false) => format!("xphone: registration failed: {reason}"),
+        (c, true) => format!("xphone: registration failed: {c}"),
+        (c, false) => format!("xphone: registration failed: {c} {reason}"),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -81,6 +96,33 @@ mod tests {
             Error::InvalidDtmfDigit.to_string(),
             "xphone: invalid DTMF digit"
         );
+    }
+
+    #[test]
+    fn registration_failed_display_skips_zero_and_empty() {
+        let full = Error::RegistrationFailed {
+            code: 403,
+            reason: "Forbidden".into(),
+        };
+        assert_eq!(
+            full.to_string(),
+            "xphone: registration failed: 403 Forbidden"
+        );
+
+        let transport = Error::RegistrationFailed {
+            code: 0,
+            reason: "transport: timeout".into(),
+        };
+        assert_eq!(
+            transport.to_string(),
+            "xphone: registration failed: transport: timeout"
+        );
+
+        let bare = Error::RegistrationFailed {
+            code: 0,
+            reason: String::new(),
+        };
+        assert_eq!(bare.to_string(), "xphone: registration failed");
     }
 
     #[test]

@@ -92,16 +92,12 @@ pub fn parse_dialog_states(xml: &str) -> Vec<String> {
                     in_state = false;
                 }
             }
-            Ok(Event::Text(e)) => {
-                if in_state {
-                    match e.unescape() {
-                        Ok(text) => states.push(text.trim().to_lowercase()),
-                        Err(err) => {
-                            debug!(error = %err, "dialog-info: failed to unescape state text");
-                        }
-                    }
+            Ok(Event::Text(e)) if in_state => match e.unescape() {
+                Ok(text) => states.push(text.trim().to_lowercase()),
+                Err(err) => {
+                    debug!(error = %err, "dialog-info: failed to unescape state text");
                 }
-            }
+            },
             Ok(Event::Eof) => break,
             Err(err) => {
                 debug!(error = %err, "dialog-info: XML parse error");

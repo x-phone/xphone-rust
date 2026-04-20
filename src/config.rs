@@ -43,6 +43,13 @@ pub struct Config {
     /// Interval for NAT keep-alive packets. `None` disables keep-alive.
     pub nat_keepalive_interval: Option<Duration>,
 
+    /// Enable NAT-friendly SIP transport behaviour. When `true`, outgoing
+    /// Via headers include the `;rport` parameter (RFC 3581) so the server
+    /// sends responses to the source IP/port the request actually arrived
+    /// from. Harmless on servers that don't understand it. Opt-in so
+    /// existing deployments see no change.
+    pub nat: bool,
+
     /// Override the local IP advertised in SDP/Via/Contact.
     /// If empty, the address is auto-detected.
     pub local_ip: String,
@@ -94,9 +101,13 @@ pub struct Config {
     /// Defaults to `"xphone"`. PBXes use this to identify the device.
     pub user_agent: String,
 
-    /// Outbound proxy URI for routing INVITEs (e.g. `"sip:proxy.example.com:5060"`).
-    /// When set, outbound INVITEs are sent to this proxy instead of the registrar.
-    /// Registration traffic still goes to `host:port`.
+    /// Outbound proxy URI for routing **all** outbound SIP requests
+    /// (e.g. `"sip:proxy.example.com:5060"`). When set, REGISTER, INVITE,
+    /// SUBSCRIBE, MESSAGE, in-dialog requests (BYE, re-INVITE, REFER, INFO),
+    /// ACK, and NAT keep-alives all route through this proxy instead of
+    /// `host:port`. For TCP/TLS, the transport connection also targets the
+    /// proxy. Mirrors how outbound-proxy deployments (Kamailio, OpenSIPS,
+    /// Asterisk) actually behave.
     pub outbound_proxy: Option<String>,
     /// Username for outbound INVITE authentication. Falls back to `username` if unset.
     pub outbound_username: Option<String>,
@@ -117,6 +128,7 @@ impl Default for Config {
             register_retry: Duration::from_secs(1),
             register_max_retry: 3,
             nat_keepalive_interval: None,
+            nat: false,
             local_ip: String::new(),
             rtp_port_min: 0,
             rtp_port_max: 0,
@@ -272,6 +284,14 @@ impl PhoneBuilder {
         self
     }
 
+    /// Enables NAT-friendly SIP transport: appends `;rport` (RFC 3581) to
+    /// outgoing Via headers so responses are routed back to the source IP/port
+    /// observed by the server. Default is off.
+    pub fn with_nat(mut self, enabled: bool) -> Self {
+        self.config.nat = enabled;
+        self
+    }
+
     /// Sets the PCM sample rate in Hz.
     pub fn pcm_rate(mut self, rate: u32) -> Self {
         self.config.pcm_rate = rate;
@@ -347,8 +367,10 @@ impl PhoneBuilder {
         self
     }
 
-    /// Sets an outbound proxy for routing INVITEs (e.g. `"sip:proxy.example.com:5060"`).
-    /// Registration traffic still goes to the configured host.
+    /// Sets an outbound proxy for routing all outbound SIP requests —
+    /// REGISTER, INVITE, SUBSCRIBE, MESSAGE, in-dialog sends, and NAT
+    /// keep-alives (e.g. `"sip:proxy.example.com:5060"`). For TCP/TLS the
+    /// transport connection also targets the proxy.
     pub fn outbound_proxy(mut self, proxy: &str) -> Self {
         self.config.outbound_proxy = Some(proxy.into());
         self
@@ -653,6 +675,21 @@ mod tests {
         assert!(opts.caller_id.is_none());
         assert!(opts.custom_headers.is_empty());
         assert!(opts.codec_override.is_empty());
+    }
+
+    #[test]
+    fn nat_default_is_off() {
+        let cfg = Config::default();
+        assert!(!cfg.nat);
+    }
+
+    #[test]
+    fn phone_builder_with_nat_enables_rport() {
+        let cfg = PhoneBuilder::new()
+            .credentials("1001", "pw", "pbx.local")
+            .with_nat(true)
+            .build();
+        assert!(cfg.nat);
     }
 
     #[test]

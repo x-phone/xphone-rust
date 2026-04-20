@@ -121,12 +121,7 @@ impl SipDialogUAC {
         let branch = generate_branch();
         req.set_header(
             "Via",
-            &format!(
-                "SIP/2.0/{} {};branch={}",
-                self.client.via_transport(),
-                self.client.local_addr(),
-                branch
-            ),
+            &self.client.build_via(self.client.local_addr(), &branch),
         );
 
         req.set_header("Call-ID", &self.call_id);
@@ -309,12 +304,7 @@ impl SipDialogUAS {
         let branch = generate_branch();
         req.set_header(
             "Via",
-            &format!(
-                "SIP/2.0/{} {};branch={}",
-                self.client.via_transport(),
-                self.client.local_addr(),
-                branch
-            ),
+            &self.client.build_via(self.client.local_addr(), &branch),
         );
 
         req.set_header("Call-ID", &self.call_id);

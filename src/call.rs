@@ -1319,24 +1319,21 @@ impl Call {
                     }
                     false
                 }
-                200 => {
-                    if inner.state == CallState::Dialing
-                        || inner.state == CallState::RemoteRinging
-                        || inner.state == CallState::EarlyMedia
-                    {
-                        inner.state = CallState::Active;
-                        inner.start_time = Some(Instant::now());
-                        inner.media_active = true;
-                        Self::start_media_pipeline(&mut inner);
-                        Self::fire_on_state(&inner, CallState::Active);
-                        for f in &inner.on_media_fn {
-                            let f = Arc::clone(f);
-                            spawn_callback(move || f());
-                        }
-                        true
-                    } else {
-                        false
+                200 if matches!(
+                    inner.state,
+                    CallState::Dialing | CallState::RemoteRinging | CallState::EarlyMedia
+                ) =>
+                {
+                    inner.state = CallState::Active;
+                    inner.start_time = Some(Instant::now());
+                    inner.media_active = true;
+                    Self::start_media_pipeline(&mut inner);
+                    Self::fire_on_state(&inner, CallState::Active);
+                    for f in &inner.on_media_fn {
+                        let f = Arc::clone(f);
+                        spawn_callback(move || f());
                     }
+                    true
                 }
                 _ => false,
             };

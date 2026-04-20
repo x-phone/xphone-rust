@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- **NAT-friendly Via (`;rport`, RFC 3581)** — `Config.nat` / `PhoneBuilder::with_nat(true)` appends `;rport` to outgoing SIP `Via` headers so the server sends responses back to the source IP/port it actually observed. Opt-in (default `false`); harmless on servers that don't understand the parameter. Covers every outbound request path (REGISTER, INVITE, ACK, BYE, SUBSCRIBE, MESSAGE, etc.) and the `TransactionManager` fallback. (xphone-go issue A)
+
+### Changed
+
+- **BREAKING: `Error::RegistrationFailed` now carries `{ code: u16, reason: String }`** — the last SIP status and reason-phrase observed across retry attempts are surfaced on the returned error and passed to `on_error` callbacks. `code == 0` means no SIP response was received (pure transport failure) and `reason` describes the transport error. The final `warn!` on retry exhaustion also logs `last_code` and `last_reason`. Callers pattern-matching `Error::RegistrationFailed` must update to the struct form. (xphone-go#96)
+- **`Config.outbound_proxy` now routes all outbound SIP requests**, not just INVITE. REGISTER, SUBSCRIBE, MESSAGE, in-dialog sends (BYE, re-INVITE, REFER, INFO), ACK, and NAT keep-alives now target the proxy when set; previously only INVITE did. For TCP/TLS the transport connection also targets the proxy. Matches how Kamailio / OpenSIPS / Asterisk outbound-proxy deployments actually work. No change when `outbound_proxy` is unset. Behavior change for anyone who was setting `outbound_proxy` and relying on REGISTER bypassing it — if you need separate routing, file an issue requesting `registrar_proxy`. (xphone-go outbound-proxy issue)
+
 ## [0.4.8] - 2026-04-08
 
 ### Added
