@@ -101,9 +101,13 @@ pub struct Config {
     /// Defaults to `"xphone"`. PBXes use this to identify the device.
     pub user_agent: String,
 
-    /// Outbound proxy URI for routing INVITEs (e.g. `"sip:proxy.example.com:5060"`).
-    /// When set, outbound INVITEs are sent to this proxy instead of the registrar.
-    /// Registration traffic still goes to `host:port`.
+    /// Outbound proxy URI for routing **all** outbound SIP requests
+    /// (e.g. `"sip:proxy.example.com:5060"`). When set, REGISTER, INVITE,
+    /// SUBSCRIBE, MESSAGE, in-dialog requests (BYE, re-INVITE, REFER, INFO),
+    /// ACK, and NAT keep-alives all route through this proxy instead of
+    /// `host:port`. For TCP/TLS, the transport connection also targets the
+    /// proxy. Mirrors how outbound-proxy deployments (Kamailio, OpenSIPS,
+    /// Asterisk) actually behave.
     pub outbound_proxy: Option<String>,
     /// Username for outbound INVITE authentication. Falls back to `username` if unset.
     pub outbound_username: Option<String>,
@@ -363,8 +367,10 @@ impl PhoneBuilder {
         self
     }
 
-    /// Sets an outbound proxy for routing INVITEs (e.g. `"sip:proxy.example.com:5060"`).
-    /// Registration traffic still goes to the configured host.
+    /// Sets an outbound proxy for routing all outbound SIP requests —
+    /// REGISTER, INVITE, SUBSCRIBE, MESSAGE, in-dialog sends, and NAT
+    /// keep-alives (e.g. `"sip:proxy.example.com:5060"`). For TCP/TLS the
+    /// transport connection also targets the proxy.
     pub fn outbound_proxy(mut self, proxy: &str) -> Self {
         self.config.outbound_proxy = Some(proxy.into());
         self

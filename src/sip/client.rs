@@ -99,9 +99,13 @@ pub struct Client {
 impl Client {
     /// Creates a new SIP client, binding or connecting based on transport.
     pub fn new(cfg: ClientConfig) -> Result<Self> {
+        // Use the outbound proxy as the transport peer when set. For TCP/TLS
+        // this is load-bearing: the connection is established once, and
+        // `send`'s destination argument is ignored by the stream.
+        let transport_peer = cfg.outbound_proxy.unwrap_or(cfg.server_addr);
         let sip_conn = conn::connect(
             &cfg.transport,
-            cfg.server_addr,
+            transport_peer,
             &cfg.local_addr,
             &cfg.domain,
             cfg.tls_config.as_ref(),
@@ -125,9 +129,10 @@ impl Client {
                 SocketAddr::new(stun_addr.ip(), local_addr.port())
             } else {
                 // Fallback: UDP connect trick to determine local routable IP.
+                // Probe the actual next-hop (outbound proxy if set).
                 use std::net::UdpSocket;
                 match UdpSocket::bind("0.0.0.0:0") {
-                    Ok(sock) => match sock.connect(cfg.server_addr) {
+                    Ok(sock) => match sock.connect(transport_peer) {
                         Ok(()) => match sock.local_addr() {
                             Ok(addr) if !addr.ip().is_unspecified() => {
                                 SocketAddr::new(addr.ip(), local_addr.port())
@@ -219,8 +224,9 @@ impl Client {
         let request_uri = format!("sip:{}", self.cfg.domain);
         let mut req = self.build_request("REGISTER", &request_uri, None);
 
-        debug!(method = "REGISTER", uri = %request_uri, server = %self.cfg.server_addr, "SIP >>> sending");
-        let resp = self.tm.send(&mut req, self.cfg.server_addr, timeout)?;
+        let dest = self.outbound_dest();
+        debug!(method = "REGISTER", uri = %request_uri, dest = %dest, "SIP >>> sending");
+        let resp = self.tm.send(&mut req, dest, timeout)?;
         debug!(method = "REGISTER", status = resp.status_code, reason = %resp.reason, "SIP <<< response");
         let branch = req.via_branch().to_string();
 
@@ -242,7 +248,7 @@ impl Client {
             extra.insert("Authorization".to_string(), auth_val);
             let mut retry = self.build_request("REGISTER", &request_uri, Some(&extra));
             debug!(method = "REGISTER", "SIP >>> re-sending with auth");
-            let resp = self.tm.send(&mut retry, self.cfg.server_addr, timeout)?;
+            let resp = self.tm.send(&mut retry, dest, timeout)?;
             info!(method = "REGISTER", status = resp.status_code, reason = %resp.reason, "SIP <<< auth response");
             let retry_branch = retry.via_branch().to_string();
             self.tm.remove_tx(&retry_branch);
@@ -264,8 +270,9 @@ impl Client {
         extra.insert("Expires".to_string(), "0".to_string());
         let mut req = self.build_request("REGISTER", &request_uri, Some(&extra));
 
+        let dest = self.outbound_dest();
         info!("SIP >>> REGISTER Expires=0 (unregister)");
-        let resp = self.tm.send(&mut req, self.cfg.server_addr, timeout)?;
+        let resp = self.tm.send(&mut req, dest, timeout)?;
         let branch = req.via_branch().to_string();
 
         // Handle 401 auth challenge.
@@ -286,7 +293,7 @@ impl Client {
             extra2.insert("Authorization".to_string(), auth_val);
             extra2.insert("Expires".to_string(), "0".to_string());
             let mut retry = self.build_request("REGISTER", &request_uri, Some(&extra2));
-            let resp = self.tm.send(&mut retry, self.cfg.server_addr, timeout)?;
+            let resp = self.tm.send(&mut retry, dest, timeout)?;
             info!(status = resp.status_code, "SIP <<< unregister response");
             let retry_branch = retry.via_branch().to_string();
             self.tm.remove_tx(&retry_branch);
@@ -487,7 +494,7 @@ impl Client {
             // Send ACK for 2xx.
             let ack = self.build_ack(&invite, &resp);
             self.tm.remove_tx(branch);
-            self.tm.send_raw(&ack.to_bytes(), self.cfg.server_addr)?;
+            self.tm.send_raw(&ack.to_bytes(), self.outbound_dest())?;
             Ok(ConsumeResult::Success(Box::new(InviteResult {
                 invite,
                 response: resp,
@@ -499,7 +506,7 @@ impl Client {
             // Send ACK for 3xx (required by RFC 3261 §17.1.1.3).
             // Non-2xx ACK reuses the INVITE's Via branch (same transaction).
             let ack = self.build_ack_non2xx(&invite, &resp, branch);
-            if let Err(e) = self.tm.send_raw(&ack.to_bytes(), self.cfg.server_addr) {
+            if let Err(e) = self.tm.send_raw(&ack.to_bytes(), self.outbound_dest()) {
                 warn!(error = %e, "failed to send ACK for 3xx redirect");
             }
             self.tm.remove_tx(branch);
@@ -539,8 +546,9 @@ impl Client {
         // Override To header to target the subscription URI.
         req.set_header("To", &format!("<{}>", subscribe_uri));
 
-        debug!(method = "SUBSCRIBE", uri = %subscribe_uri, "SIP >>> sending");
-        let resp = self.tm.send(&mut req, self.cfg.server_addr, timeout)?;
+        let dest = self.outbound_dest();
+        debug!(method = "SUBSCRIBE", uri = %subscribe_uri, dest = %dest, "SIP >>> sending");
+        let resp = self.tm.send(&mut req, dest, timeout)?;
         debug!(method = "SUBSCRIBE", status = resp.status_code, reason = %resp.reason, "SIP <<< response");
         let branch = req.via_branch().to_string();
 
@@ -568,7 +576,7 @@ impl Client {
             let mut retry = self.build_request("SUBSCRIBE", subscribe_uri, Some(&extra));
             retry.set_header("To", &format!("<{}>", subscribe_uri));
             debug!(method = "SUBSCRIBE", "SIP >>> re-sending with auth");
-            let resp = self.tm.send(&mut retry, self.cfg.server_addr, timeout)?;
+            let resp = self.tm.send(&mut retry, dest, timeout)?;
             info!(method = "SUBSCRIBE", status = resp.status_code, reason = %resp.reason, "SIP <<< auth response");
             let retry_branch = retry.via_branch().to_string();
             self.tm.remove_tx(&retry_branch);
@@ -597,8 +605,9 @@ impl Client {
         req.set_header("To", &format!("<{}>", target_uri));
         req.body = body.to_vec();
 
-        debug!(method = "MESSAGE", uri = %target_uri, "SIP >>> sending");
-        let resp = self.tm.send(&mut req, self.cfg.server_addr, timeout)?;
+        let dest = self.outbound_dest();
+        debug!(method = "MESSAGE", uri = %target_uri, dest = %dest, "SIP >>> sending");
+        let resp = self.tm.send(&mut req, dest, timeout)?;
         debug!(method = "MESSAGE", status = resp.status_code, reason = %resp.reason, "SIP <<< response");
         let branch = req.via_branch().to_string();
 
@@ -627,7 +636,7 @@ impl Client {
             retry.set_header("To", &format!("<{}>", target_uri));
             retry.body = body.to_vec();
             debug!(method = "MESSAGE", "SIP >>> re-sending with auth");
-            let resp = self.tm.send(&mut retry, self.cfg.server_addr, timeout)?;
+            let resp = self.tm.send(&mut retry, dest, timeout)?;
             info!(method = "MESSAGE", status = resp.status_code, reason = %resp.reason, "SIP <<< auth response");
             let retry_branch = retry.via_branch().to_string();
             self.tm.remove_tx(&retry_branch);
@@ -644,7 +653,7 @@ impl Client {
             return Err(Error::Other("sip: client closed".into()));
         }
         debug!(method = %req.method, "SIP >>> in-dialog request");
-        let resp = self.tm.send(req, self.cfg.server_addr, timeout)?;
+        let resp = self.tm.send(req, self.outbound_dest(), timeout)?;
         debug!(method = %req.method, status = resp.status_code, reason = %resp.reason, "SIP <<< in-dialog response");
         let branch = req.via_branch().to_string();
         self.tm.remove_tx(&branch);
@@ -659,7 +668,8 @@ impl Client {
 
         debug!(method = "re-INVITE", "SIP >>> in-dialog re-INVITE");
         let invite_clone = req.clone();
-        let resp = self.tm.send(req, self.cfg.server_addr, timeout)?;
+        let dest = self.outbound_dest();
+        let resp = self.tm.send(req, dest, timeout)?;
         let branch = req.via_branch().to_string();
 
         // Consume provisional responses.
@@ -672,7 +682,7 @@ impl Client {
             // Send ACK for 2xx.
             let ack = self.build_ack(&invite_clone, &resp);
             self.tm.remove_tx(&branch);
-            self.tm.send_raw(&ack.to_bytes(), self.cfg.server_addr)?;
+            self.tm.send_raw(&ack.to_bytes(), dest)?;
         } else {
             self.tm.remove_tx(&branch);
         }
@@ -685,9 +695,10 @@ impl Client {
         self.tm.send_raw(data, dst)
     }
 
-    /// Sends a CRLF NAT keepalive packet to the server.
+    /// Sends a CRLF NAT keepalive packet to the SIP next-hop.
+    /// Targets the outbound proxy when configured, otherwise the registrar.
     pub fn send_keepalive(&self) -> Result<()> {
-        self.tm.send_raw(b"\r\n\r\n", self.cfg.server_addr)
+        self.tm.send_raw(b"\r\n\r\n", self.outbound_dest())
     }
 
     /// Builds an INVITE request with SDP body.
@@ -887,6 +898,91 @@ mod tests {
             via.contains(";branch="),
             "Via must retain branch parameter: {via}"
         );
+        client.close();
+    }
+
+    #[test]
+    fn register_routes_through_outbound_proxy_when_set() {
+        // When outbound_proxy is set, REGISTER goes to the proxy — not the
+        // registrar. Prior to v0.5.0 the proxy applied only to INVITE.
+        let proxy = UdpConn::bind("127.0.0.1:0").unwrap();
+        let proxy_addr = proxy.local_addr().unwrap();
+        let registrar = UdpConn::bind("127.0.0.1:0").unwrap();
+        let registrar_addr = registrar.local_addr().unwrap();
+
+        let cfg = ClientConfig {
+            local_addr: "127.0.0.1:0".into(),
+            server_addr: registrar_addr,
+            outbound_proxy: Some(proxy_addr),
+            username: "1001".into(),
+            password: "test".into(),
+            domain: "pbx.local".into(),
+            ..Default::default()
+        };
+        let client = Client::new(cfg).unwrap();
+
+        // Proxy accepts the REGISTER and replies 200 OK; the registrar must
+        // never see it.
+        let proxy_thread = std::thread::spawn(move || {
+            let (data, from) = proxy.receive(Duration::from_secs(2)).unwrap();
+            let req = super::super::message::parse(&data).unwrap();
+            assert_eq!(req.method, "REGISTER");
+            let mut resp = Message::new_response(200, "OK");
+            resp.set_header("Via", req.header("Via"));
+            resp.set_header("Call-ID", req.header("Call-ID"));
+            resp.set_header("CSeq", req.header("CSeq"));
+            resp.set_header("From", req.header("From"));
+            resp.set_header("To", &format!("{};tag=srv1", req.header("To")));
+            proxy.send(&resp.to_bytes(), from).unwrap();
+        });
+        let registrar_thread = std::thread::spawn(move || {
+            // Short timeout — we expect no traffic here.
+            registrar.receive(Duration::from_millis(500)).err()
+        });
+
+        let (code, _) = client.send_register(Duration::from_secs(5)).unwrap();
+        assert_eq!(code, 200);
+        proxy_thread.join().unwrap();
+        assert!(
+            registrar_thread.join().unwrap().is_some(),
+            "registrar must NOT receive REGISTER when outbound_proxy is set"
+        );
+        client.close();
+    }
+
+    #[test]
+    fn register_falls_back_to_server_addr_without_proxy() {
+        // Without outbound_proxy, REGISTER still goes to server_addr
+        // (the registrar). Sanity check that the new routing logic
+        // doesn't regress the default path.
+        let server = UdpConn::bind("127.0.0.1:0").unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let cfg = ClientConfig {
+            local_addr: "127.0.0.1:0".into(),
+            server_addr,
+            username: "1001".into(),
+            password: "test".into(),
+            domain: "pbx.local".into(),
+            ..Default::default()
+        };
+        let client = Client::new(cfg).unwrap();
+
+        let handle = std::thread::spawn(move || {
+            let (data, from) = server.receive(Duration::from_secs(2)).unwrap();
+            let req = super::super::message::parse(&data).unwrap();
+            assert_eq!(req.method, "REGISTER");
+            let mut resp = Message::new_response(200, "OK");
+            resp.set_header("Via", req.header("Via"));
+            resp.set_header("Call-ID", req.header("Call-ID"));
+            resp.set_header("CSeq", req.header("CSeq"));
+            resp.set_header("From", req.header("From"));
+            resp.set_header("To", &format!("{};tag=srv1", req.header("To")));
+            server.send(&resp.to_bytes(), from).unwrap();
+        });
+
+        let (code, _) = client.send_register(Duration::from_secs(5)).unwrap();
+        assert_eq!(code, 200);
+        handle.join().unwrap();
         client.close();
     }
 
