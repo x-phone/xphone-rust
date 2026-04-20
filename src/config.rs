@@ -24,6 +24,12 @@ pub struct Config {
     pub username: String,
     /// SIP password for digest authentication.
     pub password: String,
+    /// Digest `username` sent in the REGISTER `Authorization` header.
+    /// Falls back to [`username`](Self::username) when `None` or empty. Allows
+    /// registering the SIP URI `sip:<username>@host` while authenticating as a
+    /// different identity (e.g. a shared trunk auth-user). Does not affect
+    /// INVITE — see [`outbound_username`](Self::outbound_username) for that.
+    pub auth_username: Option<String>,
     /// SIP server hostname or IP address.
     pub host: String,
     /// SIP server port (default `5060`).
@@ -120,6 +126,7 @@ impl Default for Config {
         Config {
             username: String::new(),
             password: String::new(),
+            auth_username: None,
             host: String::new(),
             port: 5060,
             transport: "udp".into(),
@@ -381,6 +388,14 @@ impl PhoneBuilder {
     pub fn outbound_credentials(mut self, username: &str, password: &str) -> Self {
         self.config.outbound_username = Some(username.into());
         self.config.outbound_password = Some(password.into());
+        self
+    }
+
+    /// Sets a digest auth username for REGISTER, decoupled from the SIP AOR.
+    /// The REGISTER Request-URI, From, To, and Contact still use the configured
+    /// [`username`](Config::username); only the digest `username` parameter changes.
+    pub fn auth_username(mut self, auth_username: &str) -> Self {
+        self.config.auth_username = Some(auth_username.into());
         self
     }
 
@@ -665,6 +680,33 @@ mod tests {
         assert_eq!(cfg.media_timeout, Duration::from_secs(60));
         assert_eq!(cfg.nat_keepalive_interval, Some(Duration::from_secs(30)));
         assert_eq!(cfg.pcm_rate, 16000);
+    }
+
+    #[test]
+    fn phone_builder_auth_username() {
+        let cfg = PhoneBuilder::new()
+            .credentials("1003", "pw", "pbx.local")
+            .auth_username("trunk-auth-user")
+            .build();
+        assert_eq!(cfg.username, "1003");
+        assert_eq!(cfg.auth_username.as_deref(), Some("trunk-auth-user"));
+    }
+
+    #[test]
+    fn auth_username_defaults_to_none() {
+        let cfg = Config::default();
+        assert!(cfg.auth_username.is_none());
+    }
+
+    #[test]
+    fn phone_builder_auth_username_empty_string_kept_on_config() {
+        // Builder stores the string as-is; the client-level helper treats
+        // empty as equivalent to unset (see client::register_auth_username).
+        let cfg = PhoneBuilder::new()
+            .credentials("1003", "pw", "pbx.local")
+            .auth_username("")
+            .build();
+        assert_eq!(cfg.auth_username.as_deref(), Some(""));
     }
 
     #[test]

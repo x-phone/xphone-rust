@@ -43,6 +43,8 @@ pub struct ClientConfig {
     pub server_addr: SocketAddr,
     pub username: String,
     pub password: String,
+    /// Digest `username` for REGISTER. Falls back to `username` if `None`.
+    pub auth_username: Option<String>,
     pub domain: String,
     /// Transport protocol: "udp", "tcp", or "tls".
     pub transport: String,
@@ -69,6 +71,7 @@ impl Default for ClientConfig {
             server_addr: "127.0.0.1:5060".parse().unwrap(),
             username: String::new(),
             password: String::new(),
+            auth_username: None,
             domain: String::new(),
             transport: "udp".into(),
             tls_config: None,
@@ -239,7 +242,7 @@ impl Client {
                 Err(_) => return Ok((401, auth_hdr.to_string())),
             };
             let creds = Credentials {
-                username: self.cfg.username.clone(),
+                username: self.register_auth_username().to_string(),
                 password: self.cfg.password.clone(),
             };
             let auth_val = auth::build_authorization(&ch, &creds, "REGISTER", &request_uri);
@@ -284,7 +287,7 @@ impl Client {
                 Err(_) => return Ok((401, auth_hdr.to_string())),
             };
             let creds = Credentials {
-                username: self.cfg.username.clone(),
+                username: self.register_auth_username().to_string(),
                 password: self.cfg.password.clone(),
             };
             let auth_val = auth::build_authorization(&ch, &creds, "REGISTER", &request_uri);
@@ -333,6 +336,16 @@ impl Client {
             "SIP/2.0/{} {};branch={}{}",
             self.via_transport, addr, branch, rport
         )
+    }
+
+    /// Digest `username` for REGISTER. Falls back to the AOR username when
+    /// `auth_username` is `None` or an empty string (matches xphone-go behavior).
+    fn register_auth_username(&self) -> &str {
+        self.cfg
+            .auth_username
+            .as_deref()
+            .filter(|s| !s.is_empty())
+            .unwrap_or(&self.cfg.username)
     }
 
     /// Returns the username for outbound INVITE auth (falls back to main credentials).
@@ -1074,6 +1087,151 @@ mod tests {
 
         client.close();
         handle.join().unwrap();
+    }
+
+    #[test]
+    fn register_uses_auth_username_for_digest_only() {
+        // REGISTER digest must use auth_username; From/To/Contact still use username.
+        let server = UdpConn::bind("127.0.0.1:0").unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        let cfg = ClientConfig {
+            local_addr: "127.0.0.1:0".into(),
+            server_addr,
+            username: "1003".into(),
+            password: "secret".into(),
+            auth_username: Some("trunk-auth-user".into()),
+            domain: "pbx.local".into(),
+            ..Default::default()
+        };
+        let client = Client::new(cfg).unwrap();
+
+        let handle = std::thread::spawn(move || {
+            // First request → 401.
+            let (data, from) = server.receive(Duration::from_secs(2)).unwrap();
+            let req = super::super::message::parse(&data).unwrap();
+            assert!(
+                req.header("From").contains("sip:1003@"),
+                "From must use AOR username, got: {}",
+                req.header("From")
+            );
+            assert!(
+                req.header("To").contains("sip:1003@"),
+                "To must use AOR username, got: {}",
+                req.header("To")
+            );
+            assert!(
+                req.header("Contact").contains("sip:1003@"),
+                "Contact must use AOR username, got: {}",
+                req.header("Contact")
+            );
+
+            let mut resp = Message::new_response(401, "Unauthorized");
+            resp.set_header("Via", req.header("Via"));
+            resp.set_header("Call-ID", req.header("Call-ID"));
+            resp.set_header("CSeq", req.header("CSeq"));
+            resp.set_header(
+                "WWW-Authenticate",
+                r#"Digest realm="asterisk",nonce="abc123",algorithm=MD5"#,
+            );
+            server.send(&resp.to_bytes(), from).unwrap();
+
+            // Second request — digest username must be auth_username, not AOR.
+            let (data, from) = server.receive(Duration::from_secs(2)).unwrap();
+            let req = super::super::message::parse(&data).unwrap();
+            let auth = req.header("Authorization");
+            assert!(
+                auth.contains(r#"username="trunk-auth-user""#),
+                "expected digest username=trunk-auth-user, got: {auth}"
+            );
+            assert!(
+                !auth.contains(r#"username="1003""#),
+                "digest must not use AOR username, got: {auth}"
+            );
+            assert!(
+                req.header("From").contains("sip:1003@"),
+                "From must still use AOR username on retry, got: {}",
+                req.header("From")
+            );
+            assert!(
+                req.header("Contact").contains("sip:1003@"),
+                "Contact must still use AOR username on retry, got: {}",
+                req.header("Contact")
+            );
+
+            let mut resp = Message::new_response(200, "OK");
+            resp.set_header("Via", req.header("Via"));
+            resp.set_header("Call-ID", req.header("Call-ID"));
+            resp.set_header("CSeq", req.header("CSeq"));
+            server.send(&resp.to_bytes(), from).unwrap();
+        });
+
+        let (code, _) = client.send_register(Duration::from_secs(5)).unwrap();
+        assert_eq!(code, 200);
+        client.close();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn register_falls_back_to_username_when_auth_username_unset() {
+        // Default behavior: digest username equals AOR username.
+        let server = UdpConn::bind("127.0.0.1:0").unwrap();
+        let server_addr = server.local_addr().unwrap();
+
+        let cfg = ClientConfig {
+            local_addr: "127.0.0.1:0".into(),
+            server_addr,
+            username: "1003".into(),
+            password: "secret".into(),
+            domain: "pbx.local".into(),
+            ..Default::default()
+        };
+        let client = Client::new(cfg).unwrap();
+
+        let handle = std::thread::spawn(move || {
+            let (data, from) = server.receive(Duration::from_secs(2)).unwrap();
+            let req = super::super::message::parse(&data).unwrap();
+            let mut resp = Message::new_response(401, "Unauthorized");
+            resp.set_header("Via", req.header("Via"));
+            resp.set_header("Call-ID", req.header("Call-ID"));
+            resp.set_header("CSeq", req.header("CSeq"));
+            resp.set_header(
+                "WWW-Authenticate",
+                r#"Digest realm="asterisk",nonce="abc123",algorithm=MD5"#,
+            );
+            server.send(&resp.to_bytes(), from).unwrap();
+
+            let (data, from) = server.receive(Duration::from_secs(2)).unwrap();
+            let req = super::super::message::parse(&data).unwrap();
+            let auth = req.header("Authorization");
+            assert!(
+                auth.contains(r#"username="1003""#),
+                "expected digest username=1003 fallback, got: {auth}"
+            );
+
+            let mut resp = Message::new_response(200, "OK");
+            resp.set_header("Via", req.header("Via"));
+            resp.set_header("Call-ID", req.header("Call-ID"));
+            resp.set_header("CSeq", req.header("CSeq"));
+            server.send(&resp.to_bytes(), from).unwrap();
+        });
+
+        let (code, _) = client.send_register(Duration::from_secs(5)).unwrap();
+        assert_eq!(code, 200);
+        client.close();
+        handle.join().unwrap();
+    }
+
+    #[test]
+    fn register_auth_username_empty_string_falls_back_to_aor() {
+        let cfg = ClientConfig {
+            username: "1003".into(),
+            auth_username: Some(String::new()),
+            ..Default::default()
+        };
+        let client = Client::new(cfg).unwrap();
+        assert_eq!(client.register_auth_username(), "1003");
+        client.close();
     }
 
     #[test]
