@@ -51,6 +51,11 @@ struct Inner {
     subscription_mgr: Option<Arc<SubscriptionManager>>,
     /// BLF watchers: extension -> (SubId, last known state).
     blf_watchers: HashMap<String, (SubId, ExtensionState)>,
+
+    /// Last error returned by the registry's initial `start()`. Read by
+    /// [`Phone::connect`] so callers see the real SIP code/reason instead
+    /// of a bare `RegistrationFailed { code: 0, reason: "" }`.
+    last_reg_error: Option<Error>,
 }
 
 /// Phone orchestrates SIP registration, call tracking, and incoming/outgoing calls.
@@ -86,6 +91,7 @@ impl Phone {
                 dtmf_mode,
                 subscription_mgr: None,
                 blf_watchers: HashMap::new(),
+                last_reg_error: None,
             })),
         }
     }
@@ -99,11 +105,15 @@ impl Phone {
         let state = self.state();
         if state == PhoneState::Registered {
             info!("Phone connected and registered");
-            Ok(())
-        } else {
-            warn!("Phone registration failed");
-            Err(crate::error::Error::RegistrationFailed)
+            return Ok(());
         }
+        // Surface the last observed registration error (populated by Registry).
+        let last_err = self.inner.lock().last_reg_error.clone();
+        warn!(err = ?last_err, "Phone registration failed");
+        Err(last_err.unwrap_or(crate::error::Error::RegistrationFailed {
+            code: 0,
+            reason: String::new(),
+        }))
     }
 
     /// Connects with a provided transport (test hook).
@@ -227,10 +237,15 @@ impl Phone {
         inner.reg = Some(reg);
         inner.mwi = mwi;
         inner.subscription_mgr = Some(sub_mgr);
-        if reg_result.is_ok() {
-            inner.state = PhoneState::Registered;
-        } else {
-            inner.state = PhoneState::RegistrationFailed;
+        match reg_result {
+            Ok(()) => {
+                inner.state = PhoneState::Registered;
+                inner.last_reg_error = None;
+            }
+            Err(e) => {
+                inner.state = PhoneState::RegistrationFailed;
+                inner.last_reg_error = Some(e);
+            }
         }
     }
 

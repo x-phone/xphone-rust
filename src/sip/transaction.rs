@@ -35,6 +35,8 @@ pub struct TransactionManager {
     inner: Arc<Mutex<Inner>>,
     /// Transport name for Via headers (UDP, TCP, TLS).
     transport_name: String,
+    /// Append `;rport` (RFC 3581) to auto-generated Via headers when `true`.
+    nat: std::sync::atomic::AtomicBool,
     /// Dropping this sender closes the channel, signaling all receivers to stop.
     done_tx: Mutex<Option<Sender<()>>>,
     done_rx: Receiver<()>,
@@ -72,6 +74,7 @@ impl TransactionManager {
             local_addr,
             inner,
             transport_name,
+            nat: std::sync::atomic::AtomicBool::new(false),
             done_tx: Mutex::new(Some(done_tx)),
             done_rx,
             thread: Mutex::new(Some(thread)),
@@ -81,6 +84,12 @@ impl TransactionManager {
     /// Returns the transport name (UDP, TCP, TLS) for Via header construction.
     pub fn transport_name(&self) -> &str {
         &self.transport_name
+    }
+
+    /// Enables appending `;rport` (RFC 3581) to auto-generated Via headers.
+    pub fn set_nat(&self, enabled: bool) {
+        self.nat
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Shuts down the read loop and cancels all pending transactions.
@@ -114,9 +123,14 @@ impl TransactionManager {
         let mut branch = req.via_branch().to_string();
         if branch.is_empty() {
             branch = generate_branch();
+            let rport = if self.nat.load(std::sync::atomic::Ordering::Relaxed) {
+                ";rport"
+            } else {
+                ""
+            };
             let via = format!(
-                "SIP/2.0/{} {};branch={}",
-                self.transport_name, self.local_addr, branch
+                "SIP/2.0/{} {};branch={}{}",
+                self.transport_name, self.local_addr, branch, rport
             );
             req.set_header("Via", &via);
         }

@@ -58,6 +58,8 @@ pub struct ClientConfig {
     pub outbound_password: Option<String>,
     /// User-Agent header value (default: `"xphone"`).
     pub user_agent: String,
+    /// Append `;rport` (RFC 3581) to outgoing Via headers when `true`.
+    pub nat: bool,
 }
 
 impl Default for ClientConfig {
@@ -75,6 +77,7 @@ impl Default for ClientConfig {
             outbound_username: None,
             outbound_password: None,
             user_agent: "xphone".into(),
+            nat: false,
         }
     }
 }
@@ -111,6 +114,7 @@ impl Client {
             .map_err(|e| Error::Other(format!("sip: local addr: {}", e)))?;
         let via_transport = sip_conn.transport_name().to_string();
         let tm = TransactionManager::new(sip_conn);
+        tm.set_nat(cfg.nat);
         let call_id = transaction::generate_branch();
 
         // Compute a routable IP to advertise in Via/Contact headers.
@@ -311,6 +315,17 @@ impl Client {
     /// Returns the INVITE destination: outbound proxy if set, otherwise registrar.
     fn outbound_dest(&self) -> SocketAddr {
         self.cfg.outbound_proxy.unwrap_or(self.cfg.server_addr)
+    }
+
+    /// Builds a Via header value for outgoing requests. Appends `;rport`
+    /// (RFC 3581) when `cfg.nat` is enabled so responses return to the
+    /// source address the server actually observed.
+    pub(crate) fn build_via(&self, addr: SocketAddr, branch: &str) -> String {
+        let rport = if self.cfg.nat { ";rport" } else { "" };
+        format!(
+            "SIP/2.0/{} {};branch={}{}",
+            self.via_transport, addr, branch, rport
+        )
     }
 
     /// Returns the username for outbound INVITE auth (falls back to main credentials).
@@ -691,10 +706,7 @@ impl Client {
 
         // Pre-set Via so TransactionManager doesn't generate one with 0.0.0.0.
         let branch = transaction::generate_branch();
-        msg.set_header(
-            "Via",
-            &format!("SIP/2.0/{} {};branch={}", self.via_transport, local, branch),
-        );
+        msg.set_header("Via", &self.build_via(local, &branch));
 
         msg.set_header(
             "From",
@@ -749,11 +761,7 @@ impl Client {
         ack.set_header("CSeq", &format!("{} ACK", cseq_num));
         ack.set_header("Max-Forwards", "70");
         ack.set_header("User-Agent", &self.cfg.user_agent);
-        let via = format!(
-            "SIP/2.0/{} {};branch={}",
-            self.via_transport, self.advertised_addr, branch
-        );
-        ack.set_header("Via", &via);
+        ack.set_header("Via", &self.build_via(self.advertised_addr, branch));
         ack
     }
 
@@ -771,10 +779,7 @@ impl Client {
 
         // Pre-set Via so TransactionManager doesn't generate one with 0.0.0.0.
         let branch = transaction::generate_branch();
-        msg.set_header(
-            "Via",
-            &format!("SIP/2.0/{} {};branch={}", self.via_transport, local, branch),
-        );
+        msg.set_header("Via", &self.build_via(local, &branch));
 
         let from_tag = &transaction::generate_branch()[..15];
         msg.set_header(
@@ -843,6 +848,45 @@ mod tests {
         // Via should contain the correct transport.
         assert!(req.header("Via").contains("SIP/2.0/UDP"));
 
+        client.close();
+    }
+
+    #[test]
+    fn outgoing_via_has_no_rport_by_default() {
+        let client = Client::new(test_config(5060)).unwrap();
+        let req = client.build_request("REGISTER", "sip:pbx.local", None);
+        let via = req.header("Via");
+        assert!(
+            !via.contains(";rport"),
+            "default Via must not contain ;rport, got: {via}"
+        );
+        client.close();
+    }
+
+    #[test]
+    fn outgoing_via_contains_rport_when_nat_enabled() {
+        let cfg = ClientConfig {
+            local_addr: "127.0.0.1:0".into(),
+            server_addr: "127.0.0.1:5060".parse().unwrap(),
+            username: "1001".into(),
+            password: "test".into(),
+            domain: "pbx.local".into(),
+            nat: true,
+            ..Default::default()
+        };
+        let client = Client::new(cfg).unwrap();
+        let req = client.build_request("REGISTER", "sip:pbx.local", None);
+        let via = req.header("Via");
+        assert!(
+            via.contains(";rport"),
+            "nat=true Via must contain ;rport, got: {via}"
+        );
+        // The branch parameter must still come before rport so common parsers
+        // (which stop at the first `;` after branch) still see a rport marker.
+        assert!(
+            via.contains(";branch="),
+            "Via must retain branch parameter: {via}"
+        );
         client.close();
     }
 

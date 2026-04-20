@@ -148,8 +148,13 @@ impl Registry {
     }
 
     /// Sends REGISTER with retries. On success, transitions to Registered and
-    /// fires OnRegistered. On exhausting retries, fires OnError.
+    /// fires OnRegistered. On exhausting retries, fires OnError with the last
+    /// observed SIP status (or `code == 0` and the transport error description
+    /// if no response was received).
     fn register(&self) -> Result<()> {
+        let mut last_code: u16 = 0;
+        let mut last_reason: String = String::new();
+
         for attempt in 0..self.cfg.register_max_retry {
             if attempt > 0 {
                 debug!(attempt, "REGISTER retry after delay");
@@ -165,8 +170,10 @@ impl Registry {
                 .send_request("REGISTER", None, self.cfg.register_expiry);
             let msg = match result {
                 Ok(m) => m,
-                Err(ref e) => {
+                Err(e) => {
                     warn!(attempt, error = %e, "REGISTER failed");
+                    last_code = 0;
+                    last_reason = format!("transport: {}", e);
                     continue;
                 }
             };
@@ -183,11 +190,16 @@ impl Registry {
                 }
                 return Ok(());
             }
+
+            last_code = msg.status_code;
+            last_reason = msg.reason.clone();
         }
 
         // All retries exhausted.
         warn!(
             max_retry = self.cfg.register_max_retry,
+            last_code,
+            last_reason = %last_reason,
             "REGISTER failed — all retries exhausted"
         );
         let cbs = {
@@ -195,11 +207,15 @@ impl Registry {
             inner.state = PhoneState::RegistrationFailed;
             inner.on_error.clone()
         };
+        let err = Error::RegistrationFailed {
+            code: last_code,
+            reason: last_reason.clone(),
+        };
         for f in cbs {
-            let err = Error::RegistrationFailed;
+            let err = err.clone();
             spawn_callback(move || f(err));
         }
-        Err(Error::RegistrationFailed)
+        Err(err)
     }
 }
 
@@ -243,6 +259,9 @@ fn handle_drop(inner: &Arc<Mutex<Inner>>, tr: &Arc<dyn SipTransport>, cfg: &Conf
 
 /// Re-registration attempt after a transport drop.
 fn reregister(inner: &Arc<Mutex<Inner>>, tr: &Arc<dyn SipTransport>, cfg: &Config) -> Result<()> {
+    let mut last_code: u16 = 0;
+    let mut last_reason: String = String::new();
+
     for attempt in 0..cfg.register_max_retry {
         if attempt > 0 {
             if inner.lock().stopped {
@@ -254,7 +273,11 @@ fn reregister(inner: &Arc<Mutex<Inner>>, tr: &Arc<dyn SipTransport>, cfg: &Confi
         let result = tr.send_request("REGISTER", None, cfg.register_expiry);
         let msg = match result {
             Ok(m) => m,
-            Err(_) => continue,
+            Err(e) => {
+                last_code = 0;
+                last_reason = format!("transport: {}", e);
+                continue;
+            }
         };
 
         if msg.status_code == 200 {
@@ -268,18 +291,30 @@ fn reregister(inner: &Arc<Mutex<Inner>>, tr: &Arc<dyn SipTransport>, cfg: &Confi
             }
             return Ok(());
         }
+
+        last_code = msg.status_code;
+        last_reason = msg.reason.clone();
     }
 
+    warn!(
+        last_code,
+        last_reason = %last_reason,
+        "re-REGISTER failed — all retries exhausted"
+    );
     let cbs = {
         let mut guard = inner.lock();
         guard.state = PhoneState::RegistrationFailed;
         guard.on_error.clone()
     };
+    let err = Error::RegistrationFailed {
+        code: last_code,
+        reason: last_reason.clone(),
+    };
     for f in cbs {
-        let err = Error::RegistrationFailed;
+        let err = err.clone();
         spawn_callback(move || f(err));
     }
-    Err(Error::RegistrationFailed)
+    Err(err)
 }
 
 /// Background loop: periodic refresh and NAT keepalive.
@@ -384,6 +419,74 @@ mod tests {
 
         assert!(result.is_err());
         assert_eq!(reg.state(), PhoneState::RegistrationFailed);
+    }
+
+    #[test]
+    fn start_surfaces_403_code_and_reason() {
+        // A SIP rejection (403 Forbidden) on every attempt must surface the
+        // status code and reason-phrase in the returned error.
+        let tr = Arc::new(MockTransport::new());
+        for _ in 0..3 {
+            tr.respond_with(403, "Forbidden");
+        }
+
+        let reg = Registry::new(Arc::clone(&tr) as Arc<dyn SipTransport>, test_cfg());
+        let err = reg.start().unwrap_err();
+
+        match err {
+            Error::RegistrationFailed { code, reason } => {
+                assert_eq!(code, 403);
+                assert_eq!(reason, "Forbidden");
+            }
+            other => panic!("expected RegistrationFailed {{403, Forbidden}}, got {other:?}"),
+        }
+        assert_eq!(reg.state(), PhoneState::RegistrationFailed);
+    }
+
+    #[test]
+    fn start_transport_failure_surfaces_code_zero() {
+        // Pure transport failure (no SIP response ever received) must produce
+        // code=0 with a transport-error reason-phrase.
+        let tr = Arc::new(MockTransport::new());
+        tr.fail_next(10);
+
+        let reg = Registry::new(Arc::clone(&tr) as Arc<dyn SipTransport>, test_cfg());
+        let err = reg.start().unwrap_err();
+
+        match err {
+            Error::RegistrationFailed { code, reason } => {
+                assert_eq!(code, 0, "transport failure must not surface a SIP code");
+                assert!(
+                    reason.starts_with("transport:"),
+                    "reason should describe transport failure, got: {reason}"
+                );
+            }
+            other => panic!("expected RegistrationFailed {{0, transport:...}}, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn start_error_callback_receives_detailed_error() {
+        let tr = Arc::new(MockTransport::new());
+        for _ in 0..3 {
+            tr.respond_with(503, "Service Unavailable");
+        }
+
+        let reg = Registry::new(Arc::clone(&tr) as Arc<dyn SipTransport>, test_cfg());
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        reg.on_error(move |e| {
+            let _ = tx.send(e);
+        });
+
+        let _ = reg.start();
+        let received = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        match received {
+            Error::RegistrationFailed { code, reason } => {
+                assert_eq!(code, 503);
+                assert_eq!(reason, "Service Unavailable");
+            }
+            other => panic!("expected detailed RegistrationFailed, got {other:?}"),
+        }
     }
 
     #[test]

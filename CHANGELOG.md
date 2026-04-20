@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- **NAT-friendly Via (`;rport`, RFC 3581)** — `Config.nat` / `PhoneBuilder::with_nat(true)` appends `;rport` to outgoing SIP `Via` headers so the server sends responses back to the source IP/port it actually observed. Opt-in (default `false`); harmless on servers that don't understand the parameter. Covers every outbound request path (REGISTER, INVITE, ACK, BYE, SUBSCRIBE, MESSAGE, etc.) and the `TransactionManager` fallback. (xphone-go issue A)
+
+### Changed
+
+- **BREAKING: `Error::RegistrationFailed` now carries `{ code: u16, reason: String }`** — the last SIP status and reason-phrase observed across retry attempts are surfaced on the returned error and passed to `on_error` callbacks. `code == 0` means no SIP response was received (pure transport failure) and `reason` describes the transport error. The final `warn!` on retry exhaustion also logs `last_code` and `last_reason`. Callers pattern-matching `Error::RegistrationFailed` must update to the struct form. (xphone-go#96)
+
 ## [0.4.8] - 2026-04-08
 
 ### Added

@@ -155,12 +155,10 @@ impl TurnClient {
                 stun::ATTR_XOR_RELAYED_ADDRESS => {
                     relay = Some(stun::parse_xor_address(v)?);
                 }
-                stun::ATTR_LIFETIME => {
-                    if v.len() >= 4 {
-                        let lt = u32::from_be_bytes([v[0], v[1], v[2], v[3]]);
-                        *self.lifetime.lock() = lt;
-                        debug!(lifetime = lt, "TURN: server lifetime");
-                    }
+                stun::ATTR_LIFETIME if v.len() >= 4 => {
+                    let lt = u32::from_be_bytes([v[0], v[1], v[2], v[3]]);
+                    *self.lifetime.lock() = lt;
+                    debug!(lifetime = lt, "TURN: server lifetime");
                 }
                 _ => {}
             }

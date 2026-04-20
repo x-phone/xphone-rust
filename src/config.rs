@@ -43,6 +43,13 @@ pub struct Config {
     /// Interval for NAT keep-alive packets. `None` disables keep-alive.
     pub nat_keepalive_interval: Option<Duration>,
 
+    /// Enable NAT-friendly SIP transport behaviour. When `true`, outgoing
+    /// Via headers include the `;rport` parameter (RFC 3581) so the server
+    /// sends responses to the source IP/port the request actually arrived
+    /// from. Harmless on servers that don't understand it. Opt-in so
+    /// existing deployments see no change.
+    pub nat: bool,
+
     /// Override the local IP advertised in SDP/Via/Contact.
     /// If empty, the address is auto-detected.
     pub local_ip: String,
@@ -117,6 +124,7 @@ impl Default for Config {
             register_retry: Duration::from_secs(1),
             register_max_retry: 3,
             nat_keepalive_interval: None,
+            nat: false,
             local_ip: String::new(),
             rtp_port_min: 0,
             rtp_port_max: 0,
@@ -269,6 +277,14 @@ impl PhoneBuilder {
     /// Enables NAT keep-alive with the given interval.
     pub fn nat_keepalive(mut self, d: Duration) -> Self {
         self.config.nat_keepalive_interval = Some(d);
+        self
+    }
+
+    /// Enables NAT-friendly SIP transport: appends `;rport` (RFC 3581) to
+    /// outgoing Via headers so responses are routed back to the source IP/port
+    /// observed by the server. Default is off.
+    pub fn with_nat(mut self, enabled: bool) -> Self {
+        self.config.nat = enabled;
         self
     }
 
@@ -653,6 +669,21 @@ mod tests {
         assert!(opts.caller_id.is_none());
         assert!(opts.custom_headers.is_empty());
         assert!(opts.codec_override.is_empty());
+    }
+
+    #[test]
+    fn nat_default_is_off() {
+        let cfg = Config::default();
+        assert!(!cfg.nat);
+    }
+
+    #[test]
+    fn phone_builder_with_nat_enables_rport() {
+        let cfg = PhoneBuilder::new()
+            .credentials("1001", "pw", "pbx.local")
+            .with_nat(true)
+            .build();
+        assert!(cfg.nat);
     }
 
     #[test]

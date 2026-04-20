@@ -498,7 +498,10 @@ mod tests {
         p.on_error(move |_| {
             fired_clone.store(true, Ordering::Relaxed);
         });
-        p.simulate_error(Error::RegistrationFailed);
+        p.simulate_error(Error::RegistrationFailed {
+            code: 403,
+            reason: "Forbidden".into(),
+        });
         assert!(fired.load(Ordering::Relaxed));
     }
 
