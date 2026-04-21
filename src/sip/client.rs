@@ -328,10 +328,16 @@ impl Client {
     }
 
     /// Builds a Via header value for outgoing requests. Appends `;rport`
-    /// (RFC 3581) when `cfg.nat` is enabled so responses return to the
-    /// source address the server actually observed.
+    /// (RFC 3581) when `cfg.nat` is enabled **and** the transport is UDP.
+    /// Per RFC 3581, `rport` is only meaningful for unreliable transports —
+    /// TCP and TLS do symmetric response routing implicitly via the existing
+    /// connection, so appending the parameter there is noise at best.
     pub(crate) fn build_via(&self, addr: SocketAddr, branch: &str) -> String {
-        let rport = if self.cfg.nat { ";rport" } else { "" };
+        let rport = if self.cfg.nat && self.via_transport == "UDP" {
+            ";rport"
+        } else {
+            ""
+        };
         format!(
             "SIP/2.0/{} {};branch={}{}",
             self.via_transport, addr, branch, rport
@@ -910,6 +916,46 @@ mod tests {
         assert!(
             via.contains(";branch="),
             "Via must retain branch parameter: {via}"
+        );
+        client.close();
+    }
+
+    #[test]
+    fn outgoing_via_omits_rport_on_tcp_even_when_nat_enabled() {
+        // Per RFC 3581, ;rport is only meaningful on unreliable transports.
+        // TCP/TLS do symmetric response routing over the existing connection,
+        // so we must not advertise ;rport even when Config.nat is true.
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let server_addr = listener.local_addr().unwrap();
+        // Spawn an accept loop so Client::new's TCP connect completes.
+        std::thread::spawn(move || {
+            let _ = listener.accept();
+            std::thread::sleep(Duration::from_secs(2));
+        });
+
+        let cfg = ClientConfig {
+            local_addr: "127.0.0.1:0".into(),
+            server_addr,
+            username: "1001".into(),
+            password: "test".into(),
+            domain: "pbx.local".into(),
+            transport: "tcp".into(),
+            nat: true, // opt-in, but must be ignored on TCP
+            ..Default::default()
+        };
+        let client = Client::new(cfg).unwrap();
+        assert_eq!(client.via_transport(), "TCP");
+
+        let req = client.build_request("REGISTER", "sip:pbx.local", None);
+        let via = req.header("Via");
+        assert!(
+            !via.contains(";rport"),
+            "TCP Via must never contain ;rport even with nat=true, got: {via}"
+        );
+        assert!(
+            via.contains("SIP/2.0/TCP"),
+            "Via transport must be TCP, got: {via}"
         );
         client.close();
     }

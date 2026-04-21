@@ -6,7 +6,8 @@ All notable changes to this project will be documented in this file.
 
 ### Added
 
-- **NAT-friendly Via (`;rport`, RFC 3581)** — `Config.nat` / `PhoneBuilder::with_nat(true)` appends `;rport` to outgoing SIP `Via` headers so the server sends responses back to the source IP/port it actually observed. Opt-in (default `false`); harmless on servers that don't understand the parameter. Covers every outbound request path (REGISTER, INVITE, ACK, BYE, SUBSCRIBE, MESSAGE, etc.) and the `TransactionManager` fallback. (xphone-go issue A)
+- **NAT-friendly Via (`;rport`, RFC 3581)** — `Config.nat` / `PhoneBuilder::with_nat(true)` appends `;rport` to outgoing SIP `Via` headers so the server sends responses back to the source IP/port it actually observed. Opt-in (default `false`); harmless on servers that don't understand the parameter. Covers every outbound request path (REGISTER, INVITE, ACK, BYE, SUBSCRIBE, MESSAGE, etc.) and the `TransactionManager` fallback. **Gated on UDP transport** per RFC 3581 — TCP/TLS already do symmetric response routing over the existing connection, so the parameter is ignored there. (xphone-go issue A / xphone-go PR #97 parity)
+- **`ServerConfig.nat` for trunk mode** — opt-in flag that appends `;rport` to trunk outbound Via headers (INVITE, in-dialog BYE/re-INVITE/REFER/INFO, 2xx ACK). Trunk servers are UDP-only by construction, so no transport gating. Default `false`.
 - **Separate digest auth username for REGISTER** — `Config.auth_username` / `PhoneBuilder::auth_username()` decouples the SIP AOR from the digest `username` parameter. The REGISTER Request-URI, From, To, and Contact still use `Config.username`; only the digest credentials switch to `auth_username`. Enables registering `sip:<aor>@host` while authenticating as a shared trunk auth-user. Falls back to `username` when unset (no behavior change for existing callers).
 
 ### Changed

@@ -49,11 +49,12 @@ pub struct Config {
     /// Interval for NAT keep-alive packets. `None` disables keep-alive.
     pub nat_keepalive_interval: Option<Duration>,
 
-    /// Enable NAT-friendly SIP transport behaviour. When `true`, outgoing
-    /// Via headers include the `;rport` parameter (RFC 3581) so the server
-    /// sends responses to the source IP/port the request actually arrived
-    /// from. Harmless on servers that don't understand it. Opt-in so
-    /// existing deployments see no change.
+    /// Enable NAT-friendly SIP transport behaviour. When `true` **and** the
+    /// transport is UDP, outgoing Via headers include the `;rport` parameter
+    /// (RFC 3581) so the server sends responses to the source IP/port the
+    /// request actually arrived from. Ignored on TCP/TLS where symmetric
+    /// response routing happens implicitly over the existing connection.
+    /// Opt-in so existing deployments see no change.
     pub nat: bool,
 
     /// Override the local IP advertised in SDP/Via/Contact.

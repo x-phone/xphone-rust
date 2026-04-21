@@ -14,6 +14,10 @@ pub struct ServerConfig {
     /// IP address advertised in SDP for RTP media. When the server listens on
     /// `0.0.0.0`, this must be set to the reachable IP (e.g. a container IP).
     pub rtp_address: Option<IpAddr>,
+    /// Append `;rport` (RFC 3581) to outgoing Via headers. Trunk servers are
+    /// UDP-only by construction, so unlike [`Config::nat`](crate::Config::nat)
+    /// this flag is not gated on transport. Opt-in; default `false`.
+    pub nat: bool,
 }
 
 impl Default for ServerConfig {
@@ -24,6 +28,7 @@ impl Default for ServerConfig {
             rtp_port_min: 0,
             rtp_port_max: 0,
             rtp_address: None,
+            nat: false,
         }
     }
 }
