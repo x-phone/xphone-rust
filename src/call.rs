@@ -73,8 +73,12 @@ impl Drop for VideoUpgradeRequest {
     }
 }
 
-/// Default codec preference order (payload types).
-const DEFAULT_CODEC_PREFS: &[i32] = &[8, 0, 9, 101, 111];
+/// RFC 4733 telephone-event payload type used for out-of-band DTMF.
+pub(crate) const PT_TELEPHONE_EVENT: i32 = 101;
+
+/// Default audio codec preference order (payload types): PCMA, PCMU, G.722,
+/// telephone-event (DTMF), Opus.
+pub(crate) const DEFAULT_CODEC_PREFS: &[i32] = &[8, 0, 9, PT_TELEPHONE_EVENT, 111];
 
 fn new_call_id() -> String {
     let mut buf = [0u8; 16];
@@ -214,6 +218,9 @@ struct CallInner {
     media_active: bool,
     /// DTMF transport mode for this call.
     dtmf_mode: crate::config::DtmfMode,
+    /// True when RFC 4733 telephone-event (PT 101) appears in both our codec
+    /// preferences and the remote's SDP. Set during codec negotiation.
+    telephone_event_negotiated: bool,
     /// Whether SRTP is enabled for this call.
     srtp_enabled: bool,
     /// Local SRTP keying material (base64 inline key).
@@ -281,6 +288,7 @@ impl Call {
                 codec: Codec::PCMU,
                 media_active: false,
                 dtmf_mode: crate::config::DtmfMode::Rfc4733,
+                telephone_event_negotiated: false,
                 srtp_enabled: false,
                 srtp_local_key: String::new(),
                 srtp_remote_key: String::new(),
@@ -334,6 +342,7 @@ impl Call {
                 codec: Codec::PCMU,
                 media_active: false,
                 dtmf_mode: crate::config::DtmfMode::Rfc4733,
+                telephone_event_negotiated: false,
                 srtp_enabled: false,
                 srtp_local_key: String::new(),
                 srtp_remote_key: String::new(),
@@ -607,18 +616,38 @@ impl Call {
     }
 
     fn negotiate_codec(inner: &mut CallInner, sess: &sdp::Session) {
-        // Audio codec negotiation.
-        let remote_codecs: &[i32] = sess
+        // Audio codec negotiation: exclude PT 101 (telephone-event) — it's not
+        // an audio codec, it's negotiated separately below for DTMF.
+        let remote_audio: Vec<i32> = sess
             .audio_media()
-            .map(|m| m.codecs.as_slice())
-            .unwrap_or(&[]);
-        let prefs = Self::resolve_codec_prefs(inner);
-        let pt = sdp::negotiate_codec(prefs, remote_codecs);
+            .map(|m| {
+                m.codecs
+                    .iter()
+                    .copied()
+                    .filter(|&p| p != PT_TELEPHONE_EVENT)
+                    .collect()
+            })
+            .unwrap_or_default();
+        let audio_prefs: Vec<i32> = Self::resolve_codec_prefs(inner)
+            .iter()
+            .copied()
+            .filter(|&p| p != PT_TELEPHONE_EVENT)
+            .collect();
+        let pt = sdp::negotiate_codec(&audio_prefs, &remote_audio);
         if pt >= 0 {
             if let Some(c) = Codec::from_payload_type(pt) {
                 inner.codec = c;
             }
         }
+
+        // Telephone-event (PT 101) negotiation — tracked separately for DTMF.
+        let remote_has_te = sess
+            .audio_media()
+            .map(|m| m.codecs.contains(&PT_TELEPHONE_EVENT))
+            .unwrap_or(false);
+        let local_has_te = Self::resolve_codec_prefs(inner).contains(&PT_TELEPHONE_EVENT);
+        inner.telephone_event_negotiated = remote_has_te && local_has_te;
+
         // Video codec negotiation (skip if remote rejected video with port 0).
         if let Some(vm) = sess.video_media() {
             if vm.port > 0 {
@@ -1113,11 +1142,15 @@ impl Call {
     /// Sends a DTMF digit (e.g., `"1"`, `"#"`, `"*"`).
     ///
     /// The transport method depends on the configured [`DtmfMode`](crate::config::DtmfMode):
-    /// - `Rfc4733` — RTP telephone-event packets (default)
-    /// - `SipInfo` — SIP INFO with `application/dtmf-relay` body
-    /// - `Both` — sends via RFC 4733
+    /// - `Rfc4733` — RFC 4733 RTP telephone-event packets (default). Returns
+    ///   [`Error::DtmfNotNegotiated`] if PT 101 was not negotiated with the
+    ///   remote.
+    /// - `SipInfo` — SIP INFO with `application/dtmf-relay` body (RFC 2976).
+    /// - `Both` — sends via RFC 4733 (when PT 101 was negotiated) **and** SIP
+    ///   INFO, in that order. Maximally compatible: if a middlebox strips one
+    ///   transport the other usually survives.
     pub fn send_dtmf(&self, digit: &str) -> Result<()> {
-        let (rtp_socket, remote_ip, remote_port, dtmf_mode) = {
+        let (rtp_socket, remote_ip, remote_port, dtmf_mode, te_negotiated) = {
             let inner = self.inner.lock();
             if inner.state != CallState::Active {
                 return Err(Error::InvalidState);
@@ -1127,6 +1160,7 @@ impl Call {
                 inner.remote_ip.clone(),
                 inner.remote_port,
                 inner.dtmf_mode,
+                inner.telephone_event_negotiated,
             )
         };
         if dtmf::digit_to_code(digit).is_none() {
@@ -1136,17 +1170,46 @@ impl Call {
             crate::config::DtmfMode::SipInfo => {
                 self.dlg.send_info_dtmf(digit, 160)?;
             }
-            crate::config::DtmfMode::Rfc4733 | crate::config::DtmfMode::Both => {
-                let pkts = dtmf::encode_dtmf(digit, 0, 0, 0)?;
-                if let Some(sock) = rtp_socket {
-                    if !remote_ip.is_empty() && remote_port > 0 {
-                        if let Ok(addr) =
-                            format!("{}:{}", remote_ip, remote_port).parse::<std::net::SocketAddr>()
-                        {
-                            for pkt in &pkts {
-                                let _ = sock.send_to(&pkt.to_bytes(), addr);
-                            }
-                        }
+            crate::config::DtmfMode::Rfc4733 => {
+                if !te_negotiated {
+                    return Err(Error::DtmfNotNegotiated);
+                }
+                Self::send_rfc4733_dtmf(digit, &rtp_socket, &remote_ip, remote_port)?;
+            }
+            crate::config::DtmfMode::Both => {
+                if te_negotiated {
+                    // Swallow RTP send errors so SIP INFO still fires — the
+                    // whole point of `Both` is that one transport surviving
+                    // masks the other failing.
+                    if let Err(e) =
+                        Self::send_rfc4733_dtmf(digit, &rtp_socket, &remote_ip, remote_port)
+                    {
+                        tracing::warn!(
+                            "RFC 4733 DTMF failed in Both mode: {}; SIP INFO will still fire",
+                            e
+                        );
+                    }
+                }
+                self.dlg.send_info_dtmf(digit, 160)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn send_rfc4733_dtmf(
+        digit: &str,
+        rtp_socket: &Option<Arc<UdpSocket>>,
+        remote_ip: &str,
+        remote_port: i32,
+    ) -> Result<()> {
+        let pkts = dtmf::encode_dtmf(digit, 0, 0, 0)?;
+        if let Some(sock) = rtp_socket {
+            if !remote_ip.is_empty() && remote_port > 0 {
+                if let Ok(addr) =
+                    format!("{}:{}", remote_ip, remote_port).parse::<std::net::SocketAddr>()
+                {
+                    for pkt in &pkts {
+                        let _ = sock.send_to(&pkt.to_bytes(), addr);
                     }
                 }
             }
@@ -1588,12 +1651,25 @@ impl Call {
             if let Some(m) = sess.audio_media() {
                 inner.remote_port = m.port;
             }
-            let remote_audio: &[i32] = sess
+            // Exclude PT 101 (telephone-event) when picking the audio codec —
+            // matches the filter in `negotiate_codec` so both negotiation
+            // sites pick a real media codec, never telephone-event.
+            let remote_audio: Vec<i32> = sess
                 .audio_media()
-                .map(|m| m.codecs.as_slice())
-                .unwrap_or(&[]);
-            let prefs_for_negotiate = Self::resolve_codec_prefs(&inner);
-            let pt = sdp::negotiate_codec(prefs_for_negotiate, remote_audio);
+                .map(|m| {
+                    m.codecs
+                        .iter()
+                        .copied()
+                        .filter(|&p| p != PT_TELEPHONE_EVENT)
+                        .collect()
+                })
+                .unwrap_or_default();
+            let audio_prefs: Vec<i32> = Self::resolve_codec_prefs(&inner)
+                .iter()
+                .copied()
+                .filter(|&p| p != PT_TELEPHONE_EVENT)
+                .collect();
+            let pt = sdp::negotiate_codec(&audio_prefs, &remote_audio);
             if pt >= 0 {
                 if let Some(c) = Codec::from_payload_type(pt) {
                     inner.codec = c;
@@ -2896,15 +2972,86 @@ mod tests {
     }
 
     #[test]
-    fn send_dtmf_both_mode_uses_rfc4733() {
-        // Both mode should use RFC 4733 (RTP), not SIP INFO.
+    fn send_dtmf_both_mode_always_sends_sip_info() {
+        // Both mode sends SIP INFO unconditionally (for remotes that strip
+        // RFC 4733 RTP). RFC 4733 RTP is also sent when PT 101 was negotiated,
+        // but with no remote SDP set there's no negotiation → only SIP INFO.
         let dlg = Arc::new(crate::mock::dialog::MockDialog::new());
         let call = Call::new_inbound(Arc::clone(&dlg) as Arc<dyn Dialog>);
         call.set_dtmf_mode(crate::config::DtmfMode::Both);
         call.accept().unwrap();
-        // Without an RTP socket it will fail, but it should NOT use SIP INFO.
-        let _ = call.send_dtmf("1");
-        assert!(dlg.info_dtmf_sent().is_empty());
+        call.send_dtmf("1").unwrap();
+        let sent = dlg.info_dtmf_sent();
+        assert_eq!(sent.len(), 1);
+        assert_eq!(sent[0].0, "1");
+    }
+
+    #[test]
+    fn send_dtmf_rfc4733_without_negotiation_errors() {
+        // In Rfc4733 mode, sending DTMF before PT 101 is negotiated must
+        // surface Error::DtmfNotNegotiated — not silently drop the digit.
+        let call = Call::new_inbound(mock_dlg());
+        call.set_dtmf_mode(crate::config::DtmfMode::Rfc4733);
+        call.accept().unwrap();
+        match call.send_dtmf("1") {
+            Err(Error::DtmfNotNegotiated) => {}
+            other => panic!("expected DtmfNotNegotiated, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn send_dtmf_rfc4733_outbound_without_negotiation_errors() {
+        // Outbound path: the common integration-test shape is
+        // `new_outbound → simulate_response(200)` without the caller ever
+        // wiring up remote SDP. `send_dtmf` in Rfc4733 mode must still surface
+        // DtmfNotNegotiated rather than silently no-op.
+        let call = Call::new_outbound(mock_dlg(), DialOptions::default());
+        call.set_dtmf_mode(crate::config::DtmfMode::Rfc4733);
+        call.simulate_response(200, "OK");
+        match call.send_dtmf("1") {
+            Err(Error::DtmfNotNegotiated) => {}
+            other => panic!("expected DtmfNotNegotiated, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn send_dtmf_rfc4733_after_negotiation_succeeds() {
+        // When the remote SDP advertises PT 101, Rfc4733 DTMF should succeed
+        // (the call won't actually send on the wire without a real socket,
+        // but send_dtmf returns Ok).
+        let call = Call::new_inbound(mock_dlg());
+        call.set_dtmf_mode(crate::config::DtmfMode::Rfc4733);
+        call.accept().unwrap();
+        let remote_sdp = "v=0\r\n\
+            o=- 0 0 IN IP4 127.0.0.1\r\n\
+            s=-\r\n\
+            c=IN IP4 127.0.0.1\r\n\
+            t=0 0\r\n\
+            m=audio 4000 RTP/AVP 0 101\r\n\
+            a=rtpmap:0 PCMU/8000\r\n\
+            a=rtpmap:101 telephone-event/8000\r\n";
+        call.set_remote_sdp(remote_sdp);
+        call.send_dtmf("1").unwrap();
+    }
+
+    #[test]
+    fn send_dtmf_both_mode_after_negotiation_sends_both() {
+        // With PT 101 negotiated, Both mode sends RFC 4733 RTP **and** SIP INFO.
+        let dlg = Arc::new(crate::mock::dialog::MockDialog::new());
+        let call = Call::new_inbound(Arc::clone(&dlg) as Arc<dyn Dialog>);
+        call.set_dtmf_mode(crate::config::DtmfMode::Both);
+        call.accept().unwrap();
+        let remote_sdp = "v=0\r\n\
+            o=- 0 0 IN IP4 127.0.0.1\r\n\
+            s=-\r\n\
+            c=IN IP4 127.0.0.1\r\n\
+            t=0 0\r\n\
+            m=audio 4000 RTP/AVP 0 101\r\n\
+            a=rtpmap:0 PCMU/8000\r\n\
+            a=rtpmap:101 telephone-event/8000\r\n";
+        call.set_remote_sdp(remote_sdp);
+        call.send_dtmf("1").unwrap();
+        assert_eq!(dlg.info_dtmf_sent().len(), 1);
     }
 
     #[test]

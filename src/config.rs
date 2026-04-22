@@ -57,8 +57,11 @@ pub struct Config {
     /// Opt-in so existing deployments see no change.
     pub nat: bool,
 
-    /// Override the local IP advertised in SDP/Via/Contact.
-    /// If empty, the address is auto-detected.
+    /// Override the local IP advertised in the SDP `c=` line. If empty, the
+    /// address is auto-detected. Scope is SDP-only — `Contact` and `Via` stay
+    /// anchored to the bound SIP socket. See
+    /// [`DialOptions::rtp_address`](crate::config::DialOptions::rtp_address)
+    /// for a per-call override and for the rationale.
     pub local_ip: String,
     /// Minimum port in the RTP port range (0 = OS-assigned).
     ///
@@ -435,6 +438,22 @@ pub struct DialOptions {
     /// Video codecs in preference order. Defaults to `[H264, VP8]` when
     /// `video` is enabled. Only used when `video` is `true`.
     pub video_codecs: Vec<VideoCodec>,
+    /// Override the local IP advertised in SDP (the `c=` line) for this call
+    /// only. Takes precedence over [`Config::local_ip`](Config::local_ip).
+    /// Useful on multi-homed hosts when individual calls need different
+    /// source-routable media addresses. `None` falls through to
+    /// `Config::local_ip` → STUN-mapped address → route-lookup heuristic.
+    ///
+    /// **Scope is intentionally SDP-only.** This does **not** modify the SIP
+    /// `Contact` header or `Via` — those stay anchored to the socket the SIP
+    /// client actually bound. Rewriting Contact with a routable-looking IP but
+    /// the ephemeral bound SIP port breaks inbound signaling behind NAT: the
+    /// port isn't forwarded, so registrars that trust a plausible-looking
+    /// Contact over their own NAT learning (rport / `received` on REGISTER,
+    /// keepalives) send INVITEs into the void. xphone-go's `WithRTPAddress`
+    /// conflated these scopes and tripped exactly this failure in
+    /// Docker-bridge deployments — keeping the scope SDP-only avoids it.
+    pub rtp_address: Option<String>,
 }
 
 impl Default for DialOptions {
@@ -448,6 +467,7 @@ impl Default for DialOptions {
             auth: None,
             video: false,
             video_codecs: Vec::new(),
+            rtp_address: None,
         }
     }
 }
@@ -518,6 +538,12 @@ impl DialOptionsBuilder {
     /// Sets the preferred video codecs (default: `[H264, VP8]`).
     pub fn video_codecs(mut self, codecs: Vec<VideoCodec>) -> Self {
         self.opts.video_codecs = codecs;
+        self
+    }
+
+    /// Overrides the local IP advertised in SDP for this call only.
+    pub fn rtp_address(mut self, ip: &str) -> Self {
+        self.opts.rtp_address = Some(ip.into());
         self
     }
 

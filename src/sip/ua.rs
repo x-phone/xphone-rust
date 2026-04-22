@@ -80,6 +80,12 @@ impl SipUA {
         });
 
         let client_cfg = ClientConfig {
+            // Intentionally NOT plumbed from `Config::local_ip` / any
+            // `rtp_address` override. Contact/Via must stay on the socket the
+            // OS actually bound; media-side overrides (SDP `c=`) happen at
+            // SDP build time, not here. Plumbing a user-supplied IP here
+            // would rewrite Contact with the ephemeral bound SIP port (not
+            // NAT-forwarded), silently breaking inbound signaling behind NAT.
             local_addr: "0.0.0.0:0".into(),
             server_addr,
             username: cfg.username.clone(),
