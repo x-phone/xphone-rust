@@ -304,14 +304,43 @@ impl Phone {
         };
 
         // Allocate RTP port and build SDP offer.
-        // Use STUN-mapped IP from transport if available.
-        let local_ip = if !self.cfg.local_ip.is_empty() {
+        // Precedence: DialOptions::rtp_address → Config::local_ip → STUN-mapped
+        // advertised address → route-lookup heuristic.
+        let local_ip = if let Some(ref addr) = opts.rtp_address {
+            addr.clone()
+        } else if !self.cfg.local_ip.is_empty() {
             self.cfg.local_ip.clone()
         } else if let Some(addr) = tr.advertised_addr() {
             addr.ip().to_string()
         } else {
             local_ip_for(&self.cfg.host)
         };
+
+        // Resolve audio codec list: DialOptions::codec_override →
+        // Config::codec_prefs → DEFAULT_CODEC_PREFS. Auto-inject PT 101 when
+        // DTMF mode is Rfc4733 or Both so the remote knows we accept RFC 4733
+        // digits.
+        let mut audio_codecs: Vec<i32> = if !opts.codec_override.is_empty() {
+            opts.codec_override
+                .iter()
+                .map(|c| c.payload_type())
+                .collect()
+        } else if !self.cfg.codec_prefs.is_empty() {
+            self.cfg
+                .codec_prefs
+                .iter()
+                .map(|c| c.payload_type())
+                .collect()
+        } else {
+            crate::call::DEFAULT_CODEC_PREFS.to_vec()
+        };
+        if matches!(
+            self.cfg.dtmf_mode,
+            crate::config::DtmfMode::Rfc4733 | crate::config::DtmfMode::Both
+        ) && !audio_codecs.contains(&crate::call::PT_TELEPHONE_EVENT)
+        {
+            audio_codecs.push(crate::call::PT_TELEPHONE_EVENT);
+        }
         let (rtp_socket, rtp_port) = {
             let (sock, port) =
                 crate::media::listen_rtp_port(self.cfg.rtp_port_min, self.cfg.rtp_port_max)?;
@@ -355,7 +384,7 @@ impl Phone {
                 (Some(audio_key), Some(video_key)) => crate::sdp::build_offer_video_srtp(
                     &local_ip,
                     rtp_port,
-                    &[8, 0, 9, 101],
+                    &audio_codecs,
                     video_rtp_port,
                     &video_codecs,
                     crate::sdp::DIR_SEND_RECV,
@@ -365,7 +394,7 @@ impl Phone {
                 _ => crate::sdp::build_offer_video(
                     &local_ip,
                     rtp_port,
-                    &[8, 0, 9, 101],
+                    &audio_codecs,
                     video_rtp_port,
                     &video_codecs,
                     crate::sdp::DIR_SEND_RECV,
@@ -375,7 +404,7 @@ impl Phone {
             crate::sdp::build_offer_srtp(
                 &local_ip,
                 rtp_port,
-                &[8, 0, 9, 101],
+                &audio_codecs,
                 crate::sdp::DIR_SEND_RECV,
                 key,
             )
@@ -383,7 +412,7 @@ impl Phone {
             crate::sdp::build_offer(
                 &local_ip,
                 rtp_port,
-                &[8, 0, 9, 101],
+                &audio_codecs,
                 crate::sdp::DIR_SEND_RECV,
             )
         };
@@ -1261,6 +1290,113 @@ mod tests {
         assert!(
             sdp.contains("c=IN IP4 10.0.0.99"),
             "SDP should use explicit local_ip over STUN, got: {}",
+            sdp
+        );
+    }
+
+    #[test]
+    fn dial_rtp_address_overrides_config_local_ip() {
+        let tr = Arc::new(MockTransport::new());
+        tr.respond_with(200, "OK"); // REGISTER
+
+        let mut cfg = test_cfg();
+        cfg.local_ip = "10.0.0.99".into();
+        let phone = Phone::new(cfg);
+        phone.connect_with_transport(Arc::clone(&tr) as Arc<dyn SipTransport>);
+
+        tr.respond_with(200, "OK"); // INVITE
+        let opts = crate::config::DialOptionsBuilder::new()
+            .rtp_address("192.168.1.50")
+            .build();
+        let call = phone.dial("sip:1002@pbx.local", opts).unwrap();
+
+        let sdp = call.local_sdp();
+        assert!(
+            sdp.contains("c=IN IP4 192.168.1.50"),
+            "DialOptions::rtp_address should win over Config::local_ip, got: {}",
+            sdp
+        );
+    }
+
+    #[test]
+    fn dial_codec_override_appears_in_sdp() {
+        let tr = Arc::new(MockTransport::new());
+        tr.respond_with(200, "OK"); // REGISTER
+
+        let phone = Phone::new(test_cfg());
+        phone.connect_with_transport(Arc::clone(&tr) as Arc<dyn SipTransport>);
+
+        tr.respond_with(200, "OK"); // INVITE
+        let opts = crate::config::DialOptionsBuilder::new()
+            .codec_override(vec![crate::types::Codec::G722])
+            .build();
+        let call = phone.dial("sip:1002@pbx.local", opts).unwrap();
+
+        // G.722 must be offered; PCMU/PCMA must NOT be (override narrowed).
+        // PT 101 is still auto-injected because DtmfMode defaults to Rfc4733.
+        let sdp = call.local_sdp();
+        let audio_line = sdp.lines().find(|l| l.starts_with("m=audio")).unwrap_or("");
+        assert!(
+            audio_line.contains(" 9 ") || audio_line.ends_with(" 9"),
+            "G.722 (PT 9) should be in m=audio, got: {}",
+            audio_line
+        );
+        assert!(
+            !audio_line.contains(" 0 ") && !audio_line.ends_with(" 0"),
+            "PCMU (PT 0) must not appear when override excludes it, got: {}",
+            audio_line
+        );
+        assert!(
+            audio_line.contains(" 101 ") || audio_line.ends_with(" 101"),
+            "PT 101 should be auto-injected for default Rfc4733 DTMF, got: {}",
+            audio_line
+        );
+    }
+
+    #[test]
+    fn dial_auto_injects_pt_101_when_rfc4733() {
+        let tr = Arc::new(MockTransport::new());
+        tr.respond_with(200, "OK"); // REGISTER
+
+        let mut cfg = test_cfg();
+        cfg.codec_prefs = vec![crate::types::Codec::PCMU];
+        cfg.dtmf_mode = crate::config::DtmfMode::Rfc4733;
+        let phone = Phone::new(cfg);
+        phone.connect_with_transport(Arc::clone(&tr) as Arc<dyn SipTransport>);
+
+        tr.respond_with(200, "OK"); // INVITE
+        let call = phone
+            .dial("sip:1002@pbx.local", DialOptions::default())
+            .unwrap();
+
+        let sdp = call.local_sdp();
+        assert!(
+            sdp.contains("a=rtpmap:101 telephone-event"),
+            "PT 101 should be auto-injected when DtmfMode is Rfc4733, got: {}",
+            sdp
+        );
+    }
+
+    #[test]
+    fn dial_does_not_inject_pt_101_for_sip_info_mode() {
+        let tr = Arc::new(MockTransport::new());
+        tr.respond_with(200, "OK"); // REGISTER
+
+        let mut cfg = test_cfg();
+        cfg.codec_prefs = vec![crate::types::Codec::PCMU];
+        cfg.dtmf_mode = crate::config::DtmfMode::SipInfo;
+        let phone = Phone::new(cfg);
+        phone.connect_with_transport(Arc::clone(&tr) as Arc<dyn SipTransport>);
+
+        tr.respond_with(200, "OK"); // INVITE
+        let call = phone
+            .dial("sip:1002@pbx.local", DialOptions::default())
+            .unwrap();
+
+        let sdp = call.local_sdp();
+        assert!(
+            !sdp.contains("telephone-event"),
+            "PT 101 should NOT be injected when DtmfMode is SipInfo, got: {}",
             sdp
         );
     }

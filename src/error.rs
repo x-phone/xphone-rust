@@ -35,6 +35,12 @@ pub enum Error {
     /// The supplied character is not a valid DTMF digit (0-9, *, #, A-D).
     #[error("xphone: invalid DTMF digit")]
     InvalidDtmfDigit,
+    /// `send_dtmf` called in [`DtmfMode::Rfc4733`](crate::config::DtmfMode)
+    /// but RFC 4733 telephone-event (PT 101) was not negotiated with the
+    /// remote. Switch to [`DtmfMode::SipInfo`](crate::config::DtmfMode) or
+    /// [`DtmfMode::Both`](crate::config::DtmfMode) to fall back to SIP INFO.
+    #[error("xphone: RFC 4733 DTMF not negotiated with remote")]
+    DtmfNotNegotiated,
     /// Mute was requested but the call is already muted.
     #[error("xphone: already muted")]
     AlreadyMuted,

@@ -435,6 +435,12 @@ pub struct DialOptions {
     /// Video codecs in preference order. Defaults to `[H264, VP8]` when
     /// `video` is enabled. Only used when `video` is `true`.
     pub video_codecs: Vec<VideoCodec>,
+    /// Override the local IP advertised in SDP for this call only.
+    /// Takes precedence over [`Config::local_ip`](Config::local_ip). Useful on
+    /// multi-homed hosts when individual calls need different source-routable
+    /// addresses. `None` falls through to `Config::local_ip` → STUN-mapped
+    /// address → route-lookup heuristic.
+    pub rtp_address: Option<String>,
 }
 
 impl Default for DialOptions {
@@ -448,6 +454,7 @@ impl Default for DialOptions {
             auth: None,
             video: false,
             video_codecs: Vec::new(),
+            rtp_address: None,
         }
     }
 }
@@ -518,6 +525,12 @@ impl DialOptionsBuilder {
     /// Sets the preferred video codecs (default: `[H264, VP8]`).
     pub fn video_codecs(mut self, codecs: Vec<VideoCodec>) -> Self {
         self.opts.video_codecs = codecs;
+        self
+    }
+
+    /// Overrides the local IP advertised in SDP for this call only.
+    pub fn rtp_address(mut self, ip: &str) -> Self {
+        self.opts.rtp_address = Some(ip.into());
         self
     }
 

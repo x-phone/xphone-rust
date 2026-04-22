@@ -457,6 +457,9 @@ pub enum Codec {
     G722 = 9,
     /// G.729 (payload type 18).
     G729 = 18,
+    /// RFC 4733 telephone-event / DTMF (payload type 101). Not a media codec;
+    /// advertise it alongside audio codecs to negotiate out-of-band DTMF.
+    TelephoneEvent = 101,
     /// Opus (payload type 111).
     Opus = 111,
 }
@@ -474,6 +477,7 @@ impl Codec {
             8 => Some(Codec::PCMA),
             9 => Some(Codec::G722),
             18 => Some(Codec::G729),
+            101 => Some(Codec::TelephoneEvent),
             111 => Some(Codec::Opus),
             _ => None,
         }
@@ -487,6 +491,7 @@ impl fmt::Display for Codec {
             Codec::PCMA => write!(f, "PCMA"),
             Codec::G722 => write!(f, "G722"),
             Codec::G729 => write!(f, "G729"),
+            Codec::TelephoneEvent => write!(f, "telephone-event"),
             Codec::Opus => write!(f, "Opus"),
         }
     }

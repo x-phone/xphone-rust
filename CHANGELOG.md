@@ -4,6 +4,18 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+### Added
+
+- **`Codec::TelephoneEvent`** (PT 101) exported from `crate::types`. Previously PT 101 was hardcoded in SDP offers but not representable through the public `Codec` enum — callers could not include it via `DialOptions::codec_override`. (xphone-rust#63)
+- **`DialOptions::rtp_address`** / **`DialOptionsBuilder::rtp_address()`** — per-call override of the local IP advertised in SDP. Takes precedence over `Config::local_ip`. Useful on multi-homed hosts when individual calls need different source-routable addresses. Resolution order: `DialOptions::rtp_address` → `Config::local_ip` → STUN-mapped address → route-lookup heuristic. (xphone-rust#65)
+
+### Changed
+
+- **`DialOptions::codec_override` is now actually honoured.** Previously the field existed and the builder accepted it, but `Phone::dial()` ignored it and built the SDP offer from a hardcoded `[8, 0, 9, 101]` list. Now the offer is resolved in order: `DialOptions::codec_override` → `Config::codec_prefs` → `[8, 0, 9, 101]`. (xphone-rust#63)
+- **DTMF PT 101 is auto-injected into outbound SDP** when `DtmfMode` is `Rfc4733` or `Both` and the resolved codec list doesn't already include it. Skipped for `SipInfo` (telephone-event isn't used there). Removes the common \"I set my own codecs and now DTMF doesn't work\" foot-gun. (xphone-rust#63)
+- **BREAKING: `Call::send_dtmf` now returns `Err(Error::DtmfNotNegotiated)`** in `DtmfMode::Rfc4733` when PT 101 was not negotiated with the remote, instead of silently writing RTP packets into the void. Add a match arm to catch this error, or switch to `DtmfMode::Both` for automatic SIP INFO fallback. (xphone-rust#63)
+- **BREAKING: `DtmfMode::Both` now actually sends both transports** — RFC 4733 RTP (when negotiated) **and** SIP INFO on every digit. Previously `Both` was a misnomer: it sent RTP only and merely *accepted* SIP INFO on inbound. Matches pjsua / FreeSWITCH / Asterisk convention and makes middlebox-stripped DTMF self-healing. Well-behaved remotes may now double-report digits in `Both` mode — switch to `Rfc4733` or `SipInfo` if single-transport is required. (xphone-rust#64)
+
 ## [0.5.0] - 2026-04-22
 
 ### Added
