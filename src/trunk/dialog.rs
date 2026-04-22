@@ -40,6 +40,8 @@ pub struct TrunkDialog {
     tx: mpsc::Sender<SipOutgoing>,
     remote_addr: SocketAddr,
     local_addr: SocketAddr,
+    /// Append `;rport` (RFC 3581) to outgoing Via headers (trunk is UDP-only).
+    nat: bool,
     sip_call_id: String,
     remote_tag: Mutex<String>,
     /// Pre-computed From header with local tag appended.
@@ -66,6 +68,7 @@ impl TrunkDialog {
         remote_addr: SocketAddr,
         invite: &Message,
         local_tag: String,
+        nat: bool,
     ) -> Self {
         // Build headers map (lowercase keys for case-insensitive lookup).
         let mut headers = HashMap::with_capacity(6);
@@ -103,6 +106,7 @@ impl TrunkDialog {
             tx,
             remote_addr,
             local_addr,
+            nat,
             sip_call_id: invite.header("Call-ID").to_string(),
             remote_tag: Mutex::new(String::new()),
             local_from_tagged,
@@ -121,6 +125,7 @@ impl TrunkDialog {
     }
 
     /// Create a UAC dialog for an outbound call to a peer.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new_outbound(
         tx: mpsc::Sender<SipOutgoing>,
         local_addr: SocketAddr,
@@ -129,6 +134,7 @@ impl TrunkDialog {
         local_tag: String,
         from_header: String,
         to_header: String,
+        nat: bool,
     ) -> Self {
         let contact_uri = format!("sip:{}@{}", extract_uri(&to_header), remote_addr);
 
@@ -149,6 +155,7 @@ impl TrunkDialog {
             tx,
             remote_addr,
             local_addr,
+            nat,
             sip_call_id,
             remote_tag: Mutex::new(String::new()),
             local_from_tagged,
@@ -221,9 +228,10 @@ impl TrunkDialog {
             contact_uri
         };
         let mut req = Message::new_request(method, &request_uri);
+        let rport = if self.nat { ";rport" } else { "" };
         req.set_header(
             "Via",
-            &format!("SIP/2.0/UDP {};branch={}", self.local_addr, branch),
+            &format!("SIP/2.0/UDP {};branch={}{}", self.local_addr, branch, rport),
         );
 
         let remote_tag = self.remote_tag.lock().clone();
@@ -362,6 +370,7 @@ mod tests {
             "10.0.0.1:5060".parse().unwrap(),
             &invite,
             "localtag123".into(),
+            false,
         );
         (dialog, rx)
     }
@@ -376,6 +385,7 @@ mod tests {
             "uactag456".into(),
             "<sip:1001@127.0.0.1:5080>".into(),
             "<sip:1002@10.0.0.1:5060>".into(),
+            false,
         );
         (dialog, rx)
     }
@@ -421,6 +431,7 @@ mod tests {
             "10.0.0.1:5060".parse().unwrap(),
             &invite,
             "localtag123".into(),
+            false,
         );
         dialog.respond(200, "OK", b"v=0\r\n").unwrap();
 

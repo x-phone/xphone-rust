@@ -123,7 +123,10 @@ impl TransactionManager {
         let mut branch = req.via_branch().to_string();
         if branch.is_empty() {
             branch = generate_branch();
-            let rport = if self.nat.load(std::sync::atomic::Ordering::Relaxed) {
+            // Per RFC 3581, ;rport is only meaningful on unreliable transports.
+            let rport = if self.nat.load(std::sync::atomic::Ordering::Relaxed)
+                && self.transport_name == "UDP"
+            {
                 ";rport"
             } else {
                 ""

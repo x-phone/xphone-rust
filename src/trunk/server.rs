@@ -252,6 +252,7 @@ impl Server {
             local_tag.clone(),
             from_header,
             to_header,
+            self.config.nat,
         ));
 
         let call = Call::new_outbound(dialog.clone(), DialOptions::default());
@@ -296,6 +297,7 @@ impl Server {
             from,
             to,
             sdp: &sdp,
+            nat: self.config.nat,
         });
 
         Ok(call)
@@ -607,6 +609,7 @@ impl Server {
             remote_addr,
             invite,
             local_tag,
+            self.config.nat,
         ));
 
         let call = Call::new_inbound(dialog.clone());
@@ -744,7 +747,7 @@ impl Server {
                     }
                 }
                 call.simulate_response(200, "OK");
-                send_ack(sip_tx, msg, &sip_call_id, local_addr);
+                send_ack(sip_tx, msg, &sip_call_id, local_addr, self.config.nat);
             }
             _ => {
                 warn!("outbound call {sip_call_id} rejected with {code}");
@@ -894,6 +897,7 @@ fn send_ack(
     ok_response: &Message,
     sip_call_id: &str,
     local_addr: SocketAddr,
+    nat: bool,
 ) {
     let contact = ok_response.header("Contact");
     let request_uri = if !contact.is_empty() {
@@ -908,7 +912,11 @@ fn send_ack(
 
     let branch = generate_branch();
     let mut ack = Message::new_request("ACK", &request_uri);
-    ack.set_header("Via", &format!("SIP/2.0/UDP {local_addr};branch={branch}"));
+    let rport = if nat { ";rport" } else { "" };
+    ack.set_header(
+        "Via",
+        &format!("SIP/2.0/UDP {local_addr};branch={branch}{rport}"),
+    );
     ack.set_header("From", ok_response.header("From"));
     ack.set_header("To", ok_response.header("To"));
     ack.set_header("Call-ID", sip_call_id);
@@ -939,6 +947,7 @@ struct BuildInviteParams<'a> {
     from: &'a str,
     to: &'a str,
     sdp: &'a str,
+    nat: bool,
 }
 
 fn build_and_send_invite(params: &BuildInviteParams<'_>) {
@@ -946,9 +955,10 @@ fn build_and_send_invite(params: &BuildInviteParams<'_>) {
     let request_uri = format!("sip:{}@{}", params.to, params.remote_addr);
 
     let mut invite = Message::new_request("INVITE", &request_uri);
+    let rport = if params.nat { ";rport" } else { "" };
     invite.set_header(
         "Via",
-        &format!("SIP/2.0/UDP {};branch={branch}", params.local_addr),
+        &format!("SIP/2.0/UDP {};branch={branch}{rport}", params.local_addr),
     );
     invite.set_header(
         "From",
@@ -1137,6 +1147,7 @@ mod tests {
             &ok_resp,
             "ack-test@xphone",
             "127.0.0.1:5080".parse().unwrap(),
+            false,
         );
 
         let outgoing = rx.try_recv().unwrap();
@@ -1167,6 +1178,7 @@ mod tests {
             &ok_resp,
             "ack-test@xphone",
             "127.0.0.1:5080".parse().unwrap(),
+            false,
         );
 
         let outgoing = rx.try_recv().unwrap();
@@ -1208,6 +1220,7 @@ mod tests {
             from: "1001",
             to: "1002",
             sdp: "v=0\r\n",
+            nat: false,
         });
 
         let outgoing = rx.try_recv().unwrap();
@@ -1226,6 +1239,45 @@ mod tests {
             outgoing.addr,
             "10.0.0.1:5060".parse::<SocketAddr>().unwrap()
         );
+        // Default nat=false must not advertise ;rport.
+        assert!(
+            !msg.header("Via").contains(";rport"),
+            "default Via must not contain ;rport, got: {}",
+            msg.header("Via")
+        );
+    }
+
+    #[test]
+    fn outbound_invite_advertises_rport_when_nat_enabled() {
+        let (tx, mut rx) = mpsc::channel(64);
+        build_and_send_invite(&BuildInviteParams {
+            sip_tx: &tx,
+            local_addr: "127.0.0.1:5080".parse().unwrap(),
+            remote_addr: "10.0.0.1:5060".parse().unwrap(),
+            sip_call_id: "nat-test@xphone",
+            local_tag: "localtag1",
+            from: "1001",
+            to: "1002",
+            sdp: "v=0\r\n",
+            nat: true,
+        });
+
+        let outgoing = rx.try_recv().unwrap();
+        let msg = message::parse(&outgoing.data).unwrap();
+        let via = msg.header("Via");
+        assert!(
+            via.contains(";rport"),
+            "nat=true trunk Via must contain ;rport, got: {via}"
+        );
+        assert!(
+            via.contains(";branch="),
+            "Via must retain branch parameter: {via}"
+        );
+    }
+
+    #[test]
+    fn server_config_nat_defaults_to_false() {
+        assert!(!ServerConfig::default().nat);
     }
 
     #[test]
