@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.5.0] - 2026-04-22
+
 ### Added
 
 - **NAT-friendly Via (`;rport`, RFC 3581)** — `Config.nat` / `PhoneBuilder::with_nat(true)` appends `;rport` to outgoing SIP `Via` headers so the server sends responses back to the source IP/port it actually observed. Opt-in (default `false`); harmless on servers that don't understand the parameter. Covers every outbound request path (REGISTER, INVITE, ACK, BYE, SUBSCRIBE, MESSAGE, etc.) and the `TransactionManager` fallback. **Gated on UDP transport** per RFC 3581 — TCP/TLS already do symmetric response routing over the existing connection, so the parameter is ignored there. (xphone-go issue A / xphone-go PR #97 parity)
