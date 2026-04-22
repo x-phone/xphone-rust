@@ -57,8 +57,11 @@ pub struct Config {
     /// Opt-in so existing deployments see no change.
     pub nat: bool,
 
-    /// Override the local IP advertised in SDP/Via/Contact.
-    /// If empty, the address is auto-detected.
+    /// Override the local IP advertised in the SDP `c=` line. If empty, the
+    /// address is auto-detected. Scope is SDP-only — `Contact` and `Via` stay
+    /// anchored to the bound SIP socket. See
+    /// [`DialOptions::rtp_address`](crate::config::DialOptions::rtp_address)
+    /// for a per-call override and for the rationale.
     pub local_ip: String,
     /// Minimum port in the RTP port range (0 = OS-assigned).
     ///
@@ -442,13 +445,14 @@ pub struct DialOptions {
     /// `Config::local_ip` → STUN-mapped address → route-lookup heuristic.
     ///
     /// **Scope is intentionally SDP-only.** This does **not** modify the SIP
-    /// `Contact` header or `Via` — those stay on the socket the SIP client
-    /// actually bound. Overriding Contact would break REGISTER-behind-NAT in
-    /// Docker-bridge setups, where the SIP port is ephemeral and not
-    /// port-forwarded, so the REGISTER `rport` source-address fallback is the
-    /// only way inbound INVITEs find you. (See xphone-go `WithRTPAddress`
-    /// incident — that option conflated media and signaling scopes and broke
-    /// exactly this scenario.)
+    /// `Contact` header or `Via` — those stay anchored to the socket the SIP
+    /// client actually bound. Rewriting Contact with a routable-looking IP but
+    /// the ephemeral bound SIP port breaks inbound signaling behind NAT: the
+    /// port isn't forwarded, so registrars that trust a plausible-looking
+    /// Contact over their own NAT learning (rport / `received` on REGISTER,
+    /// keepalives) send INVITEs into the void. xphone-go's `WithRTPAddress`
+    /// conflated these scopes and tripped exactly this failure in
+    /// Docker-bridge deployments — keeping the scope SDP-only avoids it.
     pub rtp_address: Option<String>,
 }
 

@@ -7,7 +7,7 @@ All notable changes to this project will be documented in this file.
 ### Added
 
 - **`Codec::TelephoneEvent`** (PT 101) exported from `crate::types`. Previously PT 101 was hardcoded in SDP offers but not representable through the public `Codec` enum — callers could not include it via `DialOptions::codec_override`. (xphone-rust#63)
-- **`DialOptions::rtp_address`** / **`DialOptionsBuilder::rtp_address()`** — per-call override of the local IP advertised in the SDP `c=` line. Takes precedence over `Config::local_ip`. Useful on multi-homed hosts when individual calls need different source-routable media addresses. Resolution order: `DialOptions::rtp_address` → `Config::local_ip` → STUN-mapped address → route-lookup heuristic. **Scope is intentionally SDP-only** — does not modify `Contact`/`Via`, which stay anchored to the bound SIP socket so REGISTER-behind-NAT keeps working (xphone-go's `WithRTPAddress` conflated these scopes and broke Docker-bridge deployments). (xphone-rust#65)
+- **`DialOptions::rtp_address`** / **`DialOptionsBuilder::rtp_address()`** — per-call override of the local IP advertised in the SDP `c=` line. Takes precedence over `Config::local_ip`. Useful on multi-homed hosts when individual calls need different source-routable media addresses. Resolution order: `DialOptions::rtp_address` → `Config::local_ip` → STUN-mapped address → route-lookup heuristic. **Scope is intentionally SDP-only** — does not modify `Contact`/`Via`, so registrar NAT learning (rport / `received` on REGISTER, keepalives) continues to route inbound signaling correctly in Docker-bridge and other asymmetric-port setups. (xphone-rust#65)
 
 ### Changed
 
