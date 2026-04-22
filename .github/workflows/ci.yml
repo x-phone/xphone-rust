@@ -19,12 +19,21 @@ jobs:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
-      - name: Check CHANGELOG.md was updated
+      - name: Check CHANGELOG.md has a new entry
         run: |
-          if git diff --name-only origin/main...HEAD | grep -q '^CHANGELOG.md$'; then
-            echo "CHANGELOG.md updated"
-          else
+          DIFF=$(git diff origin/main...HEAD -- CHANGELOG.md)
+          if [ -z "$DIFF" ]; then
             echo "::error::CHANGELOG.md was not updated. Please add an entry describing your changes."
+            exit 1
+          fi
+          # Accept either: a new "## [X.Y.Z] - YYYY-MM-DD" section (release PRs)
+          # or a new "- " bullet (normal feature/fix PRs under [Unreleased]).
+          if echo "$DIFF" | grep -qE '^\+## \[[0-9]+\.[0-9]+\.[0-9]+\]'; then
+            echo "CHANGELOG: new version section detected (release PR)"
+          elif echo "$DIFF" | grep -qE '^\+- '; then
+            echo "CHANGELOG: new bullet added"
+          else
+            echo "::error::CHANGELOG.md was touched but has no new '- ' bullet under [Unreleased] or new '## [X.Y.Z]' section. Add a meaningful entry describing your changes."
             exit 1
           fi
 

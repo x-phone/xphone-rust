@@ -16,6 +16,10 @@ All notable changes to this project will be documented in this file.
 - **BREAKING: `Call::send_dtmf` now returns `Err(Error::DtmfNotNegotiated)`** in `DtmfMode::Rfc4733` when PT 101 was not negotiated with the remote, instead of silently writing RTP packets into the void. Add a match arm to catch this error, or switch to `DtmfMode::Both` for automatic SIP INFO fallback. (xphone-rust#63)
 - **BREAKING: `DtmfMode::Both` now actually sends both transports** — RFC 4733 RTP (when negotiated) **and** SIP INFO on every digit. Previously `Both` was a misnomer: it sent RTP only and merely *accepted* SIP INFO on inbound. Matches pjsua / FreeSWITCH / Asterisk convention and makes middlebox-stripped DTMF self-healing. Well-behaved remotes may now double-report digits in `Both` mode — switch to `Rfc4733` or `SipInfo` if single-transport is required. (xphone-rust#64)
 
+### Internal
+
+- CI CHANGELOG check now validates content, not just that the file was touched. Passes on either a new `- ` bullet under `[Unreleased]` (normal PRs) or a new `## [X.Y.Z]` section (release PRs); fails on whitespace-only / comment-only edits that don't introduce a meaningful entry.
+
 ## [0.5.0] - 2026-04-22
 
 ### Added
