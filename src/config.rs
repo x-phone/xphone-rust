@@ -435,11 +435,20 @@ pub struct DialOptions {
     /// Video codecs in preference order. Defaults to `[H264, VP8]` when
     /// `video` is enabled. Only used when `video` is `true`.
     pub video_codecs: Vec<VideoCodec>,
-    /// Override the local IP advertised in SDP for this call only.
-    /// Takes precedence over [`Config::local_ip`](Config::local_ip). Useful on
-    /// multi-homed hosts when individual calls need different source-routable
-    /// addresses. `None` falls through to `Config::local_ip` → STUN-mapped
-    /// address → route-lookup heuristic.
+    /// Override the local IP advertised in SDP (the `c=` line) for this call
+    /// only. Takes precedence over [`Config::local_ip`](Config::local_ip).
+    /// Useful on multi-homed hosts when individual calls need different
+    /// source-routable media addresses. `None` falls through to
+    /// `Config::local_ip` → STUN-mapped address → route-lookup heuristic.
+    ///
+    /// **Scope is intentionally SDP-only.** This does **not** modify the SIP
+    /// `Contact` header or `Via` — those stay on the socket the SIP client
+    /// actually bound. Overriding Contact would break REGISTER-behind-NAT in
+    /// Docker-bridge setups, where the SIP port is ephemeral and not
+    /// port-forwarded, so the REGISTER `rport` source-address fallback is the
+    /// only way inbound INVITEs find you. (See xphone-go `WithRTPAddress`
+    /// incident — that option conflated media and signaling scopes and broke
+    /// exactly this scenario.)
     pub rtp_address: Option<String>,
 }
 

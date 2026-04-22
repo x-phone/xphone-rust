@@ -80,6 +80,14 @@ impl SipUA {
         });
 
         let client_cfg = ClientConfig {
+            // Intentionally NOT plumbed from `Config::local_ip` / any
+            // `rtp_address` override. Keep Contact/Via anchored to the socket
+            // the OS actually bound; media-side overrides (SDP `c=`) happen at
+            // SDP build time, not here. Mixing them would break REGISTER
+            // behind NAT — the server's source-address fallback (via rport +
+            // keepalive) is what makes inbound INVITEs reach ephemeral ports
+            // that are not explicitly forwarded. See xphone-go's
+            // `WithRTPAddress` incident.
             local_addr: "0.0.0.0:0".into(),
             server_addr,
             username: cfg.username.clone(),
