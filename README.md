@@ -86,7 +86,7 @@ Add to your `Cargo.toml`:
 
 ```toml
 [dependencies]
-xphone = "0.4"
+xphone = "0.6"
 ```
 
 Requires Rust 1.87+.
