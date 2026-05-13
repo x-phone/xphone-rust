@@ -4,6 +4,8 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.6.0] - 2026-05-13
+
 ### Added
 
 - **`Codec::TelephoneEvent`** (PT 101) exported from `crate::types`. Previously PT 101 was hardcoded in SDP offers but not representable through the public `Codec` enum — callers could not include it via `DialOptions::codec_override`. (xphone-rust#63)
