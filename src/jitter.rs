@@ -1,3 +1,4 @@
+use std::cmp::Ordering;
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
@@ -16,16 +17,21 @@ fn seq_less(a: u16, b: u16) -> bool {
     diff > 0 && diff < 0x8000
 }
 
-fn sort_entries(entries: &mut [JitterEntry]) {
-    entries.sort_by(|a, b| {
-        if seq_less(a.pkt.header.sequence_number, b.pkt.header.sequence_number) {
-            std::cmp::Ordering::Less
-        } else if a.pkt.header.sequence_number == b.pkt.header.sequence_number {
-            std::cmp::Ordering::Equal
-        } else {
-            std::cmp::Ordering::Greater
-        }
-    });
+/// Wraparound-aware ordering for RTP sequence numbers.
+///
+/// Defines a strict order only when all compared values lie within a window
+/// of less than 32768 sequence numbers — true for any sane jitter buffer
+/// (telephony depths are tens of packets) but worth being explicit about
+/// since [`Vec::binary_search_by`] relies on the slice being totally ordered
+/// under the comparator.
+fn seq_cmp(a: u16, b: u16) -> Ordering {
+    if a == b {
+        Ordering::Equal
+    } else if seq_less(a, b) {
+        Ordering::Less
+    } else {
+        Ordering::Greater
+    }
 }
 
 /// Reorders and deduplicates incoming RTP packets.
@@ -54,14 +60,22 @@ impl JitterBuffer {
     /// Adds an RTP packet to the buffer. Duplicates are dropped.
     pub fn push(&self, pkt: RtpPacket) {
         let mut inner = self.inner.lock();
-        if inner.seen.contains(&pkt.header.sequence_number) {
+        let seq = pkt.header.sequence_number;
+        if inner.seen.contains(&seq) {
             return;
         }
-        inner.seen.insert(pkt.header.sequence_number);
-        inner.entries.push(JitterEntry {
-            pkt,
-            arrival: Instant::now(),
-        });
+        inner.seen.insert(seq);
+        let pos = inner
+            .entries
+            .binary_search_by(|e| seq_cmp(e.pkt.header.sequence_number, seq))
+            .unwrap_or_else(|p| p);
+        inner.entries.insert(
+            pos,
+            JitterEntry {
+                pkt,
+                arrival: Instant::now(),
+            },
+        );
     }
 
     /// Returns the next packet in sequence order if its arrival time exceeds
@@ -71,8 +85,6 @@ impl JitterBuffer {
         if inner.entries.is_empty() {
             return None;
         }
-
-        sort_entries(&mut inner.entries);
 
         let now = Instant::now();
         if now.duration_since(inner.entries[0].arrival) >= inner.depth {
@@ -90,8 +102,6 @@ impl JitterBuffer {
         if inner.entries.is_empty() {
             return Vec::new();
         }
-
-        sort_entries(&mut inner.entries);
 
         let pkts = inner.entries.drain(..).map(|e| e.pkt).collect();
         inner.seen.clear();
