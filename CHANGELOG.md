@@ -16,6 +16,10 @@ All notable changes to this project will be documented in this file.
 - **BREAKING: `Call::send_dtmf` now returns `Err(Error::DtmfNotNegotiated)`** in `DtmfMode::Rfc4733` when PT 101 was not negotiated with the remote, instead of silently writing RTP packets into the void. Add a match arm to catch this error, or switch to `DtmfMode::Both` for automatic SIP INFO fallback. (xphone-rust#63)
 - **BREAKING: `DtmfMode::Both` now actually sends both transports** — RFC 4733 RTP (when negotiated) **and** SIP INFO on every digit. Previously `Both` was a misnomer: it sent RTP only and merely *accepted* SIP INFO on inbound. Matches pjsua / FreeSWITCH / Asterisk convention and makes middlebox-stripped DTMF self-healing. Well-behaved remotes may now double-report digits in `Both` mode — switch to `Rfc4733` or `SipInfo` if single-transport is required. (xphone-rust#64)
 
+### Performance
+
+- **`JitterBuffer` no longer re-sorts on every `pop()` / `flush()`.** Buffer is kept in sequence order via sorted insert in `push()` (`Vec::binary_search_by` + `Vec::insert`); `pop()` and `flush()` drop the per-call sort entirely. The remaining work is a small vec memmove (`Vec::remove(0)` on pop, `drain(..)` on flush) over a few dozen entries — well below the prior O(N log N) cost. At telephony cadence (50 pop/sec/stream) the previous sort dominated CPU on busy hosts — pprof on the Go port (xphone-go#114) showed ~20% of total CPU spent in the equivalent path with ~30 concurrent G.711 calls. Behavior preserved across reorder, dedup, depth, and 16-bit wraparound (existing tests unchanged). (xphone-go#114 parity)
+
 ### Internal
 
 - CI CHANGELOG check now validates content, not just that the file was touched. Passes on either a new `- ` bullet under `[Unreleased]` (normal PRs) or a new `## [X.Y.Z]` section (release PRs); fails on whitespace-only / comment-only edits that don't introduce a meaningful entry.
