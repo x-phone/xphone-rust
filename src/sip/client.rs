@@ -217,7 +217,7 @@ impl Client {
     }
 
     /// Sends a REGISTER request.
-    /// Handles 401 auth challenges automatically.
+    /// Handles 401 and 407 auth challenges automatically.
     /// Returns (response_code, reason).
     pub fn send_register(&self, timeout: Duration) -> Result<(u16, String)> {
         if *self.closed.lock() {
@@ -233,13 +233,20 @@ impl Client {
         debug!(method = "REGISTER", status = resp.status_code, reason = %resp.reason, "SIP <<< response");
         let branch = req.via_branch().to_string();
 
-        // Handle 401 auth challenge.
-        if resp.status_code == 401 {
+        // Handle 401/407 auth challenges. Some PBXes (3CX v20 among them)
+        // challenge REGISTER with 407 Proxy Authentication Required rather
+        // than 401, and expect Proxy-Authorization in the retry.
+        if resp.status_code == 401 || resp.status_code == 407 {
             self.tm.remove_tx(&branch);
-            let auth_hdr = resp.header("WWW-Authenticate");
+            let (challenge_hdr, response_hdr) = if resp.status_code == 401 {
+                ("WWW-Authenticate", "Authorization")
+            } else {
+                ("Proxy-Authenticate", "Proxy-Authorization")
+            };
+            let auth_hdr = resp.header(challenge_hdr);
             let ch = match auth::parse_challenge(auth_hdr) {
                 Ok(ch) => ch,
-                Err(_) => return Ok((401, auth_hdr.to_string())),
+                Err(_) => return Ok((resp.status_code, auth_hdr.to_string())),
             };
             let creds = Credentials {
                 username: self.register_auth_username().to_string(),
@@ -248,7 +255,7 @@ impl Client {
             let auth_val = auth::build_authorization(&ch, &creds, "REGISTER", &request_uri);
 
             let mut extra = HashMap::new();
-            extra.insert("Authorization".to_string(), auth_val);
+            extra.insert(response_hdr.to_string(), auth_val);
             let mut retry = self.build_request("REGISTER", &request_uri, Some(&extra));
             debug!(method = "REGISTER", "SIP >>> re-sending with auth");
             let resp = self.tm.send(&mut retry, dest, timeout)?;
@@ -278,13 +285,18 @@ impl Client {
         let resp = self.tm.send(&mut req, dest, timeout)?;
         let branch = req.via_branch().to_string();
 
-        // Handle 401 auth challenge.
-        if resp.status_code == 401 {
+        // Handle 401/407 auth challenges (see send_register).
+        if resp.status_code == 401 || resp.status_code == 407 {
             self.tm.remove_tx(&branch);
-            let auth_hdr = resp.header("WWW-Authenticate");
+            let (challenge_hdr, response_hdr) = if resp.status_code == 401 {
+                ("WWW-Authenticate", "Authorization")
+            } else {
+                ("Proxy-Authenticate", "Proxy-Authorization")
+            };
+            let auth_hdr = resp.header(challenge_hdr);
             let ch = match auth::parse_challenge(auth_hdr) {
                 Ok(ch) => ch,
-                Err(_) => return Ok((401, auth_hdr.to_string())),
+                Err(_) => return Ok((resp.status_code, auth_hdr.to_string())),
             };
             let creds = Credentials {
                 username: self.register_auth_username().to_string(),
@@ -293,7 +305,7 @@ impl Client {
             let auth_val = auth::build_authorization(&ch, &creds, "REGISTER", &request_uri);
 
             let mut extra2 = HashMap::new();
-            extra2.insert("Authorization".to_string(), auth_val);
+            extra2.insert(response_hdr.to_string(), auth_val);
             extra2.insert("Expires".to_string(), "0".to_string());
             let mut retry = self.build_request("REGISTER", &request_uri, Some(&extra2));
             let resp = self.tm.send(&mut retry, dest, timeout)?;
@@ -1006,6 +1018,67 @@ mod tests {
             registrar_thread.join().unwrap().is_some(),
             "registrar must NOT receive REGISTER when outbound_proxy is set"
         );
+        client.close();
+    }
+
+    /// A registrar that challenges REGISTER with 407 (3CX v20 does this,
+    /// where most PBXes send 401) must still get an authenticated retry —
+    /// carrying Proxy-Authorization, the header a 407 asks for.
+    #[test]
+    fn register_answers_407_proxy_authentication_required() {
+        let server = UdpConn::bind("127.0.0.1:0").unwrap();
+        let server_addr = server.local_addr().unwrap();
+        let cfg = ClientConfig {
+            local_addr: "127.0.0.1:0".into(),
+            server_addr,
+            username: "1001".into(),
+            password: "test".into(),
+            domain: "pbx.local".into(),
+            ..Default::default()
+        };
+        let client = Client::new(cfg).unwrap();
+
+        let handle = std::thread::spawn(move || {
+            // First REGISTER: challenge with 407 + Proxy-Authenticate.
+            let (data, from) = server.receive(Duration::from_secs(2)).unwrap();
+            let req = super::super::message::parse(&data).unwrap();
+            assert_eq!(req.method, "REGISTER");
+            let mut resp = Message::new_response(407, "Proxy Authentication Required");
+            resp.set_header("Via", req.header("Via"));
+            resp.set_header("Call-ID", req.header("Call-ID"));
+            resp.set_header("CSeq", req.header("CSeq"));
+            resp.set_header("From", req.header("From"));
+            resp.set_header("To", &format!("{};tag=srv1", req.header("To")));
+            resp.set_header(
+                "Proxy-Authenticate",
+                r#"Digest nonce="abc123",algorithm=MD5,realm="3CXPhoneSystem""#,
+            );
+            server.send(&resp.to_bytes(), from).unwrap();
+
+            // Second REGISTER must carry Proxy-Authorization (not Authorization).
+            let (data, from) = server.receive(Duration::from_secs(2)).unwrap();
+            let req = super::super::message::parse(&data).unwrap();
+            let auth = req.header("Proxy-Authorization");
+            assert!(
+                auth.contains("Digest") && auth.contains(r#"username="1001""#),
+                "retry must carry a digest Proxy-Authorization, got {auth:?}"
+            );
+            assert!(
+                req.header("Authorization").is_empty(),
+                "a 407 challenge must not be answered with Authorization"
+            );
+            let mut ok = Message::new_response(200, "OK");
+            ok.set_header("Via", req.header("Via"));
+            ok.set_header("Call-ID", req.header("Call-ID"));
+            ok.set_header("CSeq", req.header("CSeq"));
+            ok.set_header("From", req.header("From"));
+            ok.set_header("To", &format!("{};tag=srv1", req.header("To")));
+            server.send(&ok.to_bytes(), from).unwrap();
+        });
+
+        let (code, _) = client.send_register(Duration::from_secs(5)).unwrap();
+        assert_eq!(code, 200, "registration must succeed after a 407 challenge");
+        handle.join().unwrap();
         client.close();
     }
 
