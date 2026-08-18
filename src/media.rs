@@ -22,6 +22,8 @@ use crate::types::*;
 /// Default media configuration values.
 const DEFAULT_MEDIA_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_JITTER_DEPTH: Duration = Duration::from_millis(50);
+// To avoid problems, choose the shortest frame size for this value.
+const DEFAULT_JITTER_FRAME: Duration = Duration::from_millis(5);
 const DEFAULT_PCM_RATE: i32 = 8000;
 const CHANNEL_CAPACITY: usize = 256;
 
@@ -51,6 +53,8 @@ pub struct MediaConfig {
     pub media_timeout: Duration,
     /// Playout delay for the jitter buffer.
     pub jitter_depth: Duration,
+    /// Playout delay for each packet in the jitter buffer.
+    pub jitter_frame: Duration,
     /// PCM sample rate in Hz (typically 8000).
     pub pcm_rate: i32,
     /// Audio codec to use for encoding/decoding.
@@ -75,6 +79,7 @@ impl Default for MediaConfig {
         Self {
             media_timeout: DEFAULT_MEDIA_TIMEOUT,
             jitter_depth: DEFAULT_JITTER_DEPTH,
+            jitter_frame: DEFAULT_JITTER_FRAME,
             pcm_rate: DEFAULT_PCM_RATE,
             codec: Codec::PCMU,
             srtp_inbound: None,
@@ -360,6 +365,11 @@ pub fn start_media(
     } else {
         config.jitter_depth
     };
+    let jitter_frame = if config.jitter_frame == Duration::ZERO {
+        DEFAULT_JITTER_FRAME
+    } else {
+        config.jitter_frame
+    };
     let pcm_rate = if config.pcm_rate == 0 {
         DEFAULT_PCM_RATE
     } else {
@@ -498,7 +508,7 @@ pub fn start_media(
     let channels_for_thread = Arc::clone(&channels);
     let thread = std::thread::spawn(move || {
         let channels = channels_for_thread;
-        let mut jb = JitterBuffer::new(jitter_depth);
+        let mut jb = JitterBuffer::new(jitter_depth, jitter_frame);
         let mut out_seq: u16 = 0;
         let mut out_timestamp: u32 = 0;
         let out_ssrc = rand_u32();
@@ -575,9 +585,7 @@ pub fn start_media(
                     rtcp_stats.record_rtp_received(&pkt, pcm_rate as u32);
                     jb.push(pkt);
                     last_rtp_time = Instant::now();
-                    drain_jb_inline(&mut jb, &mut cp, &channels);
                 },
-
                 recv(jitter_tick) -> _ => {
                     drain_jb_inline(&mut jb, &mut cp, &channels);
 
@@ -807,7 +815,7 @@ fn drain_jb_inline(
     channels: &MediaChannels,
 ) {
     loop {
-        let pkt = match jb.pop() {
+        let (pkt, skipped) = match jb.pop() {
             Some(p) => p,
             None => return,
         };
@@ -818,6 +826,10 @@ fn drain_jb_inline(
         );
         if !pkt.payload.is_empty() {
             if let Some(ref mut proc) = cp {
+                let empty = vec![0u8; 0];
+                for _ in 0..skipped {
+                    let _ = proc.decode(&empty);
+                }
                 let pcm = proc.decode(&pkt.payload);
                 send_drop_oldest(&channels.pcm_reader.tx, &channels.pcm_reader.rx, pcm);
             }
