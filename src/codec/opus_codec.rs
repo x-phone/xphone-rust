@@ -6,6 +6,7 @@
 
 use super::CodecProcessor;
 use opus::{Application, Channels, Decoder, Encoder};
+use std::cell::Cell;
 
 const PAYLOAD_TYPE: u8 = 111;
 const CLOCK_RATE: u32 = 48000;
@@ -16,20 +17,28 @@ const MAX_DECODE_SAMPLES: usize = 960; // 120ms at 8kHz — handles up to 60ms O
 pub struct OpusProcessor {
     enc: Encoder,
     dec: Decoder,
+    skipped: Cell<bool>,
 }
 
 impl OpusProcessor {
     pub fn new() -> Option<Self> {
-        let enc = Encoder::new(PCM_RATE, Channels::Mono, Application::Voip).ok()?;
-        let dec = Decoder::new(PCM_RATE, Channels::Mono).ok()?;
-        Some(Self { enc, dec })
+        let mut enc = Encoder::new(PCM_RATE, Channels::Mono, Application::Voip).ok()?;
+        enc.set_complexity(10).ok()?;
+        enc.set_inband_fec(true).ok()?;
+        enc.set_packet_loss_perc(25).ok()?;
+        let mut dec = Decoder::new(PCM_RATE, Channels::Mono).ok()?;
+        let skipped = Cell::new(false);
+        Some(Self { enc, dec, skipped })
     }
 }
 
 impl CodecProcessor for OpusProcessor {
     fn decode(&mut self, payload: &[u8]) -> Vec<i16> {
         let mut out = vec![0i16; MAX_DECODE_SAMPLES];
-        match self.dec.decode(payload, &mut out, false) {
+        // if previous packet is empty and current packet is not empty then fec is enabled.
+        let is_empty = payload.len() == 0;
+        let fec = self.skipped.replace(is_empty) && !is_empty;
+        match self.dec.decode(payload, &mut out, fec) {
             Ok(n) => {
                 out.truncate(n);
                 out
