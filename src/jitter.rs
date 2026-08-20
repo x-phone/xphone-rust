@@ -66,7 +66,7 @@ impl JitterBuffer {
             inner: Mutex::new(JitterInner {
                 depth,
                 frame,
-                last_arrival: Instant::now() - frame,
+                last_arrival: Instant::now() - depth,
                 start: Instant::now(),
                 entries: Cell::new(BTreeMap::new()),
                 last_pop: None,
@@ -111,7 +111,7 @@ impl JitterBuffer {
                     0
                 };
                 // average frame rate
-                let frame = (inner.frame * 7 + (value.arrival.duration_since(inner.last_arrival)) / (skipped as u32 + 1)) / 8 ;
+                let frame = (inner.frame * 3 + (value.arrival.duration_since(inner.last_arrival)) / (skipped as u32 + 1)) / 4;
                 inner.frame = frame;
                 inner.last_arrival = value.arrival;
                 inner.depth += frame * (skipped as u32 + 1);
