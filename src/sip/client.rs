@@ -542,10 +542,10 @@ impl Client {
             Ok(ConsumeResult::Redirect(new_target))
         } else {
             self.tm.remove_tx(branch);
-            Err(Error::Other(format!(
-                "sip: INVITE rejected: {} {}",
-                resp.status_code, resp.reason
-            )))
+            Err(Error::InviteFailed {
+                code: resp.status_code,
+                reason: resp.reason,
+            })
         }
     }
 
