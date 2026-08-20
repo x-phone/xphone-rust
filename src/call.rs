@@ -324,6 +324,11 @@ impl Call {
 
     /// Creates a new outbound call in the `Dialing` state with the given dial options.
     pub fn new_outbound(dlg: Arc<dyn Dialog>, opts: DialOptions) -> Arc<Self> {
+        let codec_prefs = opts
+            .codec_override
+            .iter()
+            .map(|c| c.payload_type())
+            .collect();
         Arc::new(Call {
             inner: Mutex::new(CallInner {
                 id: new_call_id(),
@@ -332,7 +337,7 @@ impl Call {
                 opts,
                 start_time: None,
                 muted: false,
-                codec_prefs: Vec::new(),
+                codec_prefs,
                 local_ip: String::new(),
                 rtp_port: 0,
                 remote_ip: String::new(),
