@@ -9,6 +9,7 @@ use crate::types::RtpPacket;
 
 struct JitterEntry {
     pkt: RtpPacket,
+    arrival: Instant,
 }
 
 /// Compares two 16-bit RTP sequence numbers with wraparound (RFC 3550).
@@ -52,6 +53,7 @@ pub struct JitterBuffer {
 struct JitterInner {
     depth: Duration,
     frame: Duration,
+    last_arrival: Instant,
     start: Instant,
     entries: Cell<BTreeMap<SeqNum, JitterEntry>>,
     last_pop: Option<SeqNum>,
@@ -64,6 +66,7 @@ impl JitterBuffer {
             inner: Mutex::new(JitterInner {
                 depth,
                 frame,
+                last_arrival: Instant::now() - frame,
                 start: Instant::now(),
                 entries: Cell::new(BTreeMap::new()),
                 last_pop: None,
@@ -71,7 +74,6 @@ impl JitterBuffer {
         }
     }
 
-    /// Adds an RTP packet to the buffer. Duplicates are dropped.
     pub fn push(&self, pkt: RtpPacket) {
         let mut inner = self.inner.lock();
         let seq = pkt.header.sequence_number;
@@ -85,7 +87,12 @@ impl JitterBuffer {
             .entries
             .get_mut()
             .entry(SeqNum(seq))
-            .or_insert(JitterEntry { pkt });
+            .or_insert(
+                JitterEntry {
+                    pkt,
+                    arrival: Instant::now(),
+                },
+            );
     }
 
     /// Returns the next packet in sequence order if its arrival time exceeds
@@ -103,7 +110,10 @@ impl JitterBuffer {
                 } else {
                     0
                 };
-                let frame = inner.frame;
+                // average frame rate
+                let frame = (inner.frame * 7 + (value.arrival.duration_since(inner.last_arrival)) / (skipped as u32 + 1)) / 8 ;
+                inner.frame = frame;
+                inner.last_arrival = value.arrival;
                 inner.depth += frame * (skipped as u32 + 1);
                 inner.last_pop = Some(key);
                 Some((value.pkt, skipped))

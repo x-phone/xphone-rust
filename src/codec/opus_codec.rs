@@ -23,9 +23,9 @@ pub struct OpusProcessor {
 impl OpusProcessor {
     pub fn new() -> Option<Self> {
         let mut enc = Encoder::new(PCM_RATE, Channels::Mono, Application::Voip).ok()?;
-        enc.set_complexity(10).ok()?;
-        enc.set_inband_fec(true).ok()?;
-        enc.set_packet_loss_perc(25).ok()?;
+        let _ = enc.set_complexity(10).ok()?;
+        let _ = enc.set_inband_fec(true).ok()?;
+        let _ = enc.set_packet_loss_perc(25).ok()?;
         let mut dec = Decoder::new(PCM_RATE, Channels::Mono).ok()?;
         let skipped = Cell::new(false);
         Some(Self { enc, dec, skipped })

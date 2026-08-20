@@ -518,7 +518,7 @@ pub fn start_media(
         let mut last_dtmf_seen = false;
 
         let mut last_rtp_time = Instant::now();
-        let jitter_tick = crossbeam_channel::tick(Duration::from_millis(5));
+        let jitter_tick = crossbeam_channel::tick(jitter_frame);
 
         // Paced outbound PCM state. Uses VecDeque for O(1) drain from front.
         let frame_size = (pcm_rate / 50) as usize; // 160 samples for 8kHz (20ms frame)
