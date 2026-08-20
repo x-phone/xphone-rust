@@ -129,7 +129,7 @@ impl Client {
         let advertised_addr = if local_addr.ip().is_unspecified() {
             if let Some(stun_addr) = Self::try_stun(&cfg) {
                 info!("STUN mapped address: {}", stun_addr);
-                SocketAddr::new(stun_addr.ip(), local_addr.port())
+                SocketAddr::new(stun_addr.ip(), stun_addr.port())
             } else {
                 // Fallback: UDP connect trick to determine local routable IP.
                 // Probe the actual next-hop (outbound proxy if set).

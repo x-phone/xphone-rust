@@ -160,6 +160,7 @@ impl Phone {
         let incoming_ip = effective_ip.clone();
         let rtp_port_min = self.cfg.rtp_port_min;
         let rtp_port_max = self.cfg.rtp_port_max;
+        let stun_server = self.cfg.stun_server.clone();
         tr.on_dialog_invite(Box::new(move |dlg, from, to, remote_sdp| {
             handle_dialog_incoming(
                 &inner_clone,
@@ -170,6 +171,7 @@ impl Phone {
                 &incoming_ip,
                 rtp_port_min,
                 rtp_port_max,
+                &stun_server
             );
         }));
 
@@ -341,13 +343,26 @@ impl Phone {
         {
             audio_codecs.push(crate::call::PT_TELEPHONE_EVENT);
         }
-        let (rtp_socket, rtp_port) = {
+        let (rtp_socket, mut rtp_port) = {
             let (sock, port) =
                 crate::media::listen_rtp_port(self.cfg.rtp_port_min, self.cfg.rtp_port_max)?;
             (Some(sock), port as i32)
         };
+        if let Some(ref sock) = rtp_socket {
+            if let Some(ref stun_server_str) = self.cfg.stun_server {
+                if let Ok(stun_server_addr) = crate::stun::resolve_stun_server(stun_server_str) {
+                    if let Ok(stun_addr) = crate::stun::stun_mapped_address(
+                        sock,
+                        stun_server_addr,
+                        std::time::Duration::from_secs(3),
+                    ) {
+                        rtp_port = stun_addr.port() as i32;
+                    }
+                }
+            }
+        }
         // Allocate video RTP socket if video is requested.
-        let (video_rtp_socket, video_rtp_port) = if opts.video {
+        let (video_rtp_socket, mut video_rtp_port) = if opts.video {
             match crate::media::listen_rtp_port(self.cfg.rtp_port_min, self.cfg.rtp_port_max) {
                 Ok((sock, port)) => (Some(sock), port as i32),
                 Err(_) => (None, 0),
@@ -355,6 +370,19 @@ impl Phone {
         } else {
             (None, 0)
         };
+        if let Some(ref sock) = video_rtp_socket {
+            if let Some(ref stun_server_str) = self.cfg.stun_server {
+                if let Ok(stun_server_addr) = crate::stun::resolve_stun_server(stun_server_str) {
+                    if let Ok(stun_addr) = crate::stun::stun_mapped_address(
+                        sock,
+                        stun_server_addr,
+                        std::time::Duration::from_secs(3),
+                    ) {
+                        video_rtp_port = stun_addr.port() as i32;
+                    }
+                }
+            }
+        }
 
         // Generate SRTP keying material if enabled.
         let srtp_inline_key = if self.cfg.srtp {
@@ -906,6 +934,7 @@ fn handle_dialog_incoming(
     local_ip: &str,
     rtp_port_min: u16,
     rtp_port_max: u16,
+    stun_server: &Option<String>
 ) {
     // Check if this is a re-INVITE for an existing call (same Call-ID).
     let call_id = dlg.call_id();
@@ -920,7 +949,7 @@ fn handle_dialog_incoming(
     let incoming_fns = inner.lock().incoming.clone();
 
     // Allocate an RTP socket for this call (ephemeral port if range is 0,0).
-    let (rtp_socket, actual_port) = match crate::media::listen_rtp_port(rtp_port_min, rtp_port_max)
+    let (rtp_socket, mut actual_port) = match crate::media::listen_rtp_port(rtp_port_min, rtp_port_max)
     {
         Ok((sock, port)) => (Some(sock), port as i32),
         Err(e) => {
@@ -929,6 +958,19 @@ fn handle_dialog_incoming(
             return;
         }
     };
+    if let Some(ref sock) = rtp_socket {
+        if let Some(ref stun_server_str) = stun_server {
+            if let Ok(stun_server_addr) = crate::stun::resolve_stun_server(stun_server_str) {
+                if let Ok(stun_addr) = crate::stun::stun_mapped_address(
+                    sock,
+                    stun_server_addr,
+                    std::time::Duration::from_secs(3),
+                ) {
+                    actual_port = stun_addr.port() as i32;
+                }
+            }
+        }
+    }
 
     // Parse remote SDP once for SRTP detection and video detection.
     let parsed_sdp = crate::sdp::parse(remote_sdp).ok();
@@ -960,7 +1002,18 @@ fn handle_dialog_incoming(
     // Allocate video RTP socket if remote SDP offers video.
     if let Some(ref sess) = parsed_sdp {
         if sess.has_video() {
-            if let Ok((vsock, vport)) = crate::media::listen_rtp_port(rtp_port_min, rtp_port_max) {
+            if let Ok((vsock, mut vport)) = crate::media::listen_rtp_port(rtp_port_min, rtp_port_max) {
+                if let Some(ref stun_server_str) = stun_server {
+                    if let Ok(stun_server_addr) = crate::stun::resolve_stun_server(stun_server_str) {
+                        if let Ok(stun_addr) = crate::stun::stun_mapped_address(
+                            &vsock,
+                            stun_server_addr,
+                            std::time::Duration::from_secs(3),
+                        ) {
+                            vport = stun_addr.port();
+                        }
+                    }
+                }
                 call.set_video_rtp_port(vport as i32);
                 call.set_video_rtp_socket(vsock);
             }
