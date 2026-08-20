@@ -26,6 +26,9 @@ pub enum Error {
     /// `code == 0`.
     #[error("{}", format_registration_failed(*code, reason))]
     RegistrationFailed { code: u16, reason: String },
+    /// SIP INVITE was rejected or failed.
+    #[error("xphone: invite error occurs {code} {reason}")]
+    InviteFailed { code: u16, reason: String },
     /// SIP REFER (blind transfer) was rejected or failed.
     #[error("xphone: transfer failed")]
     TransferFailed,
