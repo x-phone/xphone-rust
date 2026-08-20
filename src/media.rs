@@ -828,7 +828,8 @@ fn drain_jb_inline(
             if let Some(ref mut proc) = cp {
                 let empty = vec![0u8; 0];
                 for _ in 0..skipped {
-                    let _ = proc.decode(&empty);
+                    let pcm = proc.decode(&empty);
+                    send_drop_oldest(&channels.pcm_reader.tx, &channels.pcm_reader.rx, pcm);
                 }
                 let pcm = proc.decode(&pkt.payload);
                 send_drop_oldest(&channels.pcm_reader.tx, &channels.pcm_reader.rx, pcm);
