@@ -1,4 +1,6 @@
-use std::cmp::Ordering;
+use std::cell::Cell;
+use std::cmp::{Ord, Ordering};
+use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use parking_lot::Mutex;
@@ -34,6 +36,15 @@ fn seq_cmp(a: u16, b: u16) -> Ordering {
     }
 }
 
+#[derive(PartialEq, Eq, PartialOrd)]
+struct SeqNum(pub u16);
+impl Ord for SeqNum {
+    #[inline]
+    fn cmp(&self, other: &SeqNum) -> Ordering {
+        seq_cmp(*(&self.0), *(&other.0))
+    }
+}
+
 /// Reorders and deduplicates incoming RTP packets.
 pub struct JitterBuffer {
     inner: Mutex<JitterInner>,
@@ -41,56 +52,74 @@ pub struct JitterBuffer {
 
 struct JitterInner {
     depth: Duration,
-    entries: Vec<JitterEntry>,
-    seen: std::collections::HashSet<u16>,
+    frame: Duration,
+    last_arrival: Instant,
+    start: Instant,
+    entries: Cell<BTreeMap<SeqNum, JitterEntry>>,
+    last_pop: Option<SeqNum>,
 }
 
 impl JitterBuffer {
     /// Creates a JitterBuffer with the given playout depth.
-    pub fn new(depth: Duration) -> Self {
+    pub fn new(depth: Duration, frame: Duration) -> Self {
         JitterBuffer {
             inner: Mutex::new(JitterInner {
                 depth,
-                entries: Vec::new(),
-                seen: std::collections::HashSet::new(),
+                frame,
+                last_arrival: Instant::now() - depth,
+                start: Instant::now(),
+                entries: Cell::new(BTreeMap::new()),
+                last_pop: None,
             }),
         }
     }
 
-    /// Adds an RTP packet to the buffer. Duplicates are dropped.
     pub fn push(&self, pkt: RtpPacket) {
         let mut inner = self.inner.lock();
         let seq = pkt.header.sequence_number;
-        if inner.seen.contains(&seq) {
+        // ignore alreadly used packet
+        // use asref compare to avoid clone
+        if inner.last_pop.as_ref().is_some_and(|e| e > &SeqNum(seq)) {
             return;
         }
-        inner.seen.insert(seq);
-        let pos = inner
+        // ignore alreadly inserted packet
+        inner
             .entries
-            .binary_search_by(|e| seq_cmp(e.pkt.header.sequence_number, seq))
-            .unwrap_or_else(|p| p);
-        inner.entries.insert(
-            pos,
-            JitterEntry {
-                pkt,
-                arrival: Instant::now(),
-            },
-        );
+            .get_mut()
+            .entry(SeqNum(seq))
+            .or_insert(
+                JitterEntry {
+                    pkt,
+                    arrival: Instant::now(),
+                },
+            );
     }
 
     /// Returns the next packet in sequence order if its arrival time exceeds
     /// the jitter depth, or `None` if no packet is ready.
-    pub fn pop(&self) -> Option<RtpPacket> {
+    pub fn pop(&self) -> Option<(RtpPacket, u16)> {
         let mut inner = self.inner.lock();
-        if inner.entries.is_empty() {
-            return None;
-        }
-
+        let depth = inner.depth;
         let now = Instant::now();
-        if now.duration_since(inner.entries[0].arrival) >= inner.depth {
-            let entry = inner.entries.remove(0);
-            inner.seen.remove(&entry.pkt.header.sequence_number);
-            Some(entry.pkt)
+        if now.duration_since(inner.start) >= depth {
+            let entry = inner.entries.get_mut().pop_first();
+            if let Some((key, value)) = entry {
+                // wait for jitter
+                let skipped: u16 = if let Some(ref last_pop) = inner.last_pop {
+                    key.0.wrapping_sub(last_pop.0) - 1
+                } else {
+                    0
+                };
+                // average frame rate
+                let frame = (inner.frame * 3 + (value.arrival.duration_since(inner.last_arrival)) / (skipped as u32 + 1)) / 4;
+                inner.frame = frame;
+                inner.last_arrival = value.arrival;
+                inner.depth += frame * (skipped as u32 + 1);
+                inner.last_pop = Some(key);
+                Some((value.pkt, skipped))
+            } else {
+                None
+            }
         } else {
             None
         }
@@ -98,14 +127,13 @@ impl JitterBuffer {
 
     /// Returns all buffered packets in sequence order and clears the buffer.
     pub fn flush(&self) -> Vec<RtpPacket> {
-        let mut inner = self.inner.lock();
-        if inner.entries.is_empty() {
-            return Vec::new();
-        }
-
-        let pkts = inner.entries.drain(..).map(|e| e.pkt).collect();
-        inner.seen.clear();
-        pkts
+        let inner = self.inner.lock();
+        inner
+            .entries
+            .replace(BTreeMap::new())
+            .into_values()
+            .map(|e| e.pkt)
+            .collect()
     }
 }
 
@@ -144,7 +172,7 @@ mod tests {
 
     #[test]
     fn in_order() {
-        let jb = JitterBuffer::new(Duration::from_millis(50));
+        let jb = JitterBuffer::new(Duration::from_millis(50), Duration::from_millis(20));
         for seq in 1..=3 {
             jb.push(make_pkt(seq));
         }
@@ -157,7 +185,7 @@ mod tests {
 
     #[test]
     fn reorder() {
-        let jb = JitterBuffer::new(Duration::from_millis(50));
+        let jb = JitterBuffer::new(Duration::from_millis(50), Duration::from_millis(20));
         jb.push(make_pkt(3));
         jb.push(make_pkt(1));
         jb.push(make_pkt(2));
@@ -171,7 +199,7 @@ mod tests {
 
     #[test]
     fn dedup() {
-        let jb = JitterBuffer::new(Duration::from_millis(50));
+        let jb = JitterBuffer::new(Duration::from_millis(50), Duration::from_millis(20));
         jb.push(make_pkt_with_payload(1, &[0xAA]));
         jb.push(make_pkt_with_payload(1, &[0xBB])); // duplicate
         jb.push(make_pkt_with_payload(2, &[0xCC]));
@@ -185,7 +213,7 @@ mod tests {
 
     #[test]
     fn configurable_depth() {
-        let short = JitterBuffer::new(Duration::from_millis(10));
+        let short = JitterBuffer::new(Duration::from_millis(10), Duration::from_millis(20));
         short.push(make_pkt(2));
         std::thread::sleep(Duration::from_millis(15));
         let pkt = short.pop();
@@ -193,9 +221,9 @@ mod tests {
             pkt.is_some(),
             "short depth should release packet after delay"
         );
-        assert_eq!(pkt.unwrap().header.sequence_number, 2);
+        assert_eq!(pkt.unwrap().0.header.sequence_number, 2);
 
-        let long = JitterBuffer::new(Duration::from_millis(200));
+        let long = JitterBuffer::new(Duration::from_millis(200), Duration::from_millis(20));
         long.push(make_pkt(3));
         let pkt = long.pop();
         assert!(
@@ -208,12 +236,12 @@ mod tests {
             pkt.is_some(),
             "long depth should release packet after delay"
         );
-        assert_eq!(pkt.unwrap().header.sequence_number, 3);
+        assert_eq!(pkt.unwrap().0.header.sequence_number, 3);
     }
 
     #[test]
     fn sequence_wrap_around() {
-        let jb = JitterBuffer::new(Duration::from_millis(50));
+        let jb = JitterBuffer::new(Duration::from_millis(50), Duration::from_millis(20));
         jb.push(make_pkt(0));
         jb.push(make_pkt(65535));
         jb.push(make_pkt(65534));
@@ -229,7 +257,7 @@ mod tests {
 
     #[test]
     fn empty() {
-        let jb = JitterBuffer::new(Duration::from_millis(50));
+        let jb = JitterBuffer::new(Duration::from_millis(50), Duration::from_millis(20));
         let pkts = jb.flush();
         assert!(pkts.is_empty());
         let pkt = jb.pop();
