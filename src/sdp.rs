@@ -144,7 +144,7 @@ fn codec_fmtp(pt: i32) -> Option<&'static str> {
     match pt {
         18 => Some("annexb=no"),
         101 => Some("0-16"),
-        111 => Some("minptime=20;useinbandfec=0"),
+        111 => Some("minptime=20;useinbandfec=1;maxplaybackrate=8000"),
         _ => None,
     }
 }
