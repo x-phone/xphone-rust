@@ -971,11 +971,15 @@ fn exec_command(state: &SharedState, phone: &Phone, input: &str) {
 
     match cmd.as_str() {
         "quit" | "q" | "exit" => {
-            {
-                let st = state.lock().unwrap();
-                for tc in &st.calls {
-                    let _ = tc.call.end();
-                }
+            let calls: Vec<Arc<Call>> = state
+                .lock()
+                .unwrap()
+                .calls
+                .iter()
+                .map(|e| Arc::clone(&e.call))
+                .collect();
+            for call in &calls {
+                let _ = call.end();
             }
             state.lock().unwrap().quitting = true;
             let _ = phone.disconnect();
@@ -1737,11 +1741,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
                 match key.code {
                     KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                        {
-                            let st = state.lock().unwrap();
-                            for tc in &st.calls {
-                                let _ = tc.call.end();
-                            }
+                        let calls: Vec<Arc<Call>> = state
+                            .lock()
+                            .unwrap()
+                            .calls
+                            .iter()
+                            .map(|e| Arc::clone(&e.call))
+                            .collect();
+                        for call in &calls {
+                            let _ = call.end();
                         }
                         state.lock().unwrap().quitting = true;
                         let _ = phone.disconnect();
